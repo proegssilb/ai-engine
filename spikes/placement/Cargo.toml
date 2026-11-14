@@ -1,0 +1,13 @@
+[package]
+name = "placement-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike: drive llama.cpp tensor placement from Rust, including a Rust-implemented buffer type"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"
