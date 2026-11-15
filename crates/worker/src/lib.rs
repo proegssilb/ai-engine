@@ -7,10 +7,11 @@
 
 pub mod stop;
 
-use aie_llama::context::{Stop, Utf8Stream};
-use aie_llama::pinned::PinOptions;
+pub use aie_llama::ContextParams;
+pub use aie_llama::context::{Stop, Utf8Stream};
+pub use aie_llama::pinned::PinOptions;
 use aie_llama::verify;
-use aie_llama::{Context, ContextParams, LoadOptions, Model, Sampling};
+use aie_llama::{Context, LoadOptions, Model, Sampling};
 use aie_plan::Plan;
 use aie_plan::llama::Settings;
 use aie_proto::worker::generate_event::Event;
@@ -39,6 +40,10 @@ pub enum Placement {
     },
     /// A plan the daemon made and compiled.
     Planned { plan: Plan, settings: Settings },
+    /// A saved intent ("experts: 10% GPU 1, 80% RAM, rest on disk"), planned
+    /// here because planning needs the devices. Refused, with the reason, if
+    /// it doesn't fit.
+    Intent { intent: aie_plan::Intent },
 }
 
 /// Everything a worker needs, passed as JSON by the daemon.
@@ -51,10 +56,58 @@ pub struct Config {
     pub context: ContextParams,
 }
 
+/// GPUs as llama.cpp sees them, and host RAM from /proc/meminfo.
+pub fn machine() -> aie_plan::fit::Machine {
+    let gpus = aie_llama::devices()
+        .into_iter()
+        .filter(|d| d.is_gpu)
+        .map(|d| aie_plan::fit::Capacity {
+            name: d.name,
+            total: d.total,
+            free: d.free,
+        })
+        .collect();
+    let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let kib = |key: &str| {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    };
+    aie_plan::fit::Machine {
+        gpus,
+        ram: aie_plan::fit::Capacity {
+            name: "RAM".into(),
+            total: kib("MemTotal:"),
+            free: kib("MemAvailable:"),
+        },
+    }
+}
+
 /// Resolve the placement mode into a plan and load settings.
 fn decide(cfg: &Config, anatomy: &aie_anatomy::Anatomy) -> Result<(Plan, Settings), String> {
     match &cfg.placement {
         Placement::Planned { plan, settings } => Ok((plan.clone(), settings.clone())),
+        Placement::Intent { intent } => {
+            let machine = machine();
+            let gpus = machine.gpus.len() as u32;
+            let plan = aie_plan::plan(anatomy, intent, gpus).map_err(|e| e.to_string())?;
+            let report = aie_plan::fit::check(
+                anatomy,
+                &plan,
+                &machine,
+                &aie_plan::fit::Overheads::default(),
+            );
+            if !report.fits() {
+                return Err(format!("this placement doesn't fit:\n{report}"));
+            }
+            let settings =
+                aie_plan::llama::compile(anatomy, &plan, gpus).map_err(|e| e.to_string())?;
+            Ok((plan, settings))
+        }
         Placement::Auto { n_ctx_min, margin } => {
             let fitted = aie_llama::fit::fit(&cfg.model, cfg.context.n_ctx, *n_ctx_min, *margin)
                 .map_err(|e| e.to_string())?;
