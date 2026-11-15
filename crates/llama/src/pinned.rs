@@ -22,8 +22,15 @@ pub struct PinOptions {
     pub numa_node: Option<u32>,
     /// mlock the allocation so it can never be paged out.
     pub mlock: bool,
-    /// MADV_HUGEPAGE on the allocation.
+    /// Transparent huge pages: true = MADV_HUGEPAGE, false = MADV_NOHUGEPAGE
+    /// (explicitly off, even when the system's THP setting is "always").
     pub hugepages: bool,
+    /// Back the buffer with reserved huge pages (hugetlb) of this size in bytes,
+    /// 2 MiB or 1 GiB. Needs pages reserved (vm.nr_hugepages or
+    /// /sys/kernel/mm/hugepages); falls back to normal pages if there aren't
+    /// enough, and records why.
+    #[serde(default)]
+    pub hugetlb: Option<u64>,
     /// cudaHostRegister the allocation (page-locked for DMA), so GPU backends
     /// can copy from it at full PCIe speed when they offload ops on these weights.
     pub cuda_register: bool,
@@ -39,6 +46,11 @@ pub struct BufferRecord {
     pub mlock_result: Option<Result<(), i32>>,
     /// Ok, or the cudaError_t code / -1 if libcudart couldn't be loaded.
     pub cuda_register_result: Option<Result<(), i32>>,
+    /// Ok(page size) if backed by reserved huge pages, Err(errno) if that
+    /// was asked for and failed (normal pages were used instead).
+    pub hugetlb_result: Option<Result<u64, i32>>,
+    /// Bytes actually mapped (rounded up to the page size used).
+    pub map_len: usize,
     pub freed: bool,
 }
 
@@ -118,22 +130,37 @@ unsafe extern "C" fn buft_alloc_buffer(
     size: usize,
 ) -> sys::ggml_backend_buffer_t {
     let opts = unsafe { buft_ctx(buft).opts.clone() };
-    let ps = page_size();
-    // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
-    let map_len = size.max(1).div_ceil(ps) * ps;
-    let base = unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            map_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
+    let anon = |len: usize, extra: libc::c_int| unsafe {
+        libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra, -1, 0)
     };
-    if base == libc::MAP_FAILED {
-        return ptr::null_mut();
+    // Reserved huge pages first, if asked; else (or on failure) normal pages.
+    // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
+    let mut hugetlb_result = None;
+    let mut mapped = None;
+    if let Some(hp) = opts.hugetlb.filter(|_| size > 0) {
+        let len = size.div_ceil(hp as usize) * hp as usize;
+        const MAP_HUGE_SHIFT: libc::c_int = 26;
+        let flags = libc::MAP_HUGETLB | ((hp.trailing_zeros() as libc::c_int) << MAP_HUGE_SHIFT);
+        let b = anon(len, flags);
+        if b == libc::MAP_FAILED {
+            hugetlb_result = Some(Err(errno()));
+        } else {
+            hugetlb_result = Some(Ok(hp));
+            mapped = Some((b, len));
+        }
     }
+    let (base, map_len) = match mapped {
+        Some(m) => m,
+        None => {
+            let ps = page_size();
+            let len = size.max(1).div_ceil(ps) * ps;
+            let b = anon(len, 0);
+            if b == libc::MAP_FAILED {
+                return ptr::null_mut();
+            }
+            (b, len)
+        }
+    };
 
     let mut rec = BufferRecord {
         base: base as usize,
@@ -142,11 +169,14 @@ unsafe extern "C" fn buft_alloc_buffer(
         mbind_result: None,
         mlock_result: None,
         cuda_register_result: None,
+        hugetlb_result,
+        map_len,
         freed: false,
     };
 
-    if opts.hugepages {
-        unsafe { libc::madvise(base, map_len, libc::MADV_HUGEPAGE) };
+    if !matches!(rec.hugetlb_result, Some(Ok(_))) {
+        let advice = if opts.hugepages { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
+        unsafe { libc::madvise(base, map_len, advice) };
     }
     if let Some(node) = opts.numa_node {
         // Must happen before first touch: the policy applies to pages as they fault in.

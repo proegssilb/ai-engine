@@ -209,6 +209,11 @@ fn load_warnings() -> Vec<String> {
                 b.len as f64 / 1048576.0
             ));
         }
+        if let Some(Err(e)) = b.hugetlb_result {
+            out.push(format!(
+                "the RAM tier asked for reserved huge pages but got normal ones (mmap errno {e}); reserve more (vm.nr_hugepages / /sys/kernel/mm/hugepages)"
+            ));
+        }
         if let Some(Err(e)) = b.mbind_result {
             out.push(format!(
                 "the RAM tier couldn't be bound to its NUMA node (mbind errno {e})"

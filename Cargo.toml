@@ -2,7 +2,7 @@
 resolver = "3"
 members = ["crates/*"]
 # Spikes are throwaway experiments with their own lockfiles.
-exclude = ["spikes/placement"]
+exclude = ["spikes/placement", "spikes/memory"]
 
 [workspace.package]
 version = "0.0.0"
