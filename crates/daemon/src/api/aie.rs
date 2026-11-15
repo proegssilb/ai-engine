@@ -34,6 +34,41 @@ fn tier_key(t: &Tier) -> String {
     }
 }
 
+/// Live numbers from a worker: speeds, totals, disk-tier residency.
+pub async fn live_stats(w: &Worker) -> Value {
+    let Ok(st) = w.client().status(aie_proto::worker::StatusRequest {}).await else {
+        return Value::Null;
+    };
+    let st = st.into_inner();
+    let rate = |tokens: u64, ns: u64| {
+        if ns == 0 {
+            0.0
+        } else {
+            tokens as f64 / (ns as f64 / 1e9)
+        }
+    };
+    json!({
+        "requests": st.requests,
+        "prompt_tokens": st.prompt_tokens,
+        "completion_tokens": st.completion_tokens,
+        "prefill_tps": rate(st.prompt_tokens, st.prefill_ns),
+        "decode_tps": rate(st.completion_tokens.saturating_sub(st.requests), st.decode_ns),
+        "last_prefill_tps": st.last_prefill_tps,
+        "last_decode_tps": st.last_decode_tps,
+        "disk_tier_bytes": st.disk_tier_bytes,
+        "disk_tier_resident": st.disk_tier_resident,
+    })
+}
+
+/// GET /api/aie/stats: every loaded model's live numbers.
+pub async fn stats(st: State) -> Json<Value> {
+    let mut out = serde_json::Map::new();
+    for w in st.0.workers.list().await {
+        out.insert(w.name.clone(), live_stats(&w).await);
+    }
+    Json(Value::Object(out))
+}
+
 /// Bytes of weights on GPUs, per the worker's plan.
 pub fn gpu_bytes(w: &Worker) -> u64 {
     let Ok(plan) = serde_json::from_str::<Plan>(&w.status.plan_json) else {
@@ -96,6 +131,7 @@ pub async fn get_placement(
             "misplaced": w.status.misplaced,
             "load_ms": w.status.load_ms,
             "planned": by_sub,
+            "stats": live_stats(&w).await,
             "plan": plan,
             "verified": report,
         });

@@ -12,6 +12,7 @@ pub mod fit;
 pub mod log;
 pub mod model;
 pub mod pinned;
+pub mod residency;
 pub mod verify;
 
 pub use context::{Context, ContextParams, Sampling};

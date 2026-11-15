@@ -68,7 +68,20 @@ export interface Placement {
     load_ms: number
     /** subsystem label -> tier key (gpu0, ram, disk) -> bytes */
     planned: Record<string, Record<string, number>>
+    stats: Stats | null
   }
+}
+
+export interface Stats {
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  prefill_tps: number
+  decode_tps: number
+  last_prefill_tps: number
+  last_decode_tps: number
+  disk_tier_bytes: number
+  disk_tier_resident: number
 }
 
 export class ApiError extends Error {}

@@ -178,6 +178,20 @@ struct Loaded {
     ctx: Arc<Mutex<Context>>,
     model: Arc<Model>,
     status: pb::StatusReply,
+    /// File ranges (offset, length) of weights on the disk tier.
+    disk_ranges: Vec<(u64, u64)>,
+    stats: std::sync::Mutex<Stats>,
+}
+
+#[derive(Default)]
+struct Stats {
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    prefill_ns: u64,
+    decode_ns: u64,
+    last_prefill_tps: f32,
+    last_decode_tps: f32,
 }
 
 /// Load the model and check its placement. Blocking; run before serving.
@@ -211,6 +225,14 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
     let placement_json = serde_json::to_string(&report).map_err(|e| e.to_string())?;
     let plan_json = serde_json::to_string(&plan).map_err(|e| e.to_string())?;
 
+    let disk_ranges: Vec<(u64, u64)> = gguf
+        .tensors
+        .iter()
+        .filter(|t| plan.tensors.get(&t.name) == Some(&aie_plan::Tier::Disk))
+        .map(|t| (gguf.file_offset(t), t.size))
+        .collect();
+    let disk_tier_bytes = disk_ranges.iter().map(|r| r.1).sum();
+
     let ctx = Context::new(model.clone(), cfg.context.clone()).map_err(|e| e.to_string())?;
     let status = pb::StatusReply {
         model_path: cfg.model.display().to_string(),
@@ -221,11 +243,15 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         misplaced,
         load_ms,
         plan_json,
+        disk_tier_bytes,
+        ..Default::default()
     };
     Ok(Loaded {
         ctx: Arc::new(Mutex::new(ctx)),
         model,
         status,
+        disk_ranges,
+        stats: Default::default(),
     })
 }
 
@@ -251,7 +277,20 @@ impl Worker for Service {
         &self,
         _: Request<pb::StatusRequest>,
     ) -> Result<Response<pb::StatusReply>, Status> {
-        Ok(Response::new(self.0.status.clone()))
+        let mut st = self.0.status.clone();
+        {
+            let s = self.0.stats.lock().unwrap();
+            st.requests = s.requests;
+            st.prompt_tokens = s.prompt_tokens;
+            st.completion_tokens = s.completion_tokens;
+            st.prefill_ns = s.prefill_ns;
+            st.decode_ns = s.decode_ns;
+            st.last_prefill_tps = s.last_prefill_tps;
+            st.last_decode_tps = s.last_decode_tps;
+        }
+        st.disk_tier_resident =
+            aie_llama::residency::resident_file_bytes(self.0.model.path(), &self.0.disk_ranges);
+        Ok(Response::new(st))
     }
 
     async fn tokenize(
@@ -305,6 +344,7 @@ impl Worker for Service {
             // One request at a time: wait for the context.
             let mut ctx = loaded.ctx.clone().lock_owned().await;
             let tx2 = tx.clone();
+            let loaded2 = loaded.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let mut utf8 = Utf8Stream::default();
                 let mut scan = stop::StopScanner::new(stops);
@@ -342,6 +382,16 @@ impl Worker for Service {
                     (Stop::ContextFull, ..) => Reason::ContextFull,
                     (Stop::Caller, ..) => Reason::Cancelled,
                 };
+                {
+                    let mut s = loaded2.stats.lock().unwrap();
+                    s.requests += 1;
+                    s.prompt_tokens += g.prompt_tokens as u64;
+                    s.completion_tokens += g.tokens.len() as u64;
+                    s.prefill_ns += g.prefill.as_nanos() as u64;
+                    s.decode_ns += g.decode.as_nanos() as u64;
+                    s.last_prefill_tps = g.prefill_tps() as f32;
+                    s.last_decode_tps = g.decode_tps() as f32;
+                }
                 Ok::<_, aie_llama::Error>(pb::Done {
                     reason: reason as i32,
                     prompt_tokens: g.prompt_tokens as u32,

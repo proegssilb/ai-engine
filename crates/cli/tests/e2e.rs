@@ -152,6 +152,24 @@ async fn serve_load_chat_place() {
     );
     assert!(p["loaded"]["planned"]["attention"]["ram"].as_u64().unwrap() > 0);
 
+    // live stats: the requests above are counted; the disk-tier FFN half
+    // was just read, so it's in RAM
+    let stats: Value = c
+        .get(format!("{base}/api/aie/placement?model={MODEL}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let s = &stats["loaded"]["stats"];
+    assert!(
+        s["requests"].as_u64().unwrap() >= 1 && s["completion_tokens"].as_u64().unwrap() >= 1,
+        "{s}"
+    );
+    assert!(s["disk_tier_bytes"].as_u64().unwrap() > 0, "{s}");
+    assert!(s["disk_tier_resident"].as_u64().unwrap() > 0, "{s}");
+
     // a placement that can't work is refused before it's saved
     let bad = json!({ "n_ctx": 2048, "layers": [{ "tier": "Disk", "amount": "Rest" }], "subsystems": {}, "embeddings": null, "output": null, "expert_cache_bytes": 0, "allow_repack": false });
     let r = c

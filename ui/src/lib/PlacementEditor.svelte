@@ -195,6 +195,22 @@
             <span class="error">{p.loaded.misplaced} weights not where planned</span>
           {/if}
         </div>
+        {#if p.loaded.stats}
+          {@const st = p.loaded.stats}
+          <div class="stats mono">
+            <span>{st.requests} request{st.requests === 1 ? '' : 's'}</span>
+            {#if st.requests > 0}
+              <span>prompt {st.prefill_tps.toFixed(0)} tok/s</span>
+              <span>generation {st.decode_tps.toFixed(1)} tok/s</span>
+              <span class="muted">last: {st.last_prefill_tps.toFixed(0)} / {st.last_decode_tps.toFixed(1)} tok/s</span>
+            {/if}
+            {#if st.disk_tier_bytes > 0}
+              <span title="Weights left in the mapped file may be dropped from RAM and re-read; this is how much is in RAM right now.">
+                disk tier {((100 * st.disk_tier_resident) / st.disk_tier_bytes).toFixed(0)}% in RAM
+              </span>
+            {/if}
+          </div>
+        {/if}
         <table>
           <thead><tr><th>Subsystem</th><th>Where</th><th></th></tr></thead>
           <tbody>
@@ -271,5 +287,11 @@
   }
   .wide {
     width: 180px;
+  }
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    margin-top: 8px;
   }
 </style>

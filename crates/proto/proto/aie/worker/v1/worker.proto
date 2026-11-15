@@ -30,6 +30,20 @@ message StatusReply {
   // aie_plan::Plan as JSON: where the weights were meant to go (for auto
   // placement, llama.cpp's fit resolved into a plan).
   string plan_json = 8;
+
+  // Running totals since load.
+  uint64 requests = 9;
+  uint64 prompt_tokens = 10;
+  uint64 completion_tokens = 11;
+  uint64 prefill_ns = 12;
+  uint64 decode_ns = 13;
+  // The last request's speeds.
+  float last_prefill_tps = 14;
+  float last_decode_tps = 15;
+  // Disk tier: bytes of weights left in the mapped file, and how many of
+  // them are in RAM right now (mincore; the kernel may drop them any time).
+  uint64 disk_tier_bytes = 16;
+  uint64 disk_tier_resident = 17;
 }
 
 message ChatMessage {

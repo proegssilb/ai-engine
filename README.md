@@ -60,7 +60,7 @@ busy). Against the MVP list in [features.md](docs/features.md):
 | Models | pull by Hugging Face shorthand and from OCI registries (verified, resumable, split models); local GGUF files; list, remove | choosing the disk per model; registry credentials (public only for now) |
 | Serving | ollama and OpenAI APIs with streaming; several models at once; keep-alive; one request at a time per model | |
 | Placement | anatomy; auto-place (llama.cpp's fit); intents by share per tier; fit check; apply on reload; every load verified weight by weight; web UI with machine view and placement editor (`/ui/`) | cross-check of overhead estimates with llama.cpp's dry run |
-| Monitoring | tokens and timings per response | per-model and per-device metrics; disk-tier residency |
+| Monitoring | per model: requests, tokens, prompt and generation speed, disk-tier residency (`/api/aie/stats`, UI); per device: free memory and what each model holds (`/api/aie/machine`) | Prometheus (v1) |
 
 ## Layout
 
