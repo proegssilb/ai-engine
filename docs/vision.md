@@ -32,7 +32,7 @@ which model sit where stays legible.
 
 ![Placement UI mockup: four models' subsystems assigned across GPUs, RAM and NVMe on a dual-socket machine](mockup.png)
 
-UI prototype (live, interactive version of the image above):
+UI prototype — a static mockup; the image above is a render of it:
 <https://claude.ai/artifact/JAwsY5NKMVw8kj1uMePY9d>
 
 Note the "Expert bank" in the mockup, split three ways — hot experts on a GPU,
