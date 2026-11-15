@@ -11,7 +11,13 @@ fn sample() -> Writer {
     Writer::new()
         .str("general.architecture", "qwen3moe")
         .u32("qwen3moe.block_count", 2)
-        .kv("tokenizer.ggml.tokens", Value::Array(8, vec![Value::String("a".into()), Value::String("▁b".into())]))
+        .kv(
+            "tokenizer.ggml.tokens",
+            Value::Array(
+                8,
+                vec![Value::String("a".into()), Value::String("▁b".into())],
+            ),
+        )
         .kv("some.float", Value::F32(0.5))
         .kv("some.bool", Value::Bool(true))
         .tensor("token_embd.weight", GgmlType::F16, &[64, 10])
@@ -29,7 +35,10 @@ fn roundtrip_full_file() {
     assert_eq!(g.arch_u64("block_count"), Some(2));
     assert_eq!(g.get("some.float"), Some(&Value::F32(0.5)));
     assert_eq!(g.get("some.bool"), Some(&Value::Bool(true)));
-    assert_eq!(g.get("tokenizer.ggml.tokens").unwrap().as_array().unwrap()[1].as_str(), Some("▁b"));
+    assert_eq!(
+        g.get("tokenizer.ggml.tokens").unwrap().as_array().unwrap()[1].as_str(),
+        Some("▁b")
+    );
     assert_eq!(g.tensors.len(), 3);
 
     let e = g.tensor("blk.0.ffn_up_exps.weight").unwrap();
@@ -74,36 +83,65 @@ fn rejects_what_llama_cpp_rejects() {
     // bad magic
     let mut bad = h.clone();
     bad[0] = b'X';
-    assert!(matches!(Gguf::from_reader(&bad[..]), Err(Error::BadMagic(_))));
+    assert!(matches!(
+        Gguf::from_reader(&bad[..]),
+        Err(Error::BadMagic(_))
+    ));
     // v1 and too-new versions
     for v in [1u32, 4, 0x0300_0000] {
         h[4..8].copy_from_slice(&v.to_le_bytes());
-        assert!(matches!(Gguf::from_reader(&h[..]), Err(Error::UnsupportedVersion(_))), "version {v}");
+        assert!(
+            matches!(Gguf::from_reader(&h[..]), Err(Error::UnsupportedVersion(_))),
+            "version {v}"
+        );
     }
     // name too long, duplicate name, too many dims, block-size mismatch
     let long = "x".repeat(64);
     for w in [
         Writer::new().tensor(long, GgmlType::F32, &[1]),
-        Writer::new().tensor("a", GgmlType::F32, &[1]).tensor("a", GgmlType::F32, &[1]),
+        Writer::new()
+            .tensor("a", GgmlType::F32, &[1])
+            .tensor("a", GgmlType::F32, &[1]),
         Writer::new().tensor("a", GgmlType::F32, &[1, 1, 1, 1, 1]),
         Writer::new().u32("general.alignment", 24),
     ] {
         let h = w.header().unwrap();
-        assert!(matches!(Gguf::from_reader(&h[..]), Err(Error::Malformed(_))));
+        assert!(matches!(
+            Gguf::from_reader(&h[..]),
+            Err(Error::Malformed(_))
+        ));
     }
-    assert!(Writer::new().tensor("q", GgmlType::Q4_K, &[100]).header().is_err());
+    assert!(
+        Writer::new()
+            .tensor("q", GgmlType::Q4_K, &[100])
+            .header()
+            .is_err()
+    );
     // truncated header
     let h = sample().header().unwrap();
-    assert!(matches!(Gguf::from_reader(&h[..40]), Err(Error::Malformed(_))));
+    assert!(matches!(
+        Gguf::from_reader(&h[..40]),
+        Err(Error::Malformed(_))
+    ));
 }
 
 #[test]
 fn rejects_non_contiguous_offsets() {
-    let mut h = Writer::new().tensor("a", GgmlType::F32, &[8]).tensor("b", GgmlType::F32, &[8]).header().unwrap();
+    let mut h = Writer::new()
+        .tensor("a", GgmlType::F32, &[8])
+        .tensor("b", GgmlType::F32, &[8])
+        .header()
+        .unwrap();
     // the last u64 before padding is b's offset (32); make it 64
     let g = Gguf::from_reader(&h[..]).unwrap();
-    let pos = (0..h.len() - 8).rev().find(|&i| u64::from_le_bytes(h[i..i + 8].try_into().unwrap()) == 32).unwrap();
+    let pos = (0..h.len() - 8)
+        .rev()
+        .find(|&i| u64::from_le_bytes(h[i..i + 8].try_into().unwrap()) == 32)
+        .unwrap();
     assert_eq!(g.tensor("b").unwrap().offset, 32);
     h[pos..pos + 8].copy_from_slice(&64u64.to_le_bytes());
-    assert!(matches!(Gguf::from_reader(&h[..]), Err(Error::Malformed(_))));
+    assert!(matches!(
+        Gguf::from_reader(&h[..]),
+        Err(Error::Malformed(_))
+    ));
 }

@@ -26,7 +26,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{} @ {rev}", r.repo);
         println!("tags: {}", hf::tags(&files).join(" "));
         for f in hf::select(&files, r.tag.as_deref())? {
-            println!("  {}  {:.2} GiB  sha256 {}", f.path, f.size as f64 / (1u64 << 30) as f64, f.sha256.as_deref().unwrap_or("-"));
+            println!(
+                "  {}  {:.2} GiB  sha256 {}",
+                f.path,
+                f.size as f64 / (1u64 << 30) as f64,
+                f.sha256.as_deref().unwrap_or("-")
+            );
         }
         return Ok(());
     }
@@ -36,7 +41,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pull(&hub, &r, &mut |p| {
             if p.done == p.total || p.done - last > 256 << 20 {
                 last = p.done;
-                eprintln!("{}: {:.0}%", p.file, 100.0 * p.done as f64 / p.total.max(1) as f64);
+                eprintln!(
+                    "{}: {:.0}%",
+                    p.file,
+                    100.0 * p.done as f64 / p.total.max(1) as f64
+                );
             }
         })
         .await?;

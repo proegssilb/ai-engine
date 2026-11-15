@@ -27,8 +27,17 @@ fn main() {
     for t in &g.tensors {
         w = w.tensor(t.name.clone(), t.ty, &t.dims);
     }
-    w.write_header_file(&dst).unwrap_or_else(|e| panic!("{dst}: {e}"));
+    w.write_header_file(&dst)
+        .unwrap_or_else(|e| panic!("{dst}: {e}"));
     let out = Gguf::open_header(&dst).expect("fixture must parse");
-    assert_eq!(out.tensors, g.tensors, "tensor table must be preserved exactly");
-    eprintln!("{dst}: {} tensors, {} metadata keys, {} bytes", out.tensors.len(), out.metadata.len(), std::fs::metadata(&dst).unwrap().len());
+    assert_eq!(
+        out.tensors, g.tensors,
+        "tensor table must be preserved exactly"
+    );
+    eprintln!(
+        "{dst}: {} tensors, {} metadata keys, {} bytes",
+        out.tensors.len(),
+        out.metadata.len(),
+        std::fs::metadata(&dst).unwrap().len()
+    );
 }

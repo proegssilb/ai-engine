@@ -64,7 +64,10 @@ impl Share {
         Share { tier, amount }
     }
     pub fn all(tier: Tier) -> Self {
-        Share { tier, amount: Amount::Rest }
+        Share {
+            tier,
+            amount: Amount::Rest,
+        }
     }
 }
 

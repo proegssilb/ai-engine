@@ -9,7 +9,13 @@ fn main() {
         eprintln!("{path}: {e}");
         std::process::exit(1)
     });
-    println!("version {} alignment {} data_offset {} n_kv {}", g.version, g.alignment, g.data_offset, g.metadata.len());
+    println!(
+        "version {} alignment {} data_offset {} n_kv {}",
+        g.version,
+        g.alignment,
+        g.data_offset,
+        g.metadata.len()
+    );
     for t in &g.tensors {
         let mut ne = [1u64; 4];
         ne[..t.dims.len()].copy_from_slice(&t.dims);

@@ -9,7 +9,9 @@ const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 
 fn model(name: &str) -> Anatomy {
-    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(name);
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(name);
     Anatomy::from_gguf(&Gguf::open_header(p).unwrap()).unwrap()
 }
 
@@ -19,8 +21,19 @@ fn moe() -> Anatomy {
 
 /// The GPU test box: 2x 32 GB, 47 GB RAM.
 fn test_box() -> Machine {
-    let gpu = |i| Capacity { name: format!("CUDA{i}"), total: 32 * GIB, free: 32 * GIB - 300 * MIB };
-    Machine { gpus: vec![gpu(0), gpu(1)], ram: Capacity { name: "RAM".into(), total: 47 * GIB, free: 44 * GIB } }
+    let gpu = |i| Capacity {
+        name: format!("CUDA{i}"),
+        total: 32 * GIB,
+        free: 32 * GIB - 300 * MIB,
+    };
+    Machine {
+        gpus: vec![gpu(0), gpu(1)],
+        ram: Capacity {
+            name: "RAM".into(),
+            total: 47 * GIB,
+            free: 44 * GIB,
+        },
+    }
 }
 
 /// plan -> compile -> what llama.cpp will do must equal the plan, tensor by tensor.
@@ -37,7 +50,10 @@ fn assert_round_trip(a: &Anatomy, intent: &Intent, gpus: u32) -> llama::Settings
 
 fn experts_split(gpu: f64, ram: f64) -> Intent {
     let mut i = Intent::all_on(Tier::Gpu(0), 4096);
-    i.layers = vec![Share::new(Tier::Gpu(0), Amount::Fraction(0.5)), Share::all(Tier::Gpu(1))];
+    i.layers = vec![
+        Share::new(Tier::Gpu(0), Amount::Fraction(0.5)),
+        Share::all(Tier::Gpu(1)),
+    ];
     i.subsystems.insert(
         Subsystem::RoutedExperts,
         vec![
@@ -63,7 +79,10 @@ fn all_on_one_gpu_needs_no_rules() {
 fn even_split_across_two_gpus() {
     let a = moe();
     let mut i = Intent::all_on(Tier::Gpu(0), 4096);
-    i.layers = vec![Share::new(Tier::Gpu(0), Amount::Fraction(0.5)), Share::new(Tier::Gpu(1), Amount::Fraction(0.5))];
+    i.layers = vec![
+        Share::new(Tier::Gpu(0), Amount::Fraction(0.5)),
+        Share::new(Tier::Gpu(1), Amount::Fraction(0.5)),
+    ];
     let s = assert_round_trip(&a, &i, 2);
     assert_eq!(s.tensor_split, vec![24.0, 25.0]);
     assert!(s.overrides.is_empty());
@@ -80,14 +99,31 @@ fn experts_ten_eighty_ten() {
     let total: u64 = by.values().sum();
     let share = |t| by.get(&t).copied().unwrap_or(0) as f64 / total as f64;
     // whole layers of 324-373.5 MiB out of 16740 MiB: within about one layer (~2.2%)
-    assert!((share(Tier::Gpu(1)) - 0.1).abs() < 0.025, "gpu {}", share(Tier::Gpu(1)));
-    assert!((share(Tier::Ram) - 0.8).abs() < 0.025, "ram {}", share(Tier::Ram));
-    assert!((share(Tier::Disk) - 0.1).abs() < 0.025, "disk {}", share(Tier::Disk));
+    assert!(
+        (share(Tier::Gpu(1)) - 0.1).abs() < 0.025,
+        "gpu {}",
+        share(Tier::Gpu(1))
+    );
+    assert!(
+        (share(Tier::Ram) - 0.8).abs() < 0.025,
+        "ram {}",
+        share(Tier::Ram)
+    );
+    assert!(
+        (share(Tier::Disk) - 0.1).abs() < 0.025,
+        "disk {}",
+        share(Tier::Disk)
+    );
 
     // GPU experts come from layers already homed on GPU 1 (no extra hop)
     for part in a.parts_of(Subsystem::RoutedExperts) {
         if p.tensors[&part.name] == Tier::Gpu(1) {
-            assert_eq!(p.layer_home[part.layer.unwrap() as usize], Tier::Gpu(1), "{}", part.name);
+            assert_eq!(
+                p.layer_home[part.layer.unwrap() as usize],
+                Tier::Gpu(1),
+                "{}",
+                part.name
+            );
         }
     }
     // rules are grouped: a handful, not one per tensor
@@ -100,21 +136,35 @@ fn experts_ten_eighty_ten() {
 fn ram_homed_layers_go_first_and_are_pinned() {
     let a = moe();
     let mut i = Intent::all_on(Tier::Gpu(0), 4096);
-    i.layers = vec![Share::new(Tier::Gpu(0), Amount::Fraction(0.75)), Share::all(Tier::Ram)];
+    i.layers = vec![
+        Share::new(Tier::Gpu(0), Amount::Fraction(0.75)),
+        Share::all(Tier::Ram),
+    ];
     let s = assert_round_trip(&a, &i, 1);
     let p = plan(&a, &i, 1).unwrap();
     assert_eq!(p.layer_counts()[&Tier::Ram], 12);
     assert!(p.layer_home[..12].iter().all(|t| *t == Tier::Ram));
     assert_eq!(s.n_gpu_layers, 37);
     // everything in those 12 layers needs an explicit pinned rule
-    assert!(p.tensors.iter().filter(|(n, _)| n.starts_with("blk.0.")).all(|(_, t)| *t == Tier::Ram));
+    assert!(
+        p.tensors
+            .iter()
+            .filter(|(n, _)| n.starts_with("blk.0."))
+            .all(|(_, t)| *t == Tier::Ram)
+    );
 }
 
 #[test]
 fn dense_model_ffn_split() {
     let a = model("qwen3-8b-q4_k_m.header.gguf");
     let mut i = Intent::all_on(Tier::Gpu(0), 8192);
-    i.subsystems.insert(Subsystem::DenseFfn, vec![Share::new(Tier::Gpu(0), Amount::Fraction(0.5)), Share::all(Tier::Ram)]);
+    i.subsystems.insert(
+        Subsystem::DenseFfn,
+        vec![
+            Share::new(Tier::Gpu(0), Amount::Fraction(0.5)),
+            Share::all(Tier::Ram),
+        ],
+    );
     i.embeddings = Some(Tier::Ram);
     assert_round_trip(&a, &i, 1);
 }
@@ -125,7 +175,10 @@ fn bytes_amounts() {
     let mut i = experts_split(0.0, 0.0);
     i.subsystems.insert(
         Subsystem::RoutedExperts,
-        vec![Share::new(Tier::Gpu(1), Amount::Bytes(4 * GIB)), Share::all(Tier::Ram)],
+        vec![
+            Share::new(Tier::Gpu(1), Amount::Bytes(4 * GIB)),
+            Share::all(Tier::Ram),
+        ],
     );
     let p = plan(&a, &i, 2).unwrap();
     let on_gpu = p.subsystem_by_tier(&a, Subsystem::RoutedExperts)[&Tier::Gpu(1)];
@@ -139,18 +192,34 @@ fn errors() {
     let mut i = Intent::all_on(Tier::Disk, 4096);
     assert_eq!(plan(&a, &i, 1), Err(PlanError::LayersOnDisk));
     i = Intent::all_on(Tier::Gpu(2), 4096);
-    assert_eq!(plan(&a, &i, 2), Err(PlanError::NoSuchGpu { index: 2, gpus: 2 }));
+    assert_eq!(
+        plan(&a, &i, 2),
+        Err(PlanError::NoSuchGpu { index: 2, gpus: 2 })
+    );
     i = Intent::all_on(Tier::Gpu(0), 4096);
     i.layers = vec![Share::new(Tier::Gpu(0), Amount::Fraction(0.5))];
     assert!(matches!(plan(&a, &i, 1), Err(PlanError::Uncovered { .. })));
     i = experts_split(0.7, 0.7);
-    assert!(matches!(plan(&a, &i, 2), Err(PlanError::OverCommitted { .. })));
+    assert!(matches!(
+        plan(&a, &i, 2),
+        Err(PlanError::OverCommitted { .. })
+    ));
     i = experts_split(0.1, 0.1);
-    i.subsystems.get_mut(&Subsystem::RoutedExperts).unwrap().push(Share::all(Tier::Ram));
-    assert!(matches!(plan(&a, &i, 2), Err(PlanError::MoreThanOneRest(_))));
+    i.subsystems
+        .get_mut(&Subsystem::RoutedExperts)
+        .unwrap()
+        .push(Share::all(Tier::Ram));
+    assert!(matches!(
+        plan(&a, &i, 2),
+        Err(PlanError::MoreThanOneRest(_))
+    ));
     i = Intent::all_on(Tier::Gpu(0), 4096);
-    i.subsystems.insert(Subsystem::Embeddings, vec![Share::all(Tier::Ram)]);
-    assert_eq!(plan(&a, &i, 1), Err(PlanError::NotPerLayer(Subsystem::Embeddings)));
+    i.subsystems
+        .insert(Subsystem::Embeddings, vec![Share::all(Tier::Ram)]);
+    assert_eq!(
+        plan(&a, &i, 1),
+        Err(PlanError::NotPerLayer(Subsystem::Embeddings))
+    );
     i = Intent::all_on(Tier::Gpu(0), 4096);
     i.layers = vec![Share::new(Tier::Gpu(0), Amount::Fraction(1.5))];
     assert_eq!(plan(&a, &i, 1), Err(PlanError::BadFraction(1.5)));
@@ -182,7 +251,10 @@ fn fit_check() {
     let ram = r.devices.iter().find(|d| d.tier == Tier::Ram).unwrap();
     assert!(ram.need.weights > 13 * GIB);
     let g0 = r.devices.iter().find(|d| d.tier == Tier::Gpu(0)).unwrap();
-    assert_eq!(g0.need.overhead, o.cuda_context + o.gpu_compute + o.op_offload);
+    assert_eq!(
+        g0.need.overhead,
+        o.cuda_context + o.gpu_compute + o.op_offload
+    );
     // disk-tier experts don't count against RAM
     assert!(r.disk_bytes > GIB);
 }
@@ -221,7 +293,11 @@ fn repack_choice_sets_both_flags() {
 fn rules_are_anchored_and_disjoint() {
     let a = moe();
     let s = llama::compile(&a, &plan(&a, &experts_split(0.1, 0.8), 2).unwrap(), 2).unwrap();
-    let res: Vec<regex::Regex> = s.overrides.iter().map(|o| regex::Regex::new(&o.pattern).unwrap()).collect();
+    let res: Vec<regex::Regex> = s
+        .overrides
+        .iter()
+        .map(|o| regex::Regex::new(&o.pattern).unwrap())
+        .collect();
     let mut hits: BTreeMap<&str, usize> = BTreeMap::new();
     for p in &a.parts {
         let n = res.iter().filter(|r| r.is_match(&p.name)).count();
@@ -230,7 +306,11 @@ fn rules_are_anchored_and_disjoint() {
     }
     // anchoring: blk.1 must not match a rule for blk.11
     for o in &s.overrides {
-        assert!(o.pattern.starts_with('^') && o.pattern.ends_with('$'), "{}", o.pattern);
+        assert!(
+            o.pattern.starts_with('^') && o.pattern.ends_with('$'),
+            "{}",
+            o.pattern
+        );
     }
 }
 
@@ -240,7 +320,10 @@ fn show_example() {
     let a = moe();
     let p = plan(&a, &experts_split(0.1, 0.8), 2).unwrap();
     let s = llama::compile(&a, &p, 2).unwrap();
-    println!("n_gpu_layers {} tensor_split {:?}", s.n_gpu_layers, s.tensor_split);
+    println!(
+        "n_gpu_layers {} tensor_split {:?}",
+        s.n_gpu_layers, s.tensor_split
+    );
     for o in &s.overrides {
         println!("{} = {}", o.pattern, o.dest);
     }

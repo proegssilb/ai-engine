@@ -97,7 +97,9 @@ pub enum CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CompileError::UnsupportedLayout(m) => write!(f, "layer layout llama.cpp can't express: {m}"),
+            CompileError::UnsupportedLayout(m) => {
+                write!(f, "layer layout llama.cpp can't express: {m}")
+            }
             CompileError::MissingTensor(t) => write!(f, "plan has no placement for tensor {t}"),
         }
     }
@@ -123,12 +125,21 @@ pub fn compile(a: &Anatomy, plan: &Plan, gpus: u32) -> Result<Settings, CompileE
     // (dest, tensor kind) -> layers (None for non-layer tensors)
     let mut groups: BTreeMap<(BufDest, String), Vec<Option<u32>>> = BTreeMap::new();
     for p in &a.parts {
-        let want = BufDest::of(*plan.tensors.get(&p.name).ok_or_else(|| CompileError::MissingTensor(p.name.clone()))?);
+        let want = BufDest::of(
+            *plan
+                .tensors
+                .get(&p.name)
+                .ok_or_else(|| CompileError::MissingTensor(p.name.clone()))?,
+        );
         if defaults[&p.name] == want {
             continue;
         }
         let key = match p.layer {
-            Some(l) => p.name.strip_prefix(&format!("blk.{l}.")).unwrap_or(&p.name).to_string(),
+            Some(l) => p
+                .name
+                .strip_prefix(&format!("blk.{l}."))
+                .unwrap_or(&p.name)
+                .to_string(),
             None => p.name.clone(),
         };
         groups.entry((want, key)).or_default().push(p.layer);
@@ -168,13 +179,17 @@ fn layer_counts(homes: &[Tier], gpus: u32) -> Result<Vec<u32>, CompileError> {
     let rank = |t: &Tier| match t {
         Tier::Ram => Ok(-1i64),
         Tier::Gpu(i) if *i < gpus => Ok(i64::from(*i)),
-        t => Err(CompileError::UnsupportedLayout(format!("a layer is homed on {t}"))),
+        t => Err(CompileError::UnsupportedLayout(format!(
+            "a layer is homed on {t}"
+        ))),
     };
     let mut prev = -1i64;
     for (l, h) in homes.iter().enumerate() {
         let r = rank(h)?;
         if r < prev {
-            return Err(CompileError::UnsupportedLayout(format!("layer {l} on {h} comes after a later device")));
+            return Err(CompileError::UnsupportedLayout(format!(
+                "layer {l} on {h} comes after a later device"
+            )));
         }
         prev = r;
         if let Tier::Gpu(i) = h {
@@ -205,10 +220,18 @@ fn layer_devices(n_layers: u32, n_gpu_layers: i32, tensor_split: &[f32]) -> Vec<
         *s = sum;
     }
     for (i, s) in splits.iter_mut().enumerate() {
-        *s = if sum != 0.0 { *s / sum } else { (i + 1) as f32 / n_dev as f32 };
+        *s = if sum != 0.0 {
+            *s / sum
+        } else {
+            (i + 1) as f32 / n_dev as f32
+        };
     }
     let start = (n_all + 1 - n_gpu_layers).max(0);
-    let act = if n_dev == 0 { 0 } else { n_gpu_layers.min(n_all + 1) };
+    let act = if n_dev == 0 {
+        0
+    } else {
+        n_gpu_layers.min(n_all + 1)
+    };
     (0..=n_all)
         .map(|il| {
             if il < start || il - start >= act {
@@ -221,7 +244,11 @@ fn layer_devices(n_layers: u32, n_gpu_layers: i32, tensor_split: &[f32]) -> Vec<
         .collect()
 }
 
-fn default_devices(a: &Anatomy, n_gpu_layers: i32, tensor_split: &[f32]) -> BTreeMap<String, BufDest> {
+fn default_devices(
+    a: &Anatomy,
+    n_gpu_layers: i32,
+    tensor_split: &[f32],
+) -> BTreeMap<String, BufDest> {
     let devs = layer_devices(a.layers, n_gpu_layers, tensor_split);
     let to = |d: Option<u32>| d.map(BufDest::Device).unwrap_or(BufDest::Cpu);
     a.parts
@@ -241,14 +268,20 @@ fn default_devices(a: &Anatomy, n_gpu_layers: i32, tensor_split: &[f32]) -> BTre
 /// Predict where llama.cpp puts each tensor under `s`, assuming mmap on and no
 /// repacking (as compiled unless the plan allows repacking).
 pub fn resolve(a: &Anatomy, s: &Settings) -> Result<BTreeMap<String, Tier>, regex::Error> {
-    let rules: Vec<(regex::Regex, BufDest)> =
-        s.overrides.iter().map(|o| Ok((regex::Regex::new(&o.pattern)?, o.dest))).collect::<Result<_, regex::Error>>()?;
+    let rules: Vec<(regex::Regex, BufDest)> = s
+        .overrides
+        .iter()
+        .map(|o| Ok((regex::Regex::new(&o.pattern)?, o.dest)))
+        .collect::<Result<_, regex::Error>>()?;
     let defaults = default_devices(a, s.n_gpu_layers, &s.tensor_split);
-    Ok(a
-        .parts
+    Ok(a.parts
         .iter()
         .map(|p| {
-            let d = rules.iter().find(|(re, _)| re.is_match(&p.name)).map(|(_, d)| *d).unwrap_or(defaults[&p.name]);
+            let d = rules
+                .iter()
+                .find(|(re, _)| re.is_match(&p.name))
+                .map(|(_, d)| *d)
+                .unwrap_or(defaults[&p.name]);
             (p.name.clone(), d.tier())
         })
         .collect())
@@ -291,14 +324,21 @@ mod tests {
             let last = if b > 0 { 1 } else { 0 };
             split[last] += 1.0;
             let d = layer_devices(48, 49, &split);
-            assert_eq!(d.iter().take(48).filter(|x| **x == Some(0)).count() as u32, a, "split {a}/{b}");
+            assert_eq!(
+                d.iter().take(48).filter(|x| **x == Some(0)).count() as u32,
+                a,
+                "split {a}/{b}"
+            );
         }
     }
 
     #[test]
     fn layout_rules() {
         use Tier::*;
-        assert_eq!(layer_counts(&[Ram, Gpu(0), Gpu(0), Gpu(1)], 2), Ok(vec![2, 1]));
+        assert_eq!(
+            layer_counts(&[Ram, Gpu(0), Gpu(0), Gpu(1)], 2),
+            Ok(vec![2, 1])
+        );
         assert!(layer_counts(&[Gpu(0), Ram], 2).is_err());
         assert!(layer_counts(&[Gpu(1), Gpu(0)], 2).is_err());
         assert!(layer_counts(&[Disk], 2).is_err());

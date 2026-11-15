@@ -43,13 +43,22 @@ impl Hub {
     /// `base` is `https://huggingface.co` in production. The token, if any,
     /// is sent for gated or private repos.
     pub fn new(base: impl Into<String>, token: Option<String>) -> Result<Hub, Error> {
-        let http = reqwest::Client::builder().user_agent(concat!("ai-engine/", env!("CARGO_PKG_VERSION"))).build()?;
-        Ok(Hub { base: base.into().trim_end_matches('/').to_string(), http, token })
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("ai-engine/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Hub {
+            base: base.into().trim_end_matches('/').to_string(),
+            http,
+            token,
+        })
     }
 
     /// The public hub, with `HF_TOKEN` from the environment if set.
     pub fn public() -> Result<Hub, Error> {
-        Hub::new("https://huggingface.co", std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()))
+        Hub::new(
+            "https://huggingface.co",
+            std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()),
+        )
     }
 
     pub(crate) fn get(&self, url: &str) -> reqwest::RequestBuilder {
@@ -63,7 +72,10 @@ impl Hub {
     /// The commit a branch or tag currently points to.
     pub async fn revision(&self, repo: &str, rev: &str) -> Result<String, Error> {
         let url = format!("{}/api/models/{repo}/revision/{rev}", self.base);
-        let r: Revision = check(self.get(&url).send().await?, &url).await?.json().await?;
+        let r: Revision = check(self.get(&url).send().await?, &url)
+            .await?
+            .json()
+            .await?;
         Ok(r.sha)
     }
 
@@ -75,11 +87,16 @@ impl Hub {
             let resp = check(self.get(&url).send().await?, &url).await?;
             let next = next_link(resp.headers());
             let entries: Vec<TreeEntry> = resp.json().await?;
-            out.extend(entries.into_iter().filter(|e| e.kind == "file").map(|e| RepoFile {
-                path: e.path,
-                size: e.size,
-                sha256: e.lfs.map(|l| l.oid),
-            }));
+            out.extend(
+                entries
+                    .into_iter()
+                    .filter(|e| e.kind == "file")
+                    .map(|e| RepoFile {
+                        path: e.path,
+                        size: e.size,
+                        sha256: e.lfs.map(|l| l.oid),
+                    }),
+            );
             match next {
                 Some(n) => url = n,
                 None => return Ok(out),
@@ -110,7 +127,12 @@ fn next_link(h: &reqwest::header::HeaderMap) -> Option<String> {
     let v = h.get(reqwest::header::LINK)?.to_str().ok()?;
     v.split(',').find_map(|part| {
         let (url, params) = part.split_once(';')?;
-        params.contains("rel=\"next\"").then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        params.contains("rel=\"next\"").then(|| {
+            url.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
     })
 }
 
@@ -119,7 +141,12 @@ fn next_link(h: &reqwest::header::HeaderMap) -> Option<String> {
 pub fn stem_of(path: &str) -> Option<String> {
     let name = path.rsplit('/').next()?;
     let stem = name.strip_suffix(".gguf")?;
-    Some(strip_split(stem).map(|(s, _, _)| s).unwrap_or(stem).to_string())
+    Some(
+        strip_split(stem)
+            .map(|(s, _, _)| s)
+            .unwrap_or(stem)
+            .to_string(),
+    )
 }
 
 /// Whether a file stem carries a tag: equal to it, or ending in `-TAG`
@@ -147,7 +174,11 @@ fn is_model_gguf(path: &str) -> bool {
 /// The tags a repo offers, sorted: model file names with the part they all
 /// share removed (`Qwen3-30B-A3B-UD-Q4_K_XL` -> `UD-Q4_K_XL`).
 pub fn tags(files: &[RepoFile]) -> Vec<String> {
-    let mut stems: Vec<String> = files.iter().filter(|f| is_model_gguf(&f.path)).filter_map(|f| stem_of(&f.path)).collect();
+    let mut stems: Vec<String> = files
+        .iter()
+        .filter(|f| is_model_gguf(&f.path))
+        .filter_map(|f| stem_of(&f.path))
+        .collect();
     stems.sort();
     stems.dedup();
     let cut = match stems.as_slice() {
@@ -157,12 +188,22 @@ pub fn tags(files: &[RepoFile]) -> Vec<String> {
             // longest common prefix that ends at a '-'
             let mut n = first.len();
             for s in rest {
-                n = n.min(first.bytes().zip(s.bytes()).take_while(|(a, b)| a == b).count());
+                n = n.min(
+                    first
+                        .bytes()
+                        .zip(s.bytes())
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                );
             }
             first[..n].rfind('-').map(|i| i + 1).unwrap_or(0)
         }
     };
-    let mut t: Vec<String> = stems.iter().map(|s| s[cut.min(s.len())..].to_string()).filter(|t| !t.is_empty()).collect();
+    let mut t: Vec<String> = stems
+        .iter()
+        .map(|s| s[cut.min(s.len())..].to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
     t.sort_by_key(|s| s.to_ascii_uppercase());
     t.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     t
@@ -177,7 +218,9 @@ pub fn select<'a>(files: &'a [RepoFile], tag: Option<&str>) -> Result<Vec<&'a Re
     let offered = tags(files);
     let tag = match tag {
         Some(t) => t.to_string(),
-        None if offered.iter().any(|t| t.eq_ignore_ascii_case(DEFAULT_TAG)) => DEFAULT_TAG.to_string(),
+        None if offered.iter().any(|t| t.eq_ignore_ascii_case(DEFAULT_TAG)) => {
+            DEFAULT_TAG.to_string()
+        }
         None if offered.len() == 1 => offered[0].clone(),
         None => return Err(Error::AmbiguousTag { offered }),
     };
@@ -198,17 +241,27 @@ pub fn select<'a>(files: &'a [RepoFile], tag: Option<&str>) -> Result<Vec<&'a Re
     if chosen.iter().any(|f| stem(f) != first) {
         return Err(Error::Http(format!(
             "tag {tag} matches several files: {}",
-            chosen.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(", ")
+            chosen
+                .iter()
+                .map(|f| f.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     chosen.sort_by_key(|f| f.path.clone());
     if let Some((_, _, of)) = strip_split(chosen[0].path.strip_suffix(".gguf").unwrap())
         && chosen.len() as u32 != of
     {
-        return Err(Error::Http(format!("tag {tag}: expected {of} split parts, found {}", chosen.len())));
+        return Err(Error::Http(format!(
+            "tag {tag}: expected {of} split parts, found {}",
+            chosen.len()
+        )));
     }
     if let Some(f) = chosen.iter().find(|f| f.sha256.is_none()) {
-        return Err(Error::Http(format!("{}: no SHA-256 (not stored with Git LFS), can't verify it", f.path)));
+        return Err(Error::Http(format!(
+            "{}: no SHA-256 (not stored with Git LFS), can't verify it",
+            f.path
+        )));
     }
     Ok(chosen)
 }
@@ -218,12 +271,19 @@ mod tests {
     use super::*;
 
     fn f(path: &str) -> RepoFile {
-        RepoFile { path: path.into(), size: 1, sha256: Some("00".repeat(32)) }
+        RepoFile {
+            path: path.into(),
+            size: 1,
+            sha256: Some("00".repeat(32)),
+        }
     }
 
     #[test]
     fn stems_and_tag_matching() {
-        assert_eq!(stem_of("BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf").as_deref(), Some("Qwen3-30B-A3B-BF16"));
+        assert_eq!(
+            stem_of("BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf").as_deref(),
+            Some("Qwen3-30B-A3B-BF16")
+        );
         assert_eq!(stem_of("README.md"), None);
         assert!(has_tag("Qwen3-30B-A3B-UD-Q4_K_XL", "ud-q4_k_xl"));
         assert!(has_tag("Qwen3-30B-A3B-UD-Q4_K_XL", "Q4_K_XL"));
@@ -231,7 +291,10 @@ mod tests {
         assert!(!has_tag("Qwen3-30B-A3B-Q4_K_M", "K_M"));
         let one = [f("Qwen3-8B-Q4_K_M.gguf")];
         assert_eq!(tags(&one), vec!["Q4_K_M"]);
-        let unsloth = [f("Qwen3-30B-A3B-UD-Q4_K_XL.gguf"), f("Qwen3-30B-A3B-Q4_K_M.gguf")];
+        let unsloth = [
+            f("Qwen3-30B-A3B-UD-Q4_K_XL.gguf"),
+            f("Qwen3-30B-A3B-Q4_K_M.gguf"),
+        ];
         assert_eq!(tags(&unsloth), vec!["Q4_K_M", "UD-Q4_K_XL"]);
     }
 
@@ -247,12 +310,30 @@ mod tests {
             f("README.md"),
         ];
         assert_eq!(tags(&files), vec!["BF16", "Q2_K", "Q2_K_L", "Q4_K_M"]);
-        let p = |t| select(&files, t).unwrap().iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        let p = |t| {
+            select(&files, t)
+                .unwrap()
+                .iter()
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+        };
         assert_eq!(p(Some("q2_k")), vec!["Qwen3-30B-A3B-Q2_K.gguf"]);
         assert_eq!(p(None), vec!["Qwen3-30B-A3B-Q4_K_M.gguf"]);
-        assert_eq!(p(Some("BF16")), vec!["BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf", "BF16/Qwen3-30B-A3B-BF16-00002-of-00002.gguf"]);
-        assert!(matches!(select(&files, Some("Q8_0")), Err(Error::NoSuchTag { .. })));
-        assert!(matches!(select(&files[..2], None), Err(Error::AmbiguousTag { .. })));
+        assert_eq!(
+            p(Some("BF16")),
+            vec![
+                "BF16/Qwen3-30B-A3B-BF16-00001-of-00002.gguf",
+                "BF16/Qwen3-30B-A3B-BF16-00002-of-00002.gguf"
+            ]
+        );
+        assert!(matches!(
+            select(&files, Some("Q8_0")),
+            Err(Error::NoSuchTag { .. })
+        ));
+        assert!(matches!(
+            select(&files[..2], None),
+            Err(Error::AmbiguousTag { .. })
+        ));
         // a missing split part is caught
         assert!(select(&files[..4], Some("BF16")).is_err());
     }
@@ -260,7 +341,10 @@ mod tests {
     #[test]
     fn link_header() {
         let mut h = reqwest::header::HeaderMap::new();
-        h.insert(reqwest::header::LINK, "<https://x/api?cursor=abc>; rel=\"next\"".parse().unwrap());
+        h.insert(
+            reqwest::header::LINK,
+            "<https://x/api?cursor=abc>; rel=\"next\"".parse().unwrap(),
+        );
         assert_eq!(next_link(&h).as_deref(), Some("https://x/api?cursor=abc"));
     }
 }

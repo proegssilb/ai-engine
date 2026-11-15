@@ -1,4 +1,6 @@
-use crate::{DEFAULT_ALIGNMENT, Gguf, GgmlType, MAGIC, MAX_DIMS, MAX_NAME, TensorInfo, VERSION, Value, pad};
+use crate::{
+    DEFAULT_ALIGNMENT, GgmlType, Gguf, MAGIC, MAX_DIMS, MAX_NAME, TensorInfo, VERSION, Value, pad,
+};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs::File;
@@ -15,7 +17,10 @@ pub enum Error {
     UnsupportedVersion(u32),
     Malformed(String),
     /// The file ends before the tensor data does.
-    Truncated { needed: u64, actual: u64 },
+    Truncated {
+        needed: u64,
+        actual: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -23,9 +28,13 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::BadMagic(m) => write!(f, "not a GGUF file (magic {m:#010x})"),
-            Error::UnsupportedVersion(v) => write!(f, "unsupported GGUF version {v} (supported: 2-{VERSION})"),
+            Error::UnsupportedVersion(v) => {
+                write!(f, "unsupported GGUF version {v} (supported: 2-{VERSION})")
+            }
             Error::Malformed(m) => write!(f, "malformed GGUF: {m}"),
-            Error::Truncated { needed, actual } => write!(f, "file is truncated: needs {needed} bytes, has {actual}"),
+            Error::Truncated { needed, actual } => {
+                write!(f, "file is truncated: needs {needed} bytes, has {actual}")
+            }
         }
     }
 }
@@ -59,7 +68,10 @@ pub(crate) fn open(path: &Path, check_len: bool) -> Result<Gguf, Error> {
     let g = parse(BufReader::with_capacity(1 << 20, file))?;
     let needed = g.data_offset + g.data_size();
     if check_len && len < needed {
-        return Err(Error::Truncated { needed, actual: len });
+        return Err(Error::Truncated {
+            needed,
+            actual: len,
+        });
     }
     Ok(g)
 }
@@ -90,7 +102,9 @@ impl<R: Read> Counted<R> {
         let got = (&mut self.inner).take(len).read_to_end(&mut buf)? as u64;
         self.pos += got;
         if got != len {
-            return malformed(format!("string of {len} bytes runs past the end of the file"));
+            return malformed(format!(
+                "string of {len} bytes runs past the end of the file"
+            ));
         }
         String::from_utf8(buf).or_else(|_| malformed("string is not valid UTF-8"))
     }
@@ -167,14 +181,20 @@ pub(crate) fn parse(r: impl Read) -> Result<Gguf, Error> {
     for i in 0..n_tensors {
         let name = r.string()?;
         if name.len() >= MAX_NAME {
-            return malformed(format!("tensor {i} name is {} bytes (limit {})", name.len(), MAX_NAME - 1));
+            return malformed(format!(
+                "tensor {i} name is {} bytes (limit {})",
+                name.len(),
+                MAX_NAME - 1
+            ));
         }
         if !seen.insert(name.clone()) {
             return malformed(format!("duplicate tensor name {name:?}"));
         }
         let n_dims = r.u32()? as usize;
         if n_dims > MAX_DIMS {
-            return malformed(format!("tensor {name:?} has {n_dims} dimensions (max {MAX_DIMS})"));
+            return malformed(format!(
+                "tensor {name:?} has {n_dims} dimensions (max {MAX_DIMS})"
+            ));
         }
         let mut dims = Vec::with_capacity(n_dims);
         for _ in 0..n_dims {
@@ -189,17 +209,28 @@ pub(crate) fn parse(r: impl Read) -> Result<Gguf, Error> {
             return malformed(format!("tensor {name:?} has unknown type id {}", ty.0));
         }
         let size = ty.tensor_bytes(&dims).ok_or_else(|| {
-            Error::Malformed(format!("tensor {name:?}: shape {dims:?} doesn't fit type {ty} (block size or overflow)"))
+            Error::Malformed(format!(
+                "tensor {name:?}: shape {dims:?} doesn't fit type {ty} (block size or overflow)"
+            ))
         })?;
         let offset = r.u64()?;
-        tensors.push(TensorInfo { name, dims, ty, offset, size });
+        tensors.push(TensorInfo {
+            name,
+            dims,
+            ty,
+            offset,
+            size,
+        });
     }
 
     // Data must be contiguous in table order, each tensor padded to the alignment.
     let mut expected = 0u64;
     for t in &tensors {
         if t.offset != expected {
-            return malformed(format!("tensor {:?} has offset {}, expected {expected}", t.name, t.offset));
+            return malformed(format!(
+                "tensor {:?} has offset {}, expected {expected}",
+                t.name, t.offset
+            ));
         }
         expected = t
             .offset
@@ -207,6 +238,16 @@ pub(crate) fn parse(r: impl Read) -> Result<Gguf, Error> {
             .ok_or_else(|| Error::Malformed(format!("tensor {:?} offset overflows", t.name)))?;
     }
 
-    let data_offset = if tensors.is_empty() { r.pos } else { pad(r.pos, alignment) };
-    Ok(Gguf { version, metadata, tensors, alignment, data_offset })
+    let data_offset = if tensors.is_empty() {
+        r.pos
+    } else {
+        pad(r.pos, alignment)
+    };
+    Ok(Gguf {
+        version,
+        metadata,
+        tensors,
+        alignment,
+        data_offset,
+    })
 }

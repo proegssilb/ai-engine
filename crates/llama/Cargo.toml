@@ -1,0 +1,28 @@
+[package]
+name = "aie-llama"
+description = "llama.cpp backend: static build, placement by plan, verified placement, generation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+links = "llama"
+
+[features]
+# Build llama.cpp with the CUDA backend (needs nvcc). Arch via CUDA_ARCHITECTURES, default 70 (V100).
+cuda = []
+
+[dependencies]
+aie-plan = { path = "../plan" }
+libc = "0.2"
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1"
+cmake = "0.1"
+
+[dev-dependencies]
+aie-anatomy = { path = "../anatomy" }
+aie-gguf = { path = "../gguf" }
+
+[lints]
+workspace = true

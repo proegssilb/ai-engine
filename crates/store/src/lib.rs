@@ -33,10 +33,19 @@ pub enum Error {
     NotFound(String),
     /// Gated or private repo: set `HF_TOKEN`, and accept the model's terms on the Hub.
     Unauthorized(String),
-    NoSuchTag { tag: String, offered: Vec<String> },
-    AmbiguousTag { offered: Vec<String> },
+    NoSuchTag {
+        tag: String,
+        offered: Vec<String>,
+    },
+    AmbiguousTag {
+        offered: Vec<String>,
+    },
     /// Downloaded content doesn't match the published hash.
-    Digest { file: String, expected: String, actual: String },
+    Digest {
+        file: String,
+        expected: String,
+        actual: String,
+    },
     Manifest(String),
 }
 
@@ -46,13 +55,30 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "{e}"),
             Error::Http(m) => f.write_str(m),
             Error::NotFound(u) => write!(f, "not found: {u}"),
-            Error::Unauthorized(u) => write!(f, "not authorised: {u} (gated or private? set HF_TOKEN)"),
-            Error::NoSuchTag { tag, offered } => write!(f, "no {tag} in this repo; it offers: {}", offered.join(", ")),
-            Error::AmbiguousTag { offered } => {
-                write!(f, "this repo has several quantizations; pick one with :TAG ({})", offered.join(", "))
+            Error::Unauthorized(u) => {
+                write!(f, "not authorised: {u} (gated or private? set HF_TOKEN)")
             }
-            Error::Digest { file, expected, actual } => {
-                write!(f, "{file}: downloaded content has SHA-256 {actual}, expected {expected}")
+            Error::NoSuchTag { tag, offered } => write!(
+                f,
+                "no {tag} in this repo; it offers: {}",
+                offered.join(", ")
+            ),
+            Error::AmbiguousTag { offered } => {
+                write!(
+                    f,
+                    "this repo has several quantizations; pick one with :TAG ({})",
+                    offered.join(", ")
+                )
+            }
+            Error::Digest {
+                file,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "{file}: downloaded content has SHA-256 {actual}, expected {expected}"
+                )
             }
             Error::Manifest(m) => write!(f, "bad manifest: {m}"),
         }
@@ -77,7 +103,11 @@ impl From<reqwest::Error> for Error {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Source {
-    Hf { repo: String, tag: String, revision: String },
+    Hf {
+        repo: String,
+        tag: String,
+        revision: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,12 +177,17 @@ impl Store {
     }
 
     fn rel_dir(r: &str, tag: &str) -> PathBuf {
-        PathBuf::from("hf.co").join(r).join(tag.to_ascii_uppercase())
+        PathBuf::from("hf.co")
+            .join(r)
+            .join(tag.to_ascii_uppercase())
     }
 
     fn manifest_path(&self, repo: &str, tag: &str) -> PathBuf {
         let d = Self::rel_dir(repo, tag);
-        self.root.join("manifests").join(d.parent().unwrap()).join(format!("{}.json", tag.to_ascii_uppercase()))
+        self.root
+            .join("manifests")
+            .join(d.parent().unwrap())
+            .join(format!("{}.json", tag.to_ascii_uppercase()))
     }
 
     fn model_dir(&self, repo: &str, tag: &str) -> PathBuf {
@@ -160,7 +195,12 @@ impl Store {
     }
 
     /// Resolve a reference against the Hub and download what's missing.
-    pub async fn pull(&self, hub: &hf::Hub, r: &HfRef, progress: &mut (dyn FnMut(Progress) + Send)) -> Result<Model, Error> {
+    pub async fn pull(
+        &self,
+        hub: &hf::Hub,
+        r: &HfRef,
+        progress: &mut (dyn FnMut(Progress) + Send),
+    ) -> Result<Model, Error> {
         let revision = hub.revision(&r.repo, "main").await?;
         let files = hub.files(&r.repo, &revision).await?;
         let chosen = hf::select(&files, r.tag.as_deref())?;
@@ -169,7 +209,10 @@ impl Store {
             None => {
                 let offered = hf::tags(&files);
                 let stem = hf::stem_of(&chosen[0].path).unwrap_or_default();
-                offered.into_iter().find(|t| stem.to_ascii_uppercase().ends_with(&t.to_ascii_uppercase())).unwrap_or_default()
+                offered
+                    .into_iter()
+                    .find(|t| stem.to_ascii_uppercase().ends_with(&t.to_ascii_uppercase()))
+                    .unwrap_or_default()
             }
         };
 
@@ -177,16 +220,32 @@ impl Store {
         for f in &chosen {
             let sha = f.sha256.clone().expect("select() requires hashes");
             let url = hub.file_url(&r.repo, &revision, &f.path);
-            self.fetch(hub, &url, &f.path, &sha, f.size, progress).await?;
-            entries.push(FileEntry { path: f.path.clone(), sha256: sha, size: f.size });
+            self.fetch(hub, &url, &f.path, &sha, f.size, progress)
+                .await?;
+            entries.push(FileEntry {
+                path: f.path.clone(),
+                sha256: sha,
+                size: f.size,
+            });
         }
 
         let manifest = Manifest {
             schema: 1,
-            name: HfRef { repo: r.repo.clone(), tag: Some(tag.clone()) }.to_string(),
-            source: Source::Hf { repo: r.repo.clone(), tag: tag.clone(), revision },
+            name: HfRef {
+                repo: r.repo.clone(),
+                tag: Some(tag.clone()),
+            }
+            .to_string(),
+            source: Source::Hf {
+                repo: r.repo.clone(),
+                tag: tag.clone(),
+                revision,
+            },
             files: entries,
-            pulled_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            pulled_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         };
         self.commit(&manifest)
     }
@@ -203,8 +262,15 @@ impl Store {
         progress: &mut (dyn FnMut(Progress) + Send),
     ) -> Result<(), Error> {
         let dest = self.blob_path(sha256);
-        if tokio::fs::metadata(&dest).await.is_ok_and(|m| m.len() == size) {
-            progress(Progress { file: name.into(), done: size, total: size });
+        if tokio::fs::metadata(&dest)
+            .await
+            .is_ok_and(|m| m.len() == size)
+        {
+            progress(Progress {
+                file: name.into(),
+                done: size,
+                total: size,
+            });
             return Ok(());
         }
         let partial = dest.with_extension("partial");
@@ -235,19 +301,30 @@ impl Store {
         }
         let mut resp = hf::check(req.send().await?, url).await?;
         let mut out = if have > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            tokio::fs::OpenOptions::new().append(true).open(&partial).await?
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&partial)
+                .await?
         } else {
             // server ignored the range: start over
             have = 0;
             hasher = Sha256::new();
             tokio::fs::File::create(&partial).await?
         };
-        progress(Progress { file: name.into(), done: have, total: size });
+        progress(Progress {
+            file: name.into(),
+            done: have,
+            total: size,
+        });
         while let Some(chunk) = resp.chunk().await? {
             hasher.update(&chunk);
             out.write_all(&chunk).await?;
             have += chunk.len() as u64;
-            progress(Progress { file: name.into(), done: have, total: size });
+            progress(Progress {
+                file: name.into(),
+                done: have,
+                total: size,
+            });
         }
         out.flush().await?;
         drop(out);
@@ -258,7 +335,11 @@ impl Store {
             return Err(if have != size {
                 Error::Http(format!("{name}: got {have} bytes, expected {size}"))
             } else {
-                Error::Digest { file: name.into(), expected: sha256.into(), actual }
+                Error::Digest {
+                    file: name.into(),
+                    expected: sha256.into(),
+                    actual,
+                }
             });
         }
         tokio::fs::rename(&partial, &dest).await?;
@@ -282,15 +363,23 @@ impl Store {
         let mp = self.manifest_path(repo, tag);
         std::fs::create_dir_all(mp.parent().unwrap())?;
         let tmp = mp.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(m).map_err(|e| Error::Manifest(e.to_string()))?)?;
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(m).map_err(|e| Error::Manifest(e.to_string()))?,
+        )?;
         std::fs::rename(&tmp, &mp)?;
         self.model_of(m.clone())
     }
 
     fn model_of(&self, manifest: Manifest) -> Result<Model, Error> {
         let Source::Hf { repo, tag, .. } = &manifest.source;
-        let first = manifest.files.first().ok_or_else(|| Error::Manifest(format!("{} has no files", manifest.name)))?;
-        let path = self.model_dir(repo, tag).join(first.path.rsplit('/').next().unwrap());
+        let first = manifest
+            .files
+            .first()
+            .ok_or_else(|| Error::Manifest(format!("{} has no files", manifest.name)))?;
+        let path = self
+            .model_dir(repo, tag)
+            .join(first.path.rsplit('/').next().unwrap());
         Ok(Model { manifest, path })
     }
 
@@ -301,9 +390,16 @@ impl Store {
         if !p.exists() {
             return Ok(None);
         }
-        let m: Manifest = serde_json::from_slice(&std::fs::read(&p)?).map_err(|e| Error::Manifest(format!("{}: {e}", p.display())))?;
-        let complete = m.files.iter().all(|f| std::fs::metadata(self.blob_path(&f.sha256)).is_ok_and(|md| md.len() == f.size));
-        Ok(if complete { Some(self.model_of(m)?) } else { None })
+        let m: Manifest = serde_json::from_slice(&std::fs::read(&p)?)
+            .map_err(|e| Error::Manifest(format!("{}: {e}", p.display())))?;
+        let complete = m.files.iter().all(|f| {
+            std::fs::metadata(self.blob_path(&f.sha256)).is_ok_and(|md| md.len() == f.size)
+        });
+        Ok(if complete {
+            Some(self.model_of(m)?)
+        } else {
+            None
+        })
     }
 
     /// Every pulled model.
@@ -328,7 +424,9 @@ impl Store {
 
     /// Remove a model, then any blobs no remaining model uses. Returns bytes freed.
     pub fn remove(&self, r: &HfRef) -> Result<u64, Error> {
-        let Some(tag) = &r.tag else { return Err(Error::Manifest("removing needs a tag".into())) };
+        let Some(tag) = &r.tag else {
+            return Err(Error::Manifest("removing needs a tag".into()));
+        };
         let mp = self.manifest_path(&r.repo, tag);
         if !mp.exists() {
             return Err(Error::NotFound(r.to_string()));
@@ -344,8 +442,11 @@ impl Store {
     /// Delete blobs no manifest references. Partial downloads are kept so an
     /// interrupted pull can resume.
     pub fn gc(&self) -> Result<u64, Error> {
-        let used: std::collections::HashSet<String> =
-            self.list()?.into_iter().flat_map(|m| m.manifest.files.into_iter().map(|f| f.sha256)).collect();
+        let used: std::collections::HashSet<String> = self
+            .list()?
+            .into_iter()
+            .flat_map(|m| m.manifest.files.into_iter().map(|f| f.sha256))
+            .collect();
         let mut freed = 0;
         for e in std::fs::read_dir(self.root.join("blobs/sha256"))? {
             let e = e?;

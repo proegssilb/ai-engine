@@ -47,7 +47,13 @@ pub struct Overheads {
 
 impl Default for Overheads {
     fn default() -> Self {
-        Overheads { cuda_context: 400 * MIB, gpu_compute: 512 * MIB, op_offload: 192 * MIB, cpu_compute: 256 * MIB, kv_elem_bytes: 2 }
+        Overheads {
+            cuda_context: 400 * MIB,
+            gpu_compute: 512 * MIB,
+            op_offload: 192 * MIB,
+            cpu_compute: 256 * MIB,
+            kv_elem_bytes: 2,
+        }
     }
 }
 
@@ -111,7 +117,11 @@ impl fmt::Display for Report {
                 if d.fits() { "" } else { "  DOES NOT FIT" }
             )?;
         }
-        write!(f, "disk     {:>9.0} MiB mapped (may be dropped from RAM)", m(self.disk_bytes))
+        write!(
+            f,
+            "disk     {:>9.0} MiB mapped (may be dropped from RAM)",
+            m(self.disk_bytes)
+        )
     }
 }
 
@@ -120,7 +130,10 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
     let n_gpus = machine.gpus.len();
     let mut gpu = vec![Need::default(); n_gpus];
     let mut gpu_used = vec![false; n_gpus];
-    let mut ram = Need { overhead: o.cpu_compute, ..Need::default() };
+    let mut ram = Need {
+        overhead: o.cpu_compute,
+        ..Need::default()
+    };
     let mut disk = 0u64;
 
     let mut add = |tier: Tier, bytes: u64, f: fn(&mut Need) -> &mut u64| match tier {
@@ -143,7 +156,8 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
 
     // KV cache lives with each layer's home; a RAM-homed layer keeps it in RAM.
     if let Some(kv) = a.kv {
-        let per_layer = kv.bytes_per_token(o.kv_elem_bytes) / u64::from(kv.layers.max(1)) * plan.n_ctx;
+        let per_layer =
+            kv.bytes_per_token(o.kv_elem_bytes) / u64::from(kv.layers.max(1)) * plan.n_ctx;
         for &home in &plan.layer_home {
             add(home, per_layer, |n| &mut n.kv_cache);
         }
@@ -152,11 +166,19 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
     // llama.cpp's expert cache: only used if some layer has all its routed
     // experts in host memory; split across GPUs like the layers.
     if plan.expert_cache_bytes > 0 && expert_cache_active(a, plan) {
-        let homes: Vec<u32> = plan.layer_home.iter().filter_map(|t| if let Tier::Gpu(i) = t { Some(*i) } else { None }).collect();
+        let homes: Vec<u32> = plan
+            .layer_home
+            .iter()
+            .filter_map(|t| if let Tier::Gpu(i) = t { Some(*i) } else { None })
+            .collect();
         for i in 0..n_gpus as u32 {
             let share = homes.iter().filter(|&&h| h == i).count() as u64;
             if share > 0 {
-                add(Tier::Gpu(i), plan.expert_cache_bytes * share / homes.len() as u64, |n| &mut n.expert_cache);
+                add(
+                    Tier::Gpu(i),
+                    plan.expert_cache_bytes * share / homes.len() as u64,
+                    |n| &mut n.expert_cache,
+                );
             }
         }
     }
@@ -177,17 +199,34 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
 
     let mut devices: Vec<DeviceFit> = (0..n_gpus)
         .filter(|&i| gpu_used[i])
-        .map(|i| DeviceFit { tier: Tier::Gpu(i as u32), name: machine.gpus[i].name.clone(), need: gpu[i], free: machine.gpus[i].free })
+        .map(|i| DeviceFit {
+            tier: Tier::Gpu(i as u32),
+            name: machine.gpus[i].name.clone(),
+            need: gpu[i],
+            free: machine.gpus[i].free,
+        })
         .collect();
-    devices.push(DeviceFit { tier: Tier::Ram, name: machine.ram.name.clone(), need: ram, free: machine.ram.free });
-    Report { devices, disk_bytes: disk }
+    devices.push(DeviceFit {
+        tier: Tier::Ram,
+        name: machine.ram.name.clone(),
+        need: ram,
+        free: machine.ram.free,
+    });
+    Report {
+        devices,
+        disk_bytes: disk,
+    }
 }
 
 /// Whether llama.cpp will enable the expert cache: some layer must have all of
 /// its routed experts in host memory (RAM or the mapped file).
 pub fn expert_cache_active(a: &Anatomy, plan: &Plan) -> bool {
     (0..a.layers).any(|l| {
-        let mut parts = a.parts_of(Subsystem::RoutedExperts).filter(|p| p.layer == Some(l)).peekable();
-        parts.peek().is_some() && parts.all(|p| !matches!(plan.tensors.get(&p.name), Some(Tier::Gpu(_))))
+        let mut parts = a
+            .parts_of(Subsystem::RoutedExperts)
+            .filter(|p| p.layer == Some(l))
+            .peekable();
+        parts.peek().is_some()
+            && parts.all(|p| !matches!(plan.tensors.get(&p.name), Some(Tier::Gpu(_))))
     })
 }

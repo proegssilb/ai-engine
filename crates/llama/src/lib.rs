@@ -1,0 +1,111 @@
+//! The llama.cpp backend: loads a model with a placement from `aie-plan`,
+//! verifies where its weights really are, and generates.
+//!
+//! llama.cpp is built statically from `vendor/llama.cpp` (see build.rs). All
+//! access goes through its C API, plus one internal header for the pinned
+//! buffer type, plus one C++ shim for the automatic fit (decision D3).
+//!
+//! llama.cpp's logging is process-global; [`log`] captures it.
+
+pub mod context;
+pub mod fit;
+pub mod log;
+pub mod model;
+pub mod pinned;
+pub mod verify;
+
+pub use context::{Context, ContextParams, Sampling};
+pub use model::{LoadOptions, Model};
+
+pub mod sys {
+    #![allow(
+        non_upper_case_globals,
+        non_camel_case_types,
+        non_snake_case,
+        dead_code,
+        unsafe_op_in_unsafe_fn,
+        unnecessary_transmutes,
+        clippy::all
+    )]
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+
+use std::ffi::CStr;
+use std::fmt;
+use std::sync::Once;
+
+pub type Token = i32;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Error {
+    Load(String),
+    Context(String),
+    Decode(String),
+    Tokenize(String),
+    Device(String),
+    Fit(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Load(m) => write!(f, "loading the model failed: {m}"),
+            Error::Context(m) => write!(f, "creating the context failed: {m}"),
+            Error::Decode(m) => write!(f, "inference failed: {m}"),
+            Error::Tokenize(m) => write!(f, "tokenizing failed: {m}"),
+            Error::Device(m) => write!(f, "{m}"),
+            Error::Fit(m) => write!(f, "automatic placement failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Initialise llama.cpp once per process (backends, logging capture).
+pub fn init() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| unsafe {
+        log::install();
+        sys::llama_backend_init();
+    });
+}
+
+/// A compute device llama.cpp sees.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Device {
+    /// e.g. `CUDA0`, `CPU`
+    pub name: String,
+    pub description: String,
+    pub free: u64,
+    pub total: u64,
+    pub is_gpu: bool,
+}
+
+/// Devices llama.cpp can use, in its order (GPU index = position among GPUs).
+pub fn devices() -> Vec<Device> {
+    init();
+    unsafe {
+        (0..sys::ggml_backend_dev_count())
+            .map(|i| {
+                let d = sys::ggml_backend_dev_get(i);
+                let (mut free, mut total) = (0usize, 0usize);
+                sys::ggml_backend_dev_memory(d, &mut free, &mut total);
+                Device {
+                    name: CStr::from_ptr(sys::ggml_backend_dev_name(d))
+                        .to_string_lossy()
+                        .into_owned(),
+                    description: CStr::from_ptr(sys::ggml_backend_dev_description(d))
+                        .to_string_lossy()
+                        .into_owned(),
+                    free: free as u64,
+                    total: total as u64,
+                    is_gpu: sys::ggml_backend_dev_type(d)
+                        == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Whether this build includes the CUDA backend.
+pub const CUDA: bool = cfg!(feature = "cuda");

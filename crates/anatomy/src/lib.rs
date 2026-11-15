@@ -127,7 +127,10 @@ impl KvShape {
     /// Bytes of KV cache per token of context, for a cache element type of
     /// `elem_bytes` (2 for f16, the default).
     pub fn bytes_per_token(&self, elem_bytes: u64) -> u64 {
-        u64::from(self.layers) * u64::from(self.kv_heads) * u64::from(self.key_len + self.value_len) * elem_bytes
+        u64::from(self.layers)
+            * u64::from(self.kv_heads)
+            * u64::from(self.key_len + self.value_len)
+            * elem_bytes
     }
 
     /// Bytes of KV cache for a context of `n_ctx` tokens.
@@ -149,7 +152,11 @@ pub enum Error {
     NoArchitecture,
     MissingKey(String),
     /// A tensor names a layer at or beyond `block_count`.
-    LayerOutOfRange { tensor: String, layer: u32, layers: u32 },
+    LayerOutOfRange {
+        tensor: String,
+        layer: u32,
+        layers: u32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -157,8 +164,15 @@ impl fmt::Display for Error {
         match self {
             Error::NoArchitecture => write!(f, "general.architecture is missing"),
             Error::MissingKey(k) => write!(f, "metadata key {k} is missing"),
-            Error::LayerOutOfRange { tensor, layer, layers } => {
-                write!(f, "tensor {tensor} is in layer {layer}, but the model has {layers} layers")
+            Error::LayerOutOfRange {
+                tensor,
+                layer,
+                layers,
+            } => {
+                write!(
+                    f,
+                    "tensor {tensor} is in layer {layer}, but the model has {layers} layers"
+                )
             }
         }
     }
@@ -184,10 +198,15 @@ impl Anatomy {
     pub fn from_gguf(g: &Gguf) -> Result<Anatomy, Error> {
         let arch = g.architecture().ok_or(Error::NoArchitecture)?.to_string();
         let key = |s: &str| g.arch_u64(s);
-        let layers = key("block_count").ok_or_else(|| Error::MissingKey(format!("{arch}.block_count")))? as u32;
+        let layers = key("block_count")
+            .ok_or_else(|| Error::MissingKey(format!("{arch}.block_count")))?
+            as u32;
 
         let moe = match (key("expert_count"), key("expert_used_count")) {
-            (Some(e), Some(u)) if e > 0 => Some(MoeShape { experts: e as u32, experts_used: u as u32 }),
+            (Some(e), Some(u)) if e > 0 => Some(MoeShape {
+                experts: e as u32,
+                experts_used: u as u32,
+            }),
             _ => None,
         };
 
@@ -208,9 +227,19 @@ impl Anatomy {
             if let Some(l) = layer
                 && l >= layers
             {
-                return Err(Error::LayerOutOfRange { tensor: t.name.clone(), layer: l, layers });
+                return Err(Error::LayerOutOfRange {
+                    tensor: t.name.clone(),
+                    layer: l,
+                    layers,
+                });
             }
-            parts.push(Part { name: t.name.clone(), subsystem, layer, ty: t.ty, bytes: t.size });
+            parts.push(Part {
+                name: t.name.clone(),
+                subsystem,
+                layer,
+                ty: t.ty,
+                bytes: t.size,
+            });
         }
 
         Ok(Anatomy {
@@ -262,7 +291,9 @@ impl Anatomy {
     /// divided by the expert count. `None` for dense models.
     pub fn bytes_per_expert(&self, layer: u32) -> Option<u64> {
         let moe = self.moe?;
-        let b = *self.layer_bytes(Subsystem::RoutedExperts).get(layer as usize)?;
+        let b = *self
+            .layer_bytes(Subsystem::RoutedExperts)
+            .get(layer as usize)?;
         Some(b / u64::from(moe.experts))
     }
 
@@ -303,7 +334,12 @@ mod tests {
 
     #[test]
     fn kv_bytes() {
-        let kv = KvShape { layers: 48, kv_heads: 4, key_len: 128, value_len: 128 };
+        let kv = KvShape {
+            layers: 48,
+            kv_heads: 4,
+            key_len: 128,
+            value_len: 128,
+        };
         assert_eq!(kv.bytes_per_token(2), 48 * 4 * 256 * 2);
         assert_eq!(kv.bytes(4096, 2), 384 << 20);
     }

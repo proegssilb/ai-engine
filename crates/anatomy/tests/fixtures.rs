@@ -9,7 +9,9 @@ use aie_gguf::{GgmlType, Gguf};
 const MIB: f64 = 1048576.0;
 
 fn load(name: &str) -> Anatomy {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures").join(name);
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures")
+        .join(name);
     let g = Gguf::open_header(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     Anatomy::from_gguf(&g).unwrap()
 }
@@ -24,8 +26,22 @@ fn qwen3_30b_a3b() {
     assert_eq!(a.architecture, "qwen3moe");
     assert!(a.is_supported() && a.is_moe());
     assert_eq!(a.layers, 48);
-    assert_eq!(a.moe, Some(MoeShape { experts: 128, experts_used: 8 }));
-    assert_eq!(a.kv, Some(KvShape { layers: 48, kv_heads: 4, key_len: 128, value_len: 128 }));
+    assert_eq!(
+        a.moe,
+        Some(MoeShape {
+            experts: 128,
+            experts_used: 8
+        })
+    );
+    assert_eq!(
+        a.kv,
+        Some(KvShape {
+            layers: 48,
+            kv_heads: 4,
+            key_len: 128,
+            value_len: 128
+        })
+    );
     assert_eq!(a.context_train, Some(40960));
 
     let s = a.subsystem_bytes();
@@ -47,7 +63,10 @@ fn qwen3_30b_a3b() {
     // 24 x 324 + 24 x 373.5 = 16740 MiB, the total above.
     let per_layer = a.layer_bytes(Subsystem::RoutedExperts);
     assert_eq!(per_layer.len(), 48);
-    let (min, max) = (*per_layer.iter().min().unwrap(), *per_layer.iter().max().unwrap());
+    let (min, max) = (
+        *per_layer.iter().min().unwrap(),
+        *per_layer.iter().max().unwrap(),
+    );
     assert_eq!((mib(min), mib(max)), (324.0, 373.5));
     assert_eq!(per_layer.iter().filter(|&&b| b == max).count(), 24);
     assert_eq!(a.bytes_per_expert(0), Some(per_layer[0] / 128));
@@ -59,12 +78,26 @@ fn qwen3_8b() {
     assert_eq!(a.architecture, "qwen3");
     assert!(a.is_supported() && !a.is_moe());
     assert_eq!(a.layers, 36);
-    assert_eq!(a.kv, Some(KvShape { layers: 36, kv_heads: 8, key_len: 128, value_len: 128 }));
+    assert_eq!(
+        a.kv,
+        Some(KvShape {
+            layers: 36,
+            kv_heads: 8,
+            key_len: 128,
+            value_len: 128
+        })
+    );
     let s = a.subsystem_bytes();
     assert!(s.contains_key(&Subsystem::DenseFfn));
     assert!(!s.contains_key(&Subsystem::RoutedExperts));
     assert_eq!(a.bytes_per_expert(0), None);
-    assert_eq!(a.layer_bytes(Subsystem::Attention).iter().filter(|&&b| b == 0).count(), 0);
+    assert_eq!(
+        a.layer_bytes(Subsystem::Attention)
+            .iter()
+            .filter(|&&b| b == 0)
+            .count(),
+        0
+    );
 }
 
 #[test]
@@ -74,10 +107,19 @@ fn errors() {
     let p = dir.join("bad.gguf");
 
     Writer::new().write_header_file(&p).unwrap();
-    assert_eq!(Anatomy::from_gguf(&Gguf::open_header(&p).unwrap()).unwrap_err(), Error::NoArchitecture);
+    assert_eq!(
+        Anatomy::from_gguf(&Gguf::open_header(&p).unwrap()).unwrap_err(),
+        Error::NoArchitecture
+    );
 
-    Writer::new().str("general.architecture", "x").write_header_file(&p).unwrap();
-    assert!(matches!(Anatomy::from_gguf(&Gguf::open_header(&p).unwrap()), Err(Error::MissingKey(_))));
+    Writer::new()
+        .str("general.architecture", "x")
+        .write_header_file(&p)
+        .unwrap();
+    assert!(matches!(
+        Anatomy::from_gguf(&Gguf::open_header(&p).unwrap()),
+        Err(Error::MissingKey(_))
+    ));
 
     Writer::new()
         .str("general.architecture", "x")
@@ -86,10 +128,21 @@ fn errors() {
         .write_header_file(&p)
         .unwrap();
     let a = Anatomy::from_gguf(&Gguf::open_header(&p).unwrap());
-    assert!(matches!(a, Err(Error::LayerOutOfRange { layer: 2, layers: 2, .. })));
+    assert!(matches!(
+        a,
+        Err(Error::LayerOutOfRange {
+            layer: 2,
+            layers: 2,
+            ..
+        })
+    ));
 
     // Unknown architectures still get an anatomy, flagged as unsupported.
-    Writer::new().str("general.architecture", "x").u32("x.block_count", 1).write_header_file(&p).unwrap();
+    Writer::new()
+        .str("general.architecture", "x")
+        .u32("x.block_count", 1)
+        .write_header_file(&p)
+        .unwrap();
     let a = Anatomy::from_gguf(&Gguf::open_header(&p).unwrap()).unwrap();
     assert!(!a.is_supported());
     assert_eq!(a.kv, None);

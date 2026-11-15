@@ -39,13 +39,29 @@ impl Writer {
 
     /// Add a tensor whose data will be zeros.
     pub fn tensor(mut self, name: impl Into<String>, ty: GgmlType, dims: &[u64]) -> Self {
-        self.tensors.push(Tensor { name: name.into(), dims: dims.to_vec(), ty, data: None });
+        self.tensors.push(Tensor {
+            name: name.into(),
+            dims: dims.to_vec(),
+            ty,
+            data: None,
+        });
         self
     }
 
     /// Add a tensor with explicit data (must be exactly the tensor's size).
-    pub fn tensor_data(mut self, name: impl Into<String>, ty: GgmlType, dims: &[u64], data: Vec<u8>) -> Self {
-        self.tensors.push(Tensor { name: name.into(), dims: dims.to_vec(), ty, data: Some(data) });
+    pub fn tensor_data(
+        mut self,
+        name: impl Into<String>,
+        ty: GgmlType,
+        dims: &[u64],
+        data: Vec<u8>,
+    ) -> Self {
+        self.tensors.push(Tensor {
+            name: name.into(),
+            dims: dims.to_vec(),
+            ty,
+            data: Some(data),
+        });
         self
     }
 
@@ -100,7 +116,11 @@ impl Writer {
                 Some(d) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("tensor {:?}: {} bytes of data, expected {size}", t.name, d.len()),
+                        format!(
+                            "tensor {:?}: {} bytes of data, expected {size}",
+                            t.name,
+                            d.len()
+                        ),
                     ));
                 }
                 None => write_zeros(&mut w, size, &zeros)?,
@@ -126,7 +146,13 @@ impl Writer {
 
 fn size_of(t: &Tensor) -> io::Result<u64> {
     t.ty.tensor_bytes(&t.dims).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("tensor {:?}: shape {:?} invalid for {}", t.name, t.dims, t.ty))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tensor {:?}: shape {:?} invalid for {}",
+                t.name, t.dims, t.ty
+            ),
+        )
     })
 }
 
