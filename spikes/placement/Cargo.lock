@@ -160,6 +160,7 @@ dependencies = [
  "bindgen",
  "cmake",
  "libc",
+ "regex",
 ]
 
 [[package]]

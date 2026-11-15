@@ -6,6 +6,7 @@
 
 mod pinned;
 mod residency;
+mod verify;
 mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
@@ -31,6 +32,8 @@ placement (rules are tried in order; first match wins, like llama.cpp -ot):
   --load-mode M        mmap (default) | none
   --extra-bufts        allow llama.cpp's repacked CPU buffer types (AMX, CPU_REPACK, ...)
   --moe-cache MIB      llama.cpp moe_cache_size: GPU cache for experts kept in host memory
+  --no-op-offload      don't let the scheduler ship host weights to a GPU for big batches
+  --no-host            don't let llama.cpp put CPU tensors in the GPU's pinned host buffer type
 
 workload:
   --prompt-tokens N    prefill length (default 512)
@@ -45,6 +48,7 @@ workload:
 output:
   --label NAME         name for the RESULT line
   --per-layer          break the placement table down per layer
+  --no-verify          skip the ground-truth placement check (eval-callback pass)
   --verbose            echo llama.cpp's log";
 
 struct Args {
@@ -69,6 +73,9 @@ struct Args {
     label: String,
     per_layer: bool,
     verbose: bool,
+    verify: bool,
+    op_offload: bool,
+    no_host: bool,
 }
 
 fn parse_args() -> Args {
@@ -78,7 +85,7 @@ fn parse_args() -> Args {
         model: PathBuf::new(), rules: vec![], gpu_layers: 0, tensor_split: vec![], numa: None, mlock: true,
         cuda_register: false, load_mode: "mmap".into(), extra_bufts: false, moe_cache_mib: 0, prompt_tokens: 512,
         tokens: 64, ctx: None, batch: 512, threads, flash_attn: "auto".into(), evict: false, repeat: 3, label: String::new(),
-        per_layer: false, verbose: false,
+        per_layer: false, verbose: false, verify: true, op_offload: true, no_host: false,
     };
     let val = |name: &str, it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| panic!("{name} needs a value\n\n{USAGE}"));
     while let Some(arg) = it.next() {
@@ -108,6 +115,9 @@ fn parse_args() -> Args {
             "--label" => a.label = val("--label", &mut it),
             "--per-layer" => a.per_layer = true,
             "--verbose" => a.verbose = true,
+            "--no-verify" => a.verify = false,
+            "--no-op-offload" => a.op_offload = false,
+            "--no-host" => a.no_host = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -294,6 +304,133 @@ fn report(title: &str, layout: &[residency::FileTensor], p: &Placement, mmap: bo
     }).collect()
 }
 
+// ----------------------------------------------------------- ground truth --
+
+/// Where the rules say a tensor should go, in the placement table's vocabulary.
+/// `None` = no rule matched, so llama.cpp's own layer assignment decides.
+fn intended_home(name: &str, rules: &[(regex::Regex, String)], mmap: bool) -> Option<String> {
+    let (_, dest) = rules.iter().find(|(re, _)| re.is_match(name))?;
+    Some(match dest.as_str() {
+        "pinned" => "RustPinned RAM".into(),
+        "CPU" | "cpu" if mmap => "CPU (mmap'd file)".into(),
+        "CPU" | "cpu" => "CPU".into(),
+        dev => dev.into(),
+    })
+}
+
+/// Compare what the graph actually read against the rules and against the
+/// log-derived table. Prints a table and returns a JSON object.
+fn verify_report(
+    obs: &verify::Observed, layout: &[residency::FileTensor], p: &Placement, rules: &[(String, String)], mmap: bool,
+    mapping: Option<(usize, usize, usize)>, prefill_tokens: usize,
+) -> String {
+    let rules: Vec<(regex::Regex, String)> = rules.iter().map(|(r, d)| (regex::Regex::new(r).expect("bad --place regex"), d.clone())).collect();
+    let reg = pinned::REGISTRY.lock().unwrap();
+    let pinned_ranges: Vec<(usize, usize)> = reg.iter().filter(|b| !b.freed).map(|b| (b.base, b.len)).collect();
+    let pinned_names: BTreeSet<&str> = reg.iter().filter(|b| !b.freed).flat_map(|b| b.tensors.iter().map(|(n, _, _)| n.as_str())).collect();
+    let size_of: BTreeMap<&str, usize> = layout.iter().map(|t| (t.name.as_str(), t.size)).collect();
+    let mib = |b: usize| b as f64 / 1048576.0;
+
+    // (subsystem, intended, actual) -> (bytes, tensors, claim mismatches)
+    let mut rows: BTreeMap<(String, String, String), (usize, usize, usize)> = BTreeMap::new();
+    let mut actual_tot: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut rule_bad, mut rule_bad_b, mut claim_bad, mut claim_bad_b) = (0, 0usize, 0, 0usize);
+    let mut examples: Vec<String> = vec![];
+    let mut unseen: Vec<&str> = vec![];
+    for t in layout {
+        let Some(seen) = obs.weights.get(&t.name) else {
+            unseen.push(&t.name);
+            continue;
+        };
+        let actual = verify::actual_home(seen, mapping, &pinned_ranges);
+        let claimed = if pinned_names.contains(t.name.as_str()) { "RustPinned RAM".to_string() } else { home_of(&t.name, p, mmap) };
+        let intended = intended_home(&t.name, &rules, mmap);
+        let rule_ok = intended.as_deref().is_none_or(|i| i == actual);
+        if !rule_ok {
+            rule_bad += 1;
+            rule_bad_b += t.size;
+            if examples.len() < 5 {
+                examples.push(format!("{} wanted {} got {}", t.name, intended.as_deref().unwrap_or("-"), actual));
+            }
+        }
+        let claim_ok = claimed == actual;
+        if !claim_ok {
+            claim_bad += 1;
+            claim_bad_b += t.size;
+        }
+        let r = rows.entry((subsystem(&t.name).1.to_string(), intended.unwrap_or_else(|| "(llama.cpp default)".into()), actual.clone())).or_default();
+        r.0 += t.size;
+        r.1 += 1;
+        r.2 += (!claim_ok) as usize;
+        *actual_tot.entry(actual).or_default() += t.size;
+    }
+
+    println!("\n== ground truth: buffer and address of every weight the graph read ==");
+    println!("{:<16} {:<20} {:<20} {:>10} {:>5}  note", "subsystem", "rule says", "actually in", "MiB", "n");
+    for ((kind, intended, actual), (b, n, cbad)) in &rows {
+        let mut note = vec![];
+        if intended != "(llama.cpp default)" && intended != actual {
+            note.push("RULE NOT HONOURED".to_string());
+        }
+        if *cbad > 0 {
+            note.push(format!("table claimed otherwise for {cbad}"));
+        }
+        println!("{:<16} {:<20} {:<20} {:>10.1} {:>5}  {}", kind, intended, actual, mib(*b), n, note.join("; "));
+    }
+    println!(
+        "rules honoured: {}  ({} tensors / {:.1} MiB not where the rule said)",
+        if rule_bad == 0 { "yes" } else { "NO" }, rule_bad, mib(rule_bad_b)
+    );
+    for e in &examples {
+        println!("  e.g. {e}");
+    }
+    println!("log-derived table accurate: {}  ({} tensors / {:.1} MiB misreported)", if claim_bad == 0 { "yes" } else { "NO" }, claim_bad, mib(claim_bad_b));
+    if !unseen.is_empty() {
+        println!("not read by the graph (unverified): {} tensors, e.g. {}", unseen.len(), unseen[..unseen.len().min(3)].join(", "));
+    }
+
+    let mut copies_json = vec![];
+    for (phase, by_w) in &obs.copies {
+        let mut per_dev: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+        for (w, devs) in by_w {
+            for d in devs {
+                let e = per_dev.entry(d.as_str()).or_default();
+                e.0 += size_of.get(w.as_str()).copied().unwrap_or(0);
+                e.1 += 1;
+            }
+        }
+        let tokens = if *phase == "prefill" { prefill_tokens } else { 1 };
+        for (d, (b, n)) in &per_dev {
+            println!("run-time copy ({phase}, {tokens}-token batch): {n} weights / {:.1} MiB shipped host -> {d} per batch", mib(*b));
+        }
+        copies_json.push(format!(
+            "{}:{{{}}}",
+            json_str(phase),
+            per_dev.iter().map(|(d, (b, _))| format!("{}:{:.1}", json_str(d), mib(*b))).collect::<Vec<_>>().join(",")
+        ));
+    }
+    for (phase, subs) in &obs.substitutes {
+        for (buf, (names, bufs)) in subs {
+            println!(
+                "substituted ({phase}): {} expert tensors read from {buf} (MoE cache, {:.1} MiB in {} buffers) instead of the placed weight",
+                names.len(), mib(bufs.values().sum()), bufs.len()
+            );
+        }
+    }
+
+    format!(
+        "{{\"rules_honoured\":{},\"rule_mismatch_tensors\":{},\"rule_mismatch_mib\":{:.1},\"table_accurate\":{},\"table_mismatch_mib\":{:.1},\"unseen\":{},\"actual\":{{{}}},\"copied_mib\":{{{}}}}}",
+        rule_bad == 0,
+        rule_bad,
+        mib(rule_bad_b),
+        claim_bad == 0,
+        mib(claim_bad_b),
+        unseen.len(),
+        actual_tot.iter().map(|(h, b)| format!("{}:{:.1}", json_str(h), mib(*b))).collect::<Vec<_>>().join(","),
+        copies_json.join(",")
+    )
+}
+
 // ---------------------------------------------------------------- devices --
 
 fn devices() -> Vec<(String, String, usize, usize)> {
@@ -435,6 +572,7 @@ fn main() {
         let mut mp = sys::llama_model_default_params();
         mp.tensor_buft_overrides = overrides.as_ptr();
         mp.use_extra_bufts = a.extra_bufts;
+        mp.no_host = a.no_host;
         mp.n_gpu_layers = a.gpu_layers;
         if !a.tensor_split.is_empty() {
             mp.tensor_split = split.as_ptr();
@@ -464,14 +602,18 @@ fn main() {
     let mapping = if mmap { residency::find_file_mapping(&a.model) } else { None };
     report("placement after load", &layout, &placement, mmap, mapping, a.per_layer);
 
-    let ctx = unsafe {
+    let make_ctx = |n_ctx: u32, observe: bool| unsafe {
         let mut cp = sys::llama_context_default_params();
-        cp.n_ctx = a.ctx.unwrap_or((a.prompt_tokens + a.tokens + 64) as u32);
+        cp.n_ctx = n_ctx;
+        if observe {
+            cp.cb_eval = Some(verify::eval_cb);
+        }
         cp.n_batch = a.batch;
         cp.n_ubatch = a.batch;
         cp.n_threads = a.threads;
         cp.n_threads_batch = a.threads;
         cp.moe_cache_size = a.moe_cache_mib * 1024 * 1024;
+        cp.op_offload = a.op_offload;
         cp.flash_attn_type = match a.flash_attn.as_str() {
             "on" => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED,
             "off" => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
@@ -479,9 +621,30 @@ fn main() {
         };
         sys::llama_init_from_model(model, cp)
     };
-    assert!(!ctx.is_null(), "context creation failed; rerun with --verbose");
     let vocab = unsafe { sys::llama_model_get_vocab(model) };
     let prompt = unsafe { tokenize(vocab, a.prompt_tokens) };
+
+    // Ground truth, in its own context: the eval callback makes the scheduler
+    // run node by node, so it must not touch the timed runs.
+    let verified = a.verify.then(|| {
+        let vctx = make_ctx((a.batch as usize + 64) as u32, true);
+        assert!(!vctx.is_null(), "verify context creation failed; rerun with --verbose");
+        verify::begin(layout.iter().map(|t| t.name.clone()));
+        unsafe {
+            let mut toks: Vec<i32> = prompt[..prompt.len().min(a.batch as usize)].to_vec();
+            verify::set_phase("prefill");
+            assert_eq!(sys::llama_decode(vctx, sys::llama_batch_get_one(toks.as_mut_ptr(), toks.len() as i32)), 0, "verify prefill failed");
+            verify::set_phase("decode");
+            let mut next = toks[0];
+            assert_eq!(sys::llama_decode(vctx, sys::llama_batch_get_one(&mut next, 1)), 0, "verify decode failed");
+            sys::llama_synchronize(vctx);
+            sys::llama_free(vctx);
+        }
+        verify_report(&verify::finish(), &layout, &placement, &a.rules, mmap, mapping, prompt.len().min(a.batch as usize))
+    });
+
+    let ctx = make_ctx(a.ctx.unwrap_or((a.prompt_tokens + a.tokens + 64) as u32), false);
+    assert!(!ctx.is_null(), "context creation failed; rerun with --verbose");
 
     // Warm-up (CUDA graph capture, kernel loading, first page faults) so it isn't billed to the timed run.
     unsafe { run(ctx, vocab, &prompt[..prompt.len().min(32)], 4, a.batch as usize) };
@@ -527,7 +690,7 @@ fn main() {
         .collect();
     let rules_json: Vec<String> = a.rules.iter().map(|(r, d)| format!("[{},{}]", json_str(r), json_str(d))).collect();
     println!(
-        "RESULT {{\"label\":{},\"model\":{},\"rules\":[{}],\"gpu_layers\":{},\"extra_bufts\":{},\"load_mode\":{},\"load_ms\":{:.0},\"prompt_tokens\":{},\"gen_tokens\":{},\"prefill_tps\":{:.2},\"decode_tps\":{:.3},\"logits_fnv\":\"{:016x}\",\"homes\":{{{}}}{}}}",
+        "RESULT {{\"label\":{},\"model\":{},\"rules\":[{}],\"gpu_layers\":{},\"extra_bufts\":{},\"load_mode\":{},\"load_ms\":{:.0},\"prompt_tokens\":{},\"gen_tokens\":{},\"prefill_tps\":{:.2},\"decode_tps\":{:.3},\"logits_fnv\":\"{:016x}\",\"homes\":{{{}}}{}{}}}",
         json_str(&a.label),
         json_str(&a.model.display().to_string()),
         rules_json.join(","),
@@ -541,7 +704,8 @@ fn main() {
         decode_med,
         warm.logits_fnv,
         homes_json.join(","),
-        cold.map(|c| format!(",\"cold_prefill_tps\":{:.2},\"cold_decode_tps\":{:.3},\"cold_identical\":{}", c.prefill_tps, c.decode_tps, c.logits_fnv == warm.logits_fnv)).unwrap_or_default()
+        cold.map(|c| format!(",\"cold_prefill_tps\":{:.2},\"cold_decode_tps\":{:.3},\"cold_identical\":{}", c.prefill_tps, c.decode_tps, c.logits_fnv == warm.logits_fnv)).unwrap_or_default(),
+        verified.map(|v| format!(",\"verify\":{v}")).unwrap_or_default()
     );
 
     unsafe {
