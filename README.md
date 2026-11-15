@@ -88,6 +88,7 @@ end-to-end test; `tools/release.sh` produces tarballs and `SHA256SUMS`;
 checksum, upgrade in place). Not verified: the `--service` path on a real
 systemd host, the CUDA variant build, running the v2 and v4 builds, and
 downloading from GitHub itself (no release exists yet).
+CI (`.github/workflows/`: fmt, clippy, tests, UI check and build on every push and PR; a release workflow on `v*` tags builds the CPU levels and uploads them with `SHA256SUMS`) has never run: it is untested until first pushed, and the CUDA release build is a TODO there.
 
 ## Layout
 
