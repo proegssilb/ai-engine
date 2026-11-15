@@ -1,6 +1,8 @@
 # Rust build output (any crate or spike; target-*/ for side builds like target-cuda/)
 target/
 target-*/
+target-release/
+dist-release/
 **/*.rs.bk
 
 # Web UI (TypeScript)

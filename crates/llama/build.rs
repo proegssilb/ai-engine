@@ -22,6 +22,7 @@ fn main() {
         root.join("include/llama.h").display()
     );
     println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=AIE_CPU_TARGET");
     let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
 
     let mut cfg = cmake::Config::new(&root);
@@ -37,11 +38,11 @@ fn main() {
         .define("LLAMA_SUBPROCESS", "OFF")
         .define("LLAMA_LLGUIDANCE", "OFF")
         .define("GGML_OPENMP", "OFF")
-        // Tuned to the build machine. Release builds for other CPUs need
-        // GGML_NATIVE=OFF plus per-variant CPU backends; see crates/llama/README.md.
-        .define("GGML_NATIVE", "ON")
         .profile("Release")
         .build_target("llama-common");
+    for (k, v) in cpu_target_flags(&env::var("AIE_CPU_TARGET").unwrap_or_default()) {
+        cfg.define(k, v);
+    }
     if cuda {
         let arch = env::var("CUDA_ARCHITECTURES").unwrap_or_else(|_| "70".into());
         cfg.define("GGML_CUDA", "ON")
@@ -136,6 +137,42 @@ fn main() {
     bindings
         .write_to_file(PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs"))
         .unwrap();
+}
+
+/// ggml's CPU options for a build target, chosen with `AIE_CPU_TARGET`.
+///
+/// `native` (the default) tunes to the build machine: fastest, but the binary
+/// only runs on CPUs with the same features. Releases use the x86-64
+/// microarchitecture levels instead, one binary each, because llama.cpp's
+/// alternative (GGML_CPU_ALL_VARIANTS) needs dynamically loaded backends,
+/// which conflicts with shipping one static binary. Every option is set
+/// explicitly so a level never depends on ggml's defaults.
+fn cpu_target_flags(target: &str) -> Vec<(&'static str, &'static str)> {
+    let onoff = |on: bool| if on { "ON" } else { "OFF" };
+    // (sse4.2, avx, avx2 + bmi2 + fma + f16c, avx512 f/cd/vl/dq/bw)
+    let (sse42, avx, avx2, avx512) = match target {
+        "" | "native" => return vec![("GGML_NATIVE", "ON")],
+        "x86-64-v2" => (true, false, false, false),
+        "x86-64-v3" => (true, true, true, false),
+        "x86-64-v4" => (true, true, true, true),
+        other => {
+            panic!("AIE_CPU_TARGET={other}: expected native, x86-64-v2, x86-64-v3 or x86-64-v4")
+        }
+    };
+    assert!(
+        env::var("CARGO_CFG_TARGET_ARCH").is_ok_and(|a| a == "x86_64"),
+        "AIE_CPU_TARGET={target} only applies to x86-64 builds"
+    );
+    vec![
+        ("GGML_NATIVE", "OFF"),
+        ("GGML_SSE42", onoff(sse42)),
+        ("GGML_AVX", onoff(avx)),
+        ("GGML_AVX2", onoff(avx2)),
+        ("GGML_BMI2", onoff(avx2)),
+        ("GGML_FMA", onoff(avx2)),
+        ("GGML_F16C", onoff(avx2)),
+        ("GGML_AVX512", onoff(avx512)),
+    ]
 }
 
 fn find_static_libs(dir: &Path, out: &mut Vec<PathBuf>) {

@@ -25,12 +25,32 @@ RAM, and SSD. For running serious model workloads on your own hardware.
 
 ## Quick start
 
+Install a release build (picks the build for your CPU, and the CUDA build if
+`nvidia-smi` is present; checks the SHA256 sum):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/proegssilb/ai-engine/main/install.sh | bash
+# or: ./install.sh --service    # system-wide, plus a systemd service (user ai-engine, data in /var/lib/ai-engine)
+```
+
+`--system` installs to `/usr/local/bin` instead of `~/.local/bin`, `--version`,
+`--cpu-only` and `--level v2|v3|v4` override the choices, and rerunning
+upgrades. For a private repo or a mirror, set `AIE_RELEASE_BASE` (and
+`AIE_CURL_AUTH="Authorization: Bearer ..."`).
+
+Releases come from `tools/release.sh`, one binary per x86-64 level (v2, v3 =
+AVX2, v4 = AVX-512) and optionally CUDA (sm 70-89; CUDA 12.4 can't build newer).
+Dev builds are tuned to the build machine; `AIE_CPU_TARGET=x86-64-v3` (or v2,
+v4) makes a portable one.
+
+Or build from source:
+
 Linux, Rust 1.100+, cmake, clang (for bindgen), protoc. CUDA 12.x for NVIDIA
 GPUs (12.x still builds for Volta / V100; CUDA 13 doesn't).
 
 ```bash
 git submodule update --init
-cargo build --release -p ai-engine                  # CPU only
+cargo build --release -p ai-engine                  # CPU only, tuned to this machine (AIE_CPU_TARGET=x86-64-v3 for a portable one)
 cargo build --release -p ai-engine --features cuda  # NVIDIA; CUDA_ARCHITECTURES=70 by default
 
 target/release/ai-engine serve &                    # API on 127.0.0.1:11435, data in ~/.ai-engine
@@ -56,11 +76,18 @@ busy). Against the MVP list in [features.md](docs/features.md):
 
 | Area | Done | Not yet |
 |---|---|---|
-| Install | one binary (daemon, worker, CLI); config file; CUDA build (links; GPU run pending); systemd unit (`contrib/systemd`) | release builds for other CPUs (built with `GGML_NATIVE`) |
+| Install | one binary (daemon, worker, CLI); config file; CUDA build (links; GPU run pending); systemd unit (`contrib/systemd`); portable CPU builds (x86-64 v2/v3/v4, `AIE_CPU_TARGET`); `tools/release.sh` and `install.sh` (see below for what is verified) | CUDA release asset never built end to end; v4 build compiled but not run (no AVX-512 here) |
 | Models | pull by Hugging Face shorthand and from OCI registries (verified, resumable, split models); local GGUF files; list, remove; several stores, one per disk, chosen at pull (`--store`) | registry credentials (v1) |
 | Serving | ollama and OpenAI APIs with streaming; several models at once; keep-alive; one request at a time per model | |
 | Placement | anatomy; auto-place (llama.cpp's fit); intents by share per tier; fit check by our estimate, then llama.cpp's dry run before loading; apply on reload; every load verified weight by weight; web UI with machine view and placement editor (`/ui/`) | KV cache placement (v1) |
 | Monitoring | per model: requests, tokens, prompt and generation speed, disk-tier residency (`/api/aie/stats`, UI); per device: free memory and what each model holds (`/api/aie/machine`) | Prometheus (v1) |
+
+Release tooling, verified so far: a non-native (`x86-64-v3`) build passes the
+end-to-end test; `tools/release.sh` produces tarballs and `SHA256SUMS`;
+`install.sh` is shellcheck-clean and tested against a local mirror (detection,
+checksum, upgrade in place). Not verified: the `--service` path on a real
+systemd host, the CUDA variant build, running the v2 and v4 builds, and
+downloading from GitHub itself (no release exists yet).
 
 ## Layout
 
@@ -78,7 +105,8 @@ crates/
 docs/          vision, decisions, features, architecture
 fixtures/      header-only GGUFs of real models, for tests
 spikes/        throwaway experiments that answer one question each
-tools/         dep-age.py: how old each locked dependency is
+tools/         dep-age.py (how old each locked dependency is), release.sh (release tarballs)
+install.sh     one-command installer
 vendor/        pinned dependencies as submodules (llama.cpp)
 ```
 
