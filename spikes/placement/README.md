@@ -27,18 +27,54 @@ Inference results are bit-identical to the unmodified baseline.
 git submodule update --init vendor/llama.cpp
 pip install numpy
 python3 spikes/placement/scripts/make_tiny_qwen3moe.py spikes/placement/models/tiny-qwen3moe.gguf
-cd spikes/placement && cargo build --release
+cd spikes/placement && cargo build --release          # add --features cuda for GPUs
 ./target/release/placement-spike models/tiny-qwen3moe.gguf --evict --pin 'blk\.[01]\.ffn_.*_exps' --numa 0
 ```
 
-| Flag | Meaning |
+Placement rules are `--place REGEX=DEST`, tried in order with the first match
+winning, like llama.cpp's `-ot`. `DEST` is `pinned` (the Rust buffer), `CPU`
+(llama.cpp's default CPU buffer, which is the mmap'd file when
+`--load-mode mmap`), or a device name such as `CUDA0`. `--pin REGEX` is short
+for `--place REGEX=pinned`. Run `--help` for everything else: `--gpu-layers`,
+`--tensor-split`, `--numa`, `--cuda-register`, `--moe-cache`, `--extra-bufts`,
+`--repeat`, `--evict`, `--per-layer`.
+
+Each run prints a placement table (subsystem × where it lives × % in RAM) and
+a `RESULT {json}` line. Locations come from llama.cpp's own debug log
+(override decisions and layer-to-device assignment) plus the Rust buffer's
+records. "% in RAM" is measured with `mincore()` on each tensor's real
+address.
+
+## Running on the test box (2× V100, 5800X3D, 64 GB, 1 NVMe)
+
+```bash
+huggingface-cli download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir ~/models
+spikes/placement/bench/test-box.sh ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
+spikes/placement/bench/test-box.sh ~/models/Qwen3-30B-A3B-Q4_K_M.gguf pressure   # NVMe tier, needs a cgroup memory cap
+```
+
+The script builds the spike and `llama-bench` (sm_70) from the same pinned
+llama.cpp, records the hardware, runs each scenario, and writes
+`results/<timestamp>/summary.md`.
+
+**Needs a CUDA 12.x toolkit.** CUDA 13 dropped Volta, and the script refuses
+to start under CUDA 13 while targeting sm_70.
+
+| scenario | what it answers |
 |---|---|
-| `--pin REGEX` | Put matching tensors in the Rust buffer (repeatable). |
-| `--numa N` | `mbind` that buffer to node N. |
-| `--no-mlock` | Don't lock the buffer in RAM. |
-| `--load-mode mmap\|none` | How llama.cpp loads everything not pinned. |
-| `--extra-bufts` | Allow llama.cpp's repacked CPU buffers (AMX etc). |
-| `--evict` | `MADV_PAGEOUT` everything, then generate again. |
+| `ref` | llama-bench numbers for all-GPU and `-ot exps=CPU`: the bar to meet |
+| `gpu` | Does driving llama.cpp through the C API cost anything? Should match `ref-all-gpu`. |
+| `experts` | Attention on GPU, experts in host RAM held three ways: mmap, mmap + llama.cpp repacking, Rust-pinned (± `cudaHostRegister`). Shows what bypassing repacking costs, and whether pinned DMA helps prefill. |
+| `mixed` | Half the experts on GPU, half in RAM: the layout from the UI mockup |
+| `moecache` | llama.cpp's own GPU expert cache over each CPU-side tier |
+| `pressure` | Process capped at `MEMCAP` (10G) so mmap'd experts stream from NVMe; compares with a third of the experts pinned |
+
+**Not verified here:** this container has no GPU and its sandbox blocked
+installing a CUDA toolkit, so the `cuda` feature has never been compiled. The
+CPU path, the result format and the summary script are tested. Expect possible
+small fixes to `build.rs` on the first CUDA build. Throughput numbers from
+this VM varied 2× between identical runs and mean nothing; that's why runs
+report the median of `--repeat` (default 3).
 
 ## Results
 

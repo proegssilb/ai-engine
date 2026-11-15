@@ -1,7 +1,8 @@
 #![allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unsafe_op_in_unsafe_fn, clippy::all)]
-//! Placement spike: load a GGUF through llama.cpp's C API, route chosen tensors
-//! into a Rust-implemented buffer type, and check from the kernel's side where
-//! every tensor actually lives — before and after asking the kernel to evict.
+//! Placement spike: load a GGUF through llama.cpp's C API, route tensors to
+//! devices / a Rust-implemented RAM buffer / the mmap'd file by regex, and
+//! check from the kernel's side where every tensor actually lives. Measures
+//! prefill and decode throughput so placements can be compared.
 
 mod pinned;
 mod residency;
@@ -9,46 +10,120 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_void};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
+const USAGE: &str = "usage: placement-spike MODEL.gguf [options]
+
+placement (rules are tried in order; first match wins, like llama.cpp -ot):
+  --place REGEX=DEST   DEST = pinned | CPU | <device name, e.g. CUDA0>
+                       pinned = Rust buffer (mlock, mbind, hugepages)
+                       CPU    = llama.cpp default CPU buffer (mmap'd file if --load-mode mmap)
+  --pin REGEX          same as --place REGEX=pinned
+  --gpu-layers N       layers llama.cpp offloads by itself (default 0; -1 = all)
+  --tensor-split A,B   layer split ratio across GPUs
+  --numa N             mbind pinned memory to NUMA node N
+  --no-mlock           don't mlock pinned memory
+  --cuda-register      cudaHostRegister pinned memory (faster GPU offload of those ops)
+  --load-mode M        mmap (default) | none
+  --extra-bufts        allow llama.cpp's repacked CPU buffer types (AMX, CPU_REPACK, ...)
+  --moe-cache MIB      llama.cpp moe_cache_size: GPU cache for experts kept in host memory
+
+workload:
+  --prompt-tokens N    prefill length (default 512)
+  --tokens N           tokens to generate (default 64)
+  --ctx N              context size (default prompt+tokens+64)
+  --batch N            n_batch / n_ubatch (default 512)
+  --threads N          CPU threads (default: available cores)
+  --flash-attn on|off|auto
+  --repeat N           timed runs; median is reported (default 3)
+  --evict              MADV_PAGEOUT everything after the timed runs, then run once more
+
+output:
+  --label NAME         name for the RESULT line
+  --per-layer          break the placement table down per layer
+  --verbose            echo llama.cpp's log";
+
 struct Args {
     model: PathBuf,
-    pins: Vec<String>,
+    rules: Vec<(String, String)>,
+    gpu_layers: i32,
+    tensor_split: Vec<f32>,
     numa: Option<u32>,
     mlock: bool,
+    cuda_register: bool,
     load_mode: String,
-    tokens: usize,
-    evict: bool,
-    verbose: bool,
     extra_bufts: bool,
+    moe_cache_mib: usize,
+    prompt_tokens: usize,
+    tokens: usize,
+    ctx: Option<u32>,
+    batch: u32,
+    threads: i32,
+    flash_attn: String,
+    evict: bool,
+    repeat: usize,
+    label: String,
+    per_layer: bool,
+    verbose: bool,
 }
 
 fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { model: PathBuf::new(), pins: vec![], numa: None, mlock: true, load_mode: "mmap".into(), tokens: 16, evict: false, verbose: false, extra_bufts: false };
+    let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(4);
+    let mut a = Args {
+        model: PathBuf::new(), rules: vec![], gpu_layers: 0, tensor_split: vec![], numa: None, mlock: true,
+        cuda_register: false, load_mode: "mmap".into(), extra_bufts: false, moe_cache_mib: 0, prompt_tokens: 512,
+        tokens: 64, ctx: None, batch: 512, threads, flash_attn: "auto".into(), evict: false, repeat: 3, label: String::new(),
+        per_layer: false, verbose: false,
+    };
+    let val = |name: &str, it: &mut dyn Iterator<Item = String>| it.next().unwrap_or_else(|| panic!("{name} needs a value\n\n{USAGE}"));
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--pin" => a.pins.push(it.next().expect("--pin REGEX")),
-            "--numa" => a.numa = Some(it.next().expect("--numa NODE").parse().unwrap()),
+            "--place" => {
+                let v = val("--place", &mut it);
+                let (re, dest) = v.rsplit_once('=').unwrap_or_else(|| panic!("--place wants REGEX=DEST, got {v}"));
+                a.rules.push((re.into(), dest.into()));
+            }
+            "--pin" => a.rules.push((val("--pin", &mut it), "pinned".into())),
+            "--gpu-layers" | "-ngl" => a.gpu_layers = val("--gpu-layers", &mut it).parse().unwrap(),
+            "--tensor-split" => a.tensor_split = val("--tensor-split", &mut it).split(',').map(|x| x.parse().unwrap()).collect(),
+            "--numa" => a.numa = Some(val("--numa", &mut it).parse().unwrap()),
             "--no-mlock" => a.mlock = false,
-            "--load-mode" => a.load_mode = it.next().expect("--load-mode mmap|none"),
-            "--tokens" => a.tokens = it.next().expect("--tokens N").parse().unwrap(),
-            "--evict" => a.evict = true,
-            "--verbose" => a.verbose = true,
-            // llama.cpp's repacked CPU buffer types (AMX, aarch64, ...). They silently
-            // copy some weights out of the mmap, so they are off by default here.
+            "--cuda-register" => a.cuda_register = true,
+            "--load-mode" => a.load_mode = val("--load-mode", &mut it),
             "--extra-bufts" => a.extra_bufts = true,
-            s if !s.starts_with("--") && a.model.as_os_str().is_empty() => a.model = s.into(),
-            s => panic!("unknown argument {s}"),
+            "--moe-cache" => a.moe_cache_mib = val("--moe-cache", &mut it).parse().unwrap(),
+            "--prompt-tokens" => a.prompt_tokens = val("--prompt-tokens", &mut it).parse().unwrap(),
+            "--tokens" => a.tokens = val("--tokens", &mut it).parse().unwrap(),
+            "--ctx" => a.ctx = Some(val("--ctx", &mut it).parse().unwrap()),
+            "--batch" => a.batch = val("--batch", &mut it).parse().unwrap(),
+            "--threads" => a.threads = val("--threads", &mut it).parse().unwrap(),
+            "--flash-attn" => a.flash_attn = val("--flash-attn", &mut it),
+            "--evict" => a.evict = true,
+            "--repeat" => a.repeat = val("--repeat", &mut it).parse::<usize>().unwrap().max(1),
+            "--label" => a.label = val("--label", &mut it),
+            "--per-layer" => a.per_layer = true,
+            "--verbose" => a.verbose = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            s if !s.starts_with('-') && a.model.as_os_str().is_empty() => a.model = s.into(),
+            s => panic!("unknown argument {s}\n\n{USAGE}"),
         }
     }
-    assert!(!a.model.as_os_str().is_empty(), "usage: placement-spike MODEL.gguf [--pin REGEX]... [--numa N] [--no-mlock] [--load-mode mmap|none] [--tokens N] [--evict] [--extra-bufts] [--verbose]");
+    if a.model.as_os_str().is_empty() {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
+    }
     a
 }
+
+// ---------------------------------------------------------------- logging --
 
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -61,94 +136,266 @@ unsafe extern "C" fn log_cb(_level: sys::ggml_log_level, text: *const libc::c_ch
     LOG.lock().unwrap().push(s);
 }
 
-/// Which "subsystem" box in the UI a tensor belongs to.
-fn subsystem(name: &str) -> String {
+// -------------------------------------------------------------- placement --
+
+/// UI-level subsystem a tensor belongs to (layer, kind).
+fn subsystem(name: &str) -> (Option<u32>, &'static str) {
     if let Some(rest) = name.strip_prefix("blk.") {
-        let layer = rest.split('.').next().unwrap();
-        if name.contains("_exps") {
-            return format!("experts  blk.{layer}");
-        }
-        if name.contains("ffn_gate_inp") {
-            return "router   (all layers)".into();
-        }
-        return "attn+norms (all layers)".into();
+        let layer = rest.split('.').next().and_then(|l| l.parse().ok());
+        let kind = if name.contains("_exps") {
+            "routed experts"
+        } else if name.contains("_shexp") || name.contains("ffn_gate_inp_shexp") {
+            "shared expert"
+        } else if name.contains("ffn_gate_inp") || name.contains("exp_probs") {
+            "router"
+        } else if name.contains("attn_") && !name.contains("norm") {
+            "attention"
+        } else if name.contains("norm") {
+            "norms"
+        } else if name.contains("ffn_") {
+            "dense ffn"
+        } else {
+            "other (layer)"
+        };
+        return (layer, kind);
     }
     if name.starts_with("token_embd") {
-        return "embeddings".into();
+        (None, "embeddings")
+    } else if name.starts_with("output") {
+        (None, "output head")
+    } else {
+        (None, "other")
     }
-    "output head".into()
+}
+
+/// Where llama.cpp put each tensor, reconstructed from its debug log:
+/// explicit overrides win, otherwise the tensor follows its layer's device.
+struct Placement {
+    overridden: BTreeMap<String, String>,
+    layer_dev: BTreeMap<u32, String>,
+    output_dev: String,
+}
+
+fn parse_placement_log(n_layer: u32) -> Placement {
+    let log = LOG.lock().unwrap();
+    let mut p = Placement { overridden: BTreeMap::new(), layer_dev: BTreeMap::new(), output_dev: "CPU".into() };
+    for l in log.iter() {
+        // "tensor blk.0.ffn_up_exps.weight (48 MiB f16) buffer type overridden to RustPinned"
+        if let Some(rest) = l.strip_prefix("tensor ")
+            && let Some((name, tail)) = rest.split_once(' ')
+            && let Some((_, buft)) = tail.split_once("buffer type overridden to ")
+        {
+            p.overridden.insert(name.to_string(), buft.trim().to_string());
+        }
+        // "load_tensors: layer   3 assigned to device CUDA0, is_swa = 0"
+        if let Some((_, rest)) = l.split_once("layer ")
+            && let Some((num, tail)) = rest.split_once(" assigned to device ")
+            && let Ok(il) = num.trim().parse::<u32>()
+        {
+            let dev = tail.split(',').next().unwrap_or("?").trim().to_string();
+            if il == n_layer {
+                p.output_dev = dev;
+            } else {
+                p.layer_dev.insert(il, dev);
+            }
+        }
+    }
+    p
+}
+
+fn home_of(name: &str, p: &Placement, mmap: bool) -> String {
+    if let Some(b) = p.overridden.get(name) {
+        return match b.as_str() {
+            "CPU" if mmap => "CPU (mmap'd file)".into(),
+            "RustPinned" => "RustPinned RAM".into(),
+            other => other.into(),
+        };
+    }
+    let dev = match subsystem(name) {
+        (Some(l), _) => p.layer_dev.get(&l).cloned().unwrap_or("CPU".into()),
+        (None, "embeddings") => "CPU".into(),
+        _ => p.output_dev.clone(),
+    };
+    if dev == "CPU" && mmap { "CPU (mmap'd file)".into() } else { dev }
+}
+
+fn layer_ranges(layers: &BTreeSet<u32>) -> String {
+    let mut out: Vec<String> = vec![];
+    let v: Vec<u32> = layers.iter().copied().collect();
+    let mut i = 0;
+    while i < v.len() {
+        let mut j = i;
+        while j + 1 < v.len() && v[j + 1] == v[j] + 1 {
+            j += 1;
+        }
+        out.push(if i == j { format!("{}", v[i]) } else { format!("{}-{}", v[i], v[j]) });
+        i = j + 1;
+    }
+    out.join(",")
 }
 
 #[derive(Default)]
-struct Group {
+struct Row {
     bytes: usize,
-    resident_bytes: f64,
-    homes: BTreeMap<&'static str, usize>,
+    resident: f64,
+    measurable: usize,
+    layers: BTreeSet<u32>,
 }
 
-/// Where each tensor lives and how much of it is in RAM, grouped by subsystem.
-fn report(title: &str, layout: &[residency::FileTensor], mapping: Option<(usize, usize, usize)>) {
+/// Placement table: subsystem x home, with mincore residency where measurable.
+/// Returns (home -> (bytes, resident fraction)) for the JSON summary.
+fn report(title: &str, layout: &[residency::FileTensor], p: &Placement, mmap: bool, mapping: Option<(usize, usize, usize)>, per_layer: bool) -> BTreeMap<String, (usize, f64)> {
     let reg = pinned::REGISTRY.lock().unwrap();
     let pinned_at: BTreeMap<&str, (usize, usize)> =
         reg.iter().filter(|b| !b.freed).flat_map(|b| b.tensors.iter().map(|(n, a, s)| (n.as_str(), (*a, *s)))).collect();
 
-    let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+    let mut rows: BTreeMap<(String, String), Row> = BTreeMap::new();
+    let mut homes: BTreeMap<String, Row> = BTreeMap::new();
     for t in layout {
-        let g = groups.entry(subsystem(&t.name)).or_default();
-        g.bytes += t.size;
-        let (home, frac) = if let Some((addr, size)) = pinned_at.get(t.name.as_str()) {
-            ("rust-pinned RAM", residency::resident_fraction(*addr, *size))
-        } else if let Some((origin, _, _)) = mapping {
-            ("mmap'd file (page cache)", residency::resident_fraction(origin + t.file_offset, t.size))
+        let (layer, kind) = subsystem(&t.name);
+        let home = if pinned_at.contains_key(t.name.as_str()) { "RustPinned RAM".to_string() } else { home_of(&t.name, p, mmap) };
+        let frac = if let Some((addr, size)) = pinned_at.get(t.name.as_str()) {
+            Some(residency::resident_fraction(*addr, *size))
+        } else if home == "CPU (mmap'd file)" {
+            mapping.map(|(origin, _, _)| residency::resident_fraction(origin + t.file_offset, t.size))
         } else {
-            ("ggml-owned RAM", f64::NAN)
+            None
         };
-        *g.homes.entry(home).or_default() += t.size;
-        if !frac.is_nan() {
-            g.resident_bytes += frac * t.size as f64;
+        let kind = match (per_layer, layer) {
+            (true, Some(l)) => format!("{kind} blk.{l}"),
+            _ => kind.to_string(),
+        };
+        for r in [rows.entry((kind, home.clone())).or_default(), homes.entry(home).or_default()] {
+            r.bytes += t.size;
+            if let Some(l) = layer {
+                r.layers.insert(l);
+            }
+            if let Some(f) = frac.filter(|f| !f.is_nan()) {
+                r.resident += f * t.size as f64;
+                r.measurable += t.size;
+            }
         }
     }
 
+    let pct = |r: &Row| if r.measurable == 0 { "-".to_string() } else { format!("{:.0}%", 100.0 * r.resident / r.measurable as f64) };
     println!("\n== {title} ==");
-    println!("{:<26} {:>9} {:>10}  lives in", "subsystem", "MiB", "in RAM");
-    for (name, g) in &groups {
-        let homes: Vec<String> = g.homes.iter().map(|(h, b)| if g.homes.len() == 1 { h.to_string() } else { format!("{h} ({:.1} MiB)", *b as f64 / 1048576.0) }).collect();
-        let resident = if g.homes.contains_key("ggml-owned RAM") { "n/a".to_string() } else { format!("{:.0}%", 100.0 * g.resident_bytes / g.bytes as f64) };
-        println!("{:<26} {:>9.1} {:>10}  {}", name, g.bytes as f64 / 1048576.0, resident, homes.join(" + "));
+    println!("{:<24} {:<20} {:>10} {:>7}  layers", "subsystem", "lives in", "MiB", "in RAM");
+    for ((kind, home), r) in &rows {
+        println!("{:<24} {:<20} {:>10.1} {:>7}  {}", kind, home, r.bytes as f64 / 1048576.0, pct(r), layer_ranges(&r.layers));
     }
-    println!("process: VmRSS={}  VmLck={}", residency::proc_status("VmRSS:"), residency::proc_status("VmLck:"));
+    println!("{:-<24} {:-<20} {:->10} {:->7}", "", "", "", "");
+    for (home, r) in &homes {
+        println!("{:<24} {:<20} {:>10.1} {:>7}", "total", home, r.bytes as f64 / 1048576.0, pct(r));
+    }
+    println!("process: VmRSS={}  VmLck={}  (\"in RAM\" = mincore; '-' = not host memory or not measurable)", residency::proc_status("VmRSS:"), residency::proc_status("VmLck:"));
+    homes.into_iter().map(|(h, r)| {
+        let f = if r.measurable == 0 { f64::NAN } else { r.resident / r.measurable as f64 };
+        (h, (r.bytes, f))
+    }).collect()
 }
 
-struct Generation {
+// ---------------------------------------------------------------- devices --
+
+fn devices() -> Vec<(String, String, usize, usize)> {
+    unsafe {
+        (0..sys::ggml_backend_dev_count())
+            .map(|i| {
+                let d = sys::ggml_backend_dev_get(i);
+                let (mut free, mut total) = (0usize, 0usize);
+                sys::ggml_backend_dev_memory(d, &mut free, &mut total);
+                (
+                    CStr::from_ptr(sys::ggml_backend_dev_name(d)).to_string_lossy().into_owned(),
+                    CStr::from_ptr(sys::ggml_backend_dev_description(d)).to_string_lossy().into_owned(),
+                    free,
+                    total,
+                )
+            })
+            .collect()
+    }
+}
+
+fn buft_for(dest: &str, pinned: &mut Option<sys::ggml_backend_buffer_type_t>, opts: &pinned::PinOptions) -> sys::ggml_backend_buffer_type_t {
+    match dest {
+        "pinned" => *pinned.get_or_insert_with(|| pinned::new_buffer_type("RustPinned", opts.clone())),
+        "CPU" | "cpu" => unsafe { sys::ggml_backend_cpu_buffer_type() },
+        dev => unsafe {
+            let c = CString::new(dev).unwrap();
+            let d = sys::ggml_backend_dev_by_name(c.as_ptr());
+            if d.is_null() {
+                let names: Vec<String> = devices().into_iter().map(|d| d.0).collect();
+                panic!("no device named {dev}; available: {names:?} (plus 'pinned' and 'CPU')");
+            }
+            sys::ggml_backend_dev_buffer_type(d)
+        },
+    }
+}
+
+// --------------------------------------------------------------- workload --
+
+struct Run {
+    prefill_tps: f64,
+    decode_tps: f64,
     tokens: Vec<i32>,
     logits_fnv: u64,
-    ms_per_token: f64,
 }
 
-unsafe fn generate(ctx: *mut sys::llama_context, n_vocab: usize, n_new: usize) -> Generation {
+const PROMPT_SEED: &str = "The engine decides where each part of the model lives: attention on the fastest GPU, \
+hot experts in local RAM, cold experts streamed from NVMe. Placement is a plan the operator can see and edit. ";
+
+unsafe fn tokenize(vocab: *const sys::llama_vocab, n: usize) -> Vec<i32> {
+    let text = PROMPT_SEED.repeat(n / 8 + 4);
+    let mut toks = vec![0i32; text.len() + 8];
+    let mut got = sys::llama_tokenize(vocab, text.as_ptr() as *const _, text.len() as i32, toks.as_mut_ptr(), toks.len() as i32, true, false);
+    if got < 0 {
+        // negative = buffer too small; -got is the size needed
+        toks.resize((-got) as usize, 0);
+        got = sys::llama_tokenize(vocab, text.as_ptr() as *const _, text.len() as i32, toks.as_mut_ptr(), toks.len() as i32, true, false);
+    }
+    assert!(got > 0, "tokenize failed");
+    toks.truncate((got as usize).min(n.max(1)));
+    toks
+}
+
+unsafe fn run(ctx: *mut sys::llama_context, vocab: *const sys::llama_vocab, prompt: &[i32], n_new: usize, batch: usize) -> Run {
+    let n_vocab = sys::llama_vocab_n_tokens(vocab) as usize;
     sys::llama_memory_clear(sys::llama_get_memory(ctx), true);
-    // Byte-fallback vocab: token id = byte + 3, BOS = 1.
-    let mut prompt: Vec<i32> = std::iter::once(1).chain(b"Where should the experts live?".iter().map(|b| *b as i32 + 3)).collect();
     let mut fnv: u64 = 0xcbf29ce484222325;
-    let mut out = vec![];
-    let start = Instant::now();
-    let mut batch = sys::llama_batch_get_one(prompt.as_mut_ptr(), prompt.len() as i32);
-    for _ in 0..n_new {
-        assert_eq!(sys::llama_decode(ctx, batch), 0, "llama_decode failed");
-        let logits = std::slice::from_raw_parts(sys::llama_get_logits_ith(ctx, -1), n_vocab);
+    let mut hash = |logits: &[f32]| {
         for l in logits {
             for b in l.to_bits().to_le_bytes() {
                 fnv = (fnv ^ b as u64).wrapping_mul(0x100000001b3);
             }
         }
-        let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as i32;
-        out.push(next);
-        // batch_get_one keeps a pointer; give it storage that outlives the call.
-        prompt = vec![next];
-        batch = sys::llama_batch_get_one(prompt.as_mut_ptr(), 1);
+    };
+
+    let mut buf = prompt.to_vec();
+    let t0 = Instant::now();
+    for chunk in buf.chunks_mut(batch) {
+        assert_eq!(sys::llama_decode(ctx, sys::llama_batch_get_one(chunk.as_mut_ptr(), chunk.len() as i32)), 0, "prefill decode failed");
     }
-    Generation { tokens: out, logits_fnv: fnv, ms_per_token: start.elapsed().as_secs_f64() * 1000.0 / n_new as f64 }
+    sys::llama_synchronize(ctx);
+    let prefill_s = t0.elapsed().as_secs_f64();
+
+    let mut out = vec![];
+    let t1 = Instant::now();
+    for i in 0..n_new {
+        let logits = std::slice::from_raw_parts(sys::llama_get_logits_ith(ctx, -1), n_vocab);
+        hash(logits);
+        let mut next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as i32;
+        out.push(next);
+        if i + 1 < n_new {
+            assert_eq!(sys::llama_decode(ctx, sys::llama_batch_get_one(&mut next, 1)), 0, "decode failed");
+        }
+    }
+    let decode_s = t1.elapsed().as_secs_f64();
+    Run { prefill_tps: prompt.len() as f64 / prefill_s, decode_tps: (n_new.saturating_sub(1)) as f64 / decode_s, tokens: out, logits_fnv: fnv }
 }
+
+fn json_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// ------------------------------------------------------------------- main --
 
 fn main() {
     let a = parse_args();
@@ -158,14 +405,29 @@ fn main() {
         sys::llama_backend_init();
     }
 
-    let layout = residency::gguf_layout(&a.model);
+    println!("devices:");
+    for (name, desc, free, total) in devices() {
+        println!("  {name:<8} {desc:<40} {:>8.0} / {:>8.0} MiB free", free as f64 / 1048576.0, total as f64 / 1048576.0);
+    }
 
-    // --- placement: pattern -> buffer type, exactly what the UI would emit ---
-    let pin_buft = (!a.pins.is_empty()).then(|| pinned::new_buffer_type("RustPinned", pinned::PinOptions { numa_node: a.numa, mlock: a.mlock, hugepages: true }));
-    let patterns: Vec<CString> = a.pins.iter().map(|p| CString::new(p.as_str()).unwrap()).collect();
-    let mut overrides: Vec<sys::llama_model_tensor_buft_override> =
-        patterns.iter().map(|p| sys::llama_model_tensor_buft_override { pattern: p.as_ptr(), buft: pin_buft.unwrap() }).collect();
+    let layout = residency::gguf_layout(&a.model);
+    let n_layer = layout.iter().filter_map(|t| subsystem(&t.name).0).max().map(|l| l + 1).unwrap_or(0);
+
+    // --- placement rules -> tensor_buft_overrides, exactly what the UI would emit ---
+    let pin_opts = pinned::PinOptions { numa_node: a.numa, mlock: a.mlock, hugepages: true, cuda_register: a.cuda_register };
+    let mut pin_buft = None;
+    let patterns: Vec<CString> = a.rules.iter().map(|(re, _)| CString::new(re.as_str()).unwrap()).collect();
+    let mut overrides: Vec<sys::llama_model_tensor_buft_override> = a
+        .rules
+        .iter()
+        .zip(&patterns)
+        .map(|((_, dest), pat)| sys::llama_model_tensor_buft_override { pattern: pat.as_ptr(), buft: buft_for(dest, &mut pin_buft, &pin_opts) })
+        .collect();
     overrides.push(sys::llama_model_tensor_buft_override { pattern: std::ptr::null(), buft: std::ptr::null_mut() });
+    let mut split = vec![0f32; unsafe { sys::llama_max_devices() }];
+    for (i, s) in a.tensor_split.iter().enumerate() {
+        split[i] = *s;
+    }
 
     let model_path = CString::new(a.model.to_str().unwrap()).unwrap();
     let t0 = Instant::now();
@@ -173,6 +435,10 @@ fn main() {
         let mut mp = sys::llama_model_default_params();
         mp.tensor_buft_overrides = overrides.as_ptr();
         mp.use_extra_bufts = a.extra_bufts;
+        mp.n_gpu_layers = a.gpu_layers;
+        if !a.tensor_split.is_empty() {
+            mp.tensor_split = split.as_ptr();
+        }
         mp.load_mode = match a.load_mode.as_str() {
             "mmap" => sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP,
             "none" => sys::llama_load_mode_LLAMA_LOAD_MODE_NONE,
@@ -181,56 +447,102 @@ fn main() {
         sys::llama_model_load_from_file(model_path.as_ptr(), mp)
     };
     assert!(!model.is_null(), "model load failed; rerun with --verbose");
-    println!("loaded {} in {:.0} ms (load_mode={}, pins={:?})", a.model.display(), t0.elapsed().as_secs_f64() * 1000.0, a.load_mode, a.pins);
-    for l in LOG.lock().unwrap().iter().filter(|l| l.contains("buffer size")) {
-        print!("  llama.cpp: {}", l.trim_start_matches(|c: char| c != ' ').trim_start());
+    let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("\nloaded {} in {:.0} ms (load_mode={}, gpu_layers={}, rules={:?})", a.model.display(), load_ms, a.load_mode, a.gpu_layers, a.rules);
+    for l in LOG.lock().unwrap().iter().filter(|l| l.contains("model buffer size") || l.contains("cannot be used with preferred")) {
+        print!("  llama.cpp: {}", l.split_once(": ").map(|x| x.1).unwrap_or(l).trim_start());
+    }
+    for (i, b) in pinned::REGISTRY.lock().unwrap().iter().enumerate() {
+        println!(
+            "  RustPinned buffer #{i}: {:.1} MiB, {} tensors, mlock={:?} mbind={:?} cuda_register={:?} page NUMA nodes={:?}",
+            b.len as f64 / 1048576.0, b.tensors.len(), b.mlock_result, b.mbind_result, b.cuda_register_result, residency::numa_nodes(b.base, b.len)
+        );
     }
 
-    {
-        let reg = pinned::REGISTRY.lock().unwrap();
-        for (i, b) in reg.iter().enumerate() {
-            let nodes = residency::numa_nodes(b.base, b.len);
-            println!(
-                "  RustPinned buffer #{i}: {:.1} MiB @ {:#x}, {} tensors, mlock={:?}, mbind={:?}, page NUMA nodes={:?}",
-                b.len as f64 / 1048576.0, b.base, b.tensors.len(), b.mlock_result, b.mbind_result, nodes
-            );
-        }
-    }
-
-    let mapping = if a.load_mode == "mmap" { residency::find_file_mapping(&a.model) } else { None };
-    report("after load", &layout, mapping);
+    let mmap = a.load_mode == "mmap";
+    let placement = parse_placement_log(n_layer);
+    let mapping = if mmap { residency::find_file_mapping(&a.model) } else { None };
+    report("placement after load", &layout, &placement, mmap, mapping, a.per_layer);
 
     let ctx = unsafe {
         let mut cp = sys::llama_context_default_params();
-        cp.n_ctx = 512;
-        cp.n_batch = 512;
-        cp.n_threads = 4;
-        cp.n_threads_batch = 4;
+        cp.n_ctx = a.ctx.unwrap_or((a.prompt_tokens + a.tokens + 64) as u32);
+        cp.n_batch = a.batch;
+        cp.n_ubatch = a.batch;
+        cp.n_threads = a.threads;
+        cp.n_threads_batch = a.threads;
+        cp.moe_cache_size = a.moe_cache_mib * 1024 * 1024;
+        cp.flash_attn_type = match a.flash_attn.as_str() {
+            "on" => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            "off" => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            _ => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
+        };
         sys::llama_init_from_model(model, cp)
     };
-    assert!(!ctx.is_null());
-    let n_vocab = unsafe { sys::llama_vocab_n_tokens(sys::llama_model_get_vocab(model)) } as usize;
+    assert!(!ctx.is_null(), "context creation failed; rerun with --verbose");
+    let vocab = unsafe { sys::llama_model_get_vocab(model) };
+    let prompt = unsafe { tokenize(vocab, a.prompt_tokens) };
 
-    let g = unsafe { generate(ctx, n_vocab, a.tokens) };
-    report("after generating (warm)", &layout, mapping);
-    println!("generation: {:.2} ms/token", g.ms_per_token);
-    println!("RESULT tokens={:?} logits_fnv={:016x}", g.tokens, g.logits_fnv);
+    // Warm-up (CUDA graph capture, kernel loading, first page faults) so it isn't billed to the timed run.
+    unsafe { run(ctx, vocab, &prompt[..prompt.len().min(32)], 4, a.batch as usize) };
+    let runs: Vec<Run> = (0..a.repeat).map(|_| unsafe { run(ctx, vocab, &prompt, a.tokens, a.batch as usize) }).collect();
+    assert!(runs.iter().all(|r| r.logits_fnv == runs[0].logits_fnv), "repeated runs disagree: nondeterministic output");
+    let median = |f: &dyn Fn(&Run) -> f64| {
+        let mut v: Vec<f64> = runs.iter().map(f).collect();
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (prefill_med, decode_med) = (median(&|r| r.prefill_tps), median(&|r| r.decode_tps));
+    let spread = |f: &dyn Fn(&Run) -> f64| {
+        let v: Vec<f64> = runs.iter().map(f).collect();
+        format!("{:.1}-{:.1}", v.iter().cloned().fold(f64::INFINITY, f64::min), v.iter().cloned().fold(0.0, f64::max))
+    };
+    let warm = &runs[0];
+    let homes = report("after run (warm)", &layout, &placement, mmap, mapping, a.per_layer);
+    println!(
+        "prefill {:.1} tok/s ({} tokens), decode {:.2} tok/s ({} tokens)  [median of {}; ranges {} / {}]",
+        prefill_med, prompt.len(), decode_med, a.tokens, a.repeat, spread(&|r| r.prefill_tps), spread(&|r| r.decode_tps)
+    );
+    println!("first tokens: {:?}", &warm.tokens[..warm.tokens.len().min(12)]);
 
+    let mut cold = None;
     if a.evict {
-        // Ask the kernel to drop everything it can: the whole file mapping and our buffers.
         if let Some((_, s, e)) = mapping {
             residency::page_out(s, e - s);
         }
         for b in pinned::REGISTRY.lock().unwrap().iter().filter(|b| !b.freed) {
             residency::page_out(b.base, b.len);
         }
-        report("after MADV_PAGEOUT on everything", &layout, mapping);
-
-        let g2 = unsafe { generate(ctx, n_vocab, a.tokens) };
-        report("after generating again (cold)", &layout, mapping);
-        println!("generation after eviction: {:.2} ms/token", g2.ms_per_token);
-        println!("RESULT-AFTER-EVICT tokens={:?} logits_fnv={:016x} identical={}", g2.tokens, g2.logits_fnv, g2.logits_fnv == g.logits_fnv);
+        report("after MADV_PAGEOUT on everything", &layout, &placement, mmap, mapping, a.per_layer);
+        let r = unsafe { run(ctx, vocab, &prompt, a.tokens, a.batch as usize) };
+        report("after run (cold)", &layout, &placement, mmap, mapping, a.per_layer);
+        println!("cold: prefill {:.1} tok/s, decode {:.2} tok/s, identical logits: {}", r.prefill_tps, r.decode_tps, r.logits_fnv == warm.logits_fnv);
+        cold = Some(r);
     }
+
+    // One machine-readable line per run, for bench scripts.
+    let homes_json: Vec<String> = homes
+        .iter()
+        .map(|(h, (b, f))| format!("{}:{{\"mib\":{:.1},\"in_ram\":{}}}", json_str(h), *b as f64 / 1048576.0, if f.is_nan() { "null".into() } else { format!("{f:.3}") }))
+        .collect();
+    let rules_json: Vec<String> = a.rules.iter().map(|(r, d)| format!("[{},{}]", json_str(r), json_str(d))).collect();
+    println!(
+        "RESULT {{\"label\":{},\"model\":{},\"rules\":[{}],\"gpu_layers\":{},\"extra_bufts\":{},\"load_mode\":{},\"load_ms\":{:.0},\"prompt_tokens\":{},\"gen_tokens\":{},\"prefill_tps\":{:.2},\"decode_tps\":{:.3},\"logits_fnv\":\"{:016x}\",\"homes\":{{{}}}{}}}",
+        json_str(&a.label),
+        json_str(&a.model.display().to_string()),
+        rules_json.join(","),
+        a.gpu_layers,
+        a.extra_bufts,
+        json_str(&a.load_mode),
+        load_ms,
+        prompt.len(),
+        a.tokens,
+        prefill_med,
+        decode_med,
+        warm.logits_fnv,
+        homes_json.join(","),
+        cold.map(|c| format!(",\"cold_prefill_tps\":{:.2},\"cold_decode_tps\":{:.3},\"cold_identical\":{}", c.prefill_tps, c.decode_tps, c.logits_fnv == warm.logits_fnv)).unwrap_or_default()
+    );
 
     unsafe {
         sys::llama_free(ctx);

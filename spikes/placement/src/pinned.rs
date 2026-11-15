@@ -22,6 +22,9 @@ pub struct PinOptions {
     pub mlock: bool,
     /// MADV_HUGEPAGE on the allocation.
     pub hugepages: bool,
+    /// cudaHostRegister the allocation (page-locked for DMA), so GPU backends
+    /// can copy from it at full PCIe speed when they offload ops on these weights.
+    pub cuda_register: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +35,8 @@ pub struct BufferRecord {
     pub tensors: Vec<(String, usize, usize)>,
     pub mbind_result: Option<Result<(), i32>>,
     pub mlock_result: Option<Result<(), i32>>,
+    /// Ok, or the cudaError_t code / -1 if libcudart couldn't be loaded.
+    pub cuda_register_result: Option<Result<(), i32>>,
     pub freed: bool,
 }
 
@@ -112,7 +117,7 @@ unsafe extern "C" fn buft_alloc_buffer(buft: sys::ggml_backend_buffer_type_t, si
         return ptr::null_mut();
     }
 
-    let mut rec = BufferRecord { base: base as usize, len: size, tensors: vec![], mbind_result: None, mlock_result: None, freed: false };
+    let mut rec = BufferRecord { base: base as usize, len: size, tensors: vec![], mbind_result: None, mlock_result: None, cuda_register_result: None, freed: false };
 
     if opts.hugepages {
         unsafe { libc::madvise(base, map_len, libc::MADV_HUGEPAGE) };
@@ -133,6 +138,15 @@ unsafe extern "C" fn buft_alloc_buffer(buft: sys::ggml_backend_buffer_type_t, si
         // mlock also faults every page in now, under the NUMA policy above.
         let r = unsafe { libc::mlock(base, map_len) };
         rec.mlock_result = Some(if r == 0 { Ok(()) } else { Err(errno()) });
+    }
+    if opts.cuda_register {
+        rec.cuda_register_result = Some(match cudart() {
+            Some(c) => match unsafe { (c.register)(base, map_len, 0) } {
+                0 => Ok(()),
+                e => Err(e),
+            },
+            None => Err(-1),
+        });
     }
 
     let idx = {
@@ -168,6 +182,10 @@ unsafe fn buf_ctx<'a>(buf: sys::ggml_backend_buffer_t) -> &'a BufCtx {
 unsafe extern "C" fn buf_free(buf: sys::ggml_backend_buffer_t) {
     unsafe {
         let ctx = Box::from_raw((*buf).context as *mut BufCtx);
+        let registered = matches!(REGISTRY.lock().unwrap()[ctx.idx].cuda_register_result, Some(Ok(())));
+        if registered && let Some(c) = cudart() {
+            (c.unregister)(ctx.base as *mut c_void);
+        }
         libc::munmap(ctx.base as *mut c_void, ctx.map_len);
         REGISTRY.lock().unwrap()[ctx.idx].freed = true;
     }
@@ -216,4 +234,30 @@ unsafe extern "C" fn buf_clear(buf: sys::ggml_backend_buffer_t, value: u8) {
         let ctx = buf_ctx(buf);
         ptr::write_bytes(ctx.base, value, (*buf).size);
     }
+}
+
+/// cudaHostRegister / cudaHostUnregister, looked up at runtime so the spike
+/// builds and runs without CUDA. llama.cpp's CUDA backend already loaded
+/// libcudart if it's in use, so this finds the same copy.
+struct Cudart {
+    register: unsafe extern "C" fn(*mut c_void, usize, libc::c_uint) -> i32,
+    unregister: unsafe extern "C" fn(*mut c_void) -> i32,
+}
+
+fn cudart() -> Option<&'static Cudart> {
+    static CUDART: std::sync::OnceLock<Option<Cudart>> = std::sync::OnceLock::new();
+    CUDART
+        .get_or_init(|| unsafe {
+            let h = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
+                .iter()
+                .map(|n| libc::dlopen(CString::new(*n).unwrap().as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL))
+                .find(|h| !h.is_null())?;
+            let reg = libc::dlsym(h, c"cudaHostRegister".as_ptr());
+            let unreg = libc::dlsym(h, c"cudaHostUnregister".as_ptr());
+            if reg.is_null() || unreg.is_null() {
+                return None;
+            }
+            Some(Cudart { register: std::mem::transmute(reg), unregister: std::mem::transmute(unreg) })
+        })
+        .as_ref()
 }

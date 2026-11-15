@@ -4,9 +4,10 @@ fn main() {
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../vendor/llama.cpp");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed={}", root.join("include/llama.h").display());
+    println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
 
-    let dst = cmake::Config::new(&root)
-        .define("BUILD_SHARED_LIBS", "OFF")
+    let mut cfg = cmake::Config::new(&root);
+    cfg.define("BUILD_SHARED_LIBS", "ON")
         .define("LLAMA_BUILD_TESTS", "OFF")
         .define("LLAMA_BUILD_EXAMPLES", "OFF")
         .define("LLAMA_BUILD_TOOLS", "OFF")
@@ -17,18 +18,21 @@ fn main() {
         .define("GGML_OPENMP", "OFF")
         .define("GGML_NATIVE", "ON")
         .profile("Release")
-        .build_target("llama")
-        .build();
+        .build_target("llama");
+    if env::var_os("CARGO_FEATURE_CUDA").is_some() {
+        // V100 = 70. Override with e.g. CUDA_ARCHITECTURES="70;86".
+        let arch = env::var("CUDA_ARCHITECTURES").unwrap_or_else(|_| "70".into());
+        cfg.define("GGML_CUDA", "ON").define("CMAKE_CUDA_ARCHITECTURES", arch);
+    }
+    let dst = cfg.build();
 
-    let b = dst.join("build");
-    for dir in ["src", "ggml/src"] {
-        println!("cargo:rustc-link-search=native={}", b.join(dir).display());
+    // Shared libs land in build/bin; embed that path so the binary runs in place.
+    let lib = dst.join("build/bin");
+    println!("cargo:rustc-link-search=native={}", lib.display());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    for l in ["llama", "ggml", "ggml-base"] {
+        println!("cargo:rustc-link-lib=dylib={l}");
     }
-    for lib in ["llama", "ggml", "ggml-cpu", "ggml-base"] {
-        println!("cargo:rustc-link-lib=static={lib}");
-    }
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-lib=dylib=m");
 
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
@@ -38,9 +42,9 @@ fn main() {
         .allowlist_function("llama_.*")
         .allowlist_function("ggml_.*")
         .allowlist_function("gguf_.*")
-        .allowlist_type("gguf_.*")
         .allowlist_type("llama_.*")
         .allowlist_type("ggml_.*")
+        .allowlist_type("gguf_.*")
         .derive_default(true)
         .generate()
         .expect("bindgen failed");

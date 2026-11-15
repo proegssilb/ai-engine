@@ -11,3 +11,7 @@ libc = "0.2"
 [build-dependencies]
 bindgen = "0.72"
 cmake = "0.1"
+
+[features]
+# Build llama.cpp with the CUDA backend (needs nvcc). Arch via CUDA_ARCHITECTURES, default 70 (V100).
+cuda = []
