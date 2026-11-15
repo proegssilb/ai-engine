@@ -184,3 +184,5 @@ Where the first implementation refined the design above:
   global logger, so the shim's two calls are serialised per process.
 - **The shim has two functions:** the fit and the dry run, both from
   llama.cpp's `common` library.
+
+How each placement promise in the UI is held and checked (weights, RAM tier, disk tier, host socket): [reference/placement-guarantees.md](reference/placement-guarantees.md).
