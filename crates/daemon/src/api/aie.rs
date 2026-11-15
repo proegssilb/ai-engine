@@ -279,5 +279,7 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
         models.push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced, "store": store }));
     }
     v["models"] = json!(models);
+    // RAM over the last minute (latest, min, max), for the fuzzy RAM bar.
+    v["memory"] = st.0.memory.snapshot();
     Ok(Json(v))
 }

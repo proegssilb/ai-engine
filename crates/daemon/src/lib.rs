@@ -5,6 +5,7 @@
 
 pub mod api;
 pub mod config;
+pub mod memory;
 pub mod stores;
 pub mod workers;
 
@@ -26,6 +27,8 @@ pub struct Daemon {
     pub stores: stores::Stores,
     pub hub: aie_store::hf::Hub,
     pub workers: Arc<Manager>,
+    /// Host memory over the last minute, for the machine view's RAM bar.
+    pub memory: memory::Sampler,
     /// One pull at a time (the store serialises per blob).
     pub pulling: tokio::sync::Mutex<()>,
 }
@@ -72,6 +75,7 @@ impl Daemon {
         std::fs::create_dir_all(cfg.home.join("placements")).map_err(|e| e.to_string())?;
         Ok(Arc::new(Daemon {
             workers: Manager::new(cfg.clone()),
+            memory: memory::Sampler::default(),
             cfg,
             stores,
             hub,
@@ -317,6 +321,13 @@ pub async fn serve(cfg: Config) -> Result<(), String> {
     let listen = cfg.listen;
     let d = Daemon::new(cfg)?;
     let reaper = d.workers.clone();
+    let sampler = d.clone();
+    tokio::spawn(async move {
+        loop {
+            sampler.memory.sample(&sampler.workers).await;
+            tokio::time::sleep(memory::INTERVAL).await;
+        }
+    });
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;

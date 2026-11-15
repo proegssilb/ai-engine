@@ -41,6 +41,35 @@ export interface Device {
   gpu: boolean
 }
 
+/** Latest value plus the min and max over the daemon's 60 s window (bytes). */
+export interface Spread {
+  latest: number
+  min: number
+  max: number
+}
+
+/** One RAM box (all RAM, or one NUMA node) over the window. */
+export interface MemBox {
+  node: number | null
+  total: number
+  /** ours | free | other (processes, kernel) | slab (reclaimable) | cache (droppable page cache) */
+  segments: Record<'ours' | 'free' | 'other' | 'slab' | 'cache', Spread>
+  /** where the four borders between those segments sit, bytes from the left */
+  edges: [Spread, Spread, Spread, Spread]
+  meminfo: Record<'free' | 'cached' | 'buffers' | 'sreclaimable' | 'shmem', Spread>
+  /** our processes; model '' is the daemon itself */
+  models: { model: string; ours: Spread; disk_tier_bytes: number; disk_tier_resident: Spread }[]
+}
+
+export interface MemoryWindow {
+  interval_secs: number
+  window_secs: number
+  samples: number
+  system: MemBox
+  /** only on machines with several NUMA nodes */
+  nodes: MemBox[]
+}
+
 export interface Machine {
   devices: Device[]
   ram: { total: number; available: number }
@@ -48,6 +77,8 @@ export interface Machine {
   disk: { path: string; total: number; free: number }
   disks: { path: string; total: number; free: number }[]
   cuda_build: boolean
+  /** null until the daemon has taken its first sample */
+  memory: MemoryWindow | null
   models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null }[]
 }
 

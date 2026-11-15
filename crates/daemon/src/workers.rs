@@ -36,6 +36,11 @@ impl Worker {
         self.client.clone()
     }
 
+    /// The worker process's id, while it runs.
+    pub async fn pid(&self) -> Option<u32> {
+        self.child.lock().await.id()
+    }
+
     /// When an idle worker will be unloaded, if ever.
     pub fn expires_at(&self) -> Option<SystemTime> {
         let ka = (*self.keep_alive.lock().unwrap())?;

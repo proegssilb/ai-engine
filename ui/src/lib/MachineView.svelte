@@ -1,7 +1,8 @@
 <script lang="ts">
   // The machine as boxes: GPUs, RAM (per NUMA node when there are several),
   // and the store's disk, each with what loaded models planned there.
-  import { bytes, type Machine } from './api'
+  import RamBar from './RamBar.svelte'
+  import { bytes, type Machine, type MemBox } from './api'
 
   let { machine, colors }: { machine: Machine; colors: Record<string, string> } = $props()
 
@@ -12,6 +13,8 @@
     total: number
     used: number
     models: { model: string; bytes: number }[]
+    /** the fuzzy RAM bar, for RAM boxes once the daemon has samples */
+    mem?: MemBox
   }
 
   let boxes = $derived.by((): Box[] => {
@@ -23,15 +26,33 @@
       .forEach((d, i) =>
         out.push({ key: `gpu${i}`, title: `GPU ${i}`, detail: d.description, total: d.total, used: d.total - d.free, models: usage(`gpu${i}`) }),
       )
-    const nodes = machine.numa.length > 1 ? machine.numa.map((n) => ` · node ${n.node}`) : ['']
-    out.push({
-      key: 'ram',
-      title: 'RAM',
-      detail: `${machine.numa.length} NUMA node${machine.numa.length === 1 ? '' : 's'}${nodes.length > 1 ? '' : ''}`,
-      total: machine.ram.total,
-      used: machine.ram.total - machine.ram.available,
-      models: usage('ram'),
-    })
+    // One RAM box, or one per NUMA node when there are several.
+    const mem = machine.memory
+    if (machine.numa.length > 1) {
+      machine.numa.forEach((n) => {
+        const mb = mem?.nodes.find((x) => x.node === n.node)
+        out.push({
+          key: `ram${n.node}`,
+          title: `RAM, node ${n.node}`,
+          detail: `CPUs ${n.cpus}`,
+          total: n.total,
+          used: n.total - n.free,
+          // which node a model's RAM sits on isn't tracked per model; the bar shows it
+          models: [],
+          mem: mb,
+        })
+      })
+    } else {
+      out.push({
+        key: 'ram',
+        title: 'RAM',
+        detail: `${machine.numa.length} NUMA node${machine.numa.length === 1 ? '' : 's'}`,
+        total: machine.ram.total,
+        used: machine.ram.total - machine.ram.available,
+        models: usage('ram'),
+        mem: mem?.system,
+      })
+    }
     // one box per store: a model's disk tier is on the disk its store is on
     const disks = machine.disks?.length ? machine.disks : [machine.disk]
     disks.forEach((d, i) =>
@@ -62,7 +83,11 @@
         <span class="muted mono">{bytes(b.used)} / {bytes(b.total)}</span>
       </div>
       <div class="muted detail" title={b.detail}>{b.detail}</div>
-      <div class="bar"><span style="width: {(100 * b.used) / Math.max(b.total, 1)}%; background: var(--accent)"></span></div>
+      {#if b.mem}
+        <RamBar box={b.mem} {colors} />
+      {:else}
+        <div class="bar"><span style="width: {(100 * b.used) / Math.max(b.total, 1)}%; background: var(--accent)"></span></div>
+      {/if}
       {#each b.models as m (m.model)}
         <div class="chip" style="border-color: {colors[m.model]}">
           <span class="swatch" style="background: {colors[m.model]}"></span>

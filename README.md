@@ -80,7 +80,7 @@ busy). Against the MVP list in [features.md](docs/features.md):
 | Models | pull by Hugging Face shorthand and from OCI registries (verified, resumable, split models); local GGUF files; list, remove; several stores, one per disk, chosen at pull (`--store`) | registry credentials (v1) |
 | Serving | ollama and OpenAI APIs with streaming; several models at once; keep-alive; one request at a time per model | |
 | Placement | anatomy; auto-place (llama.cpp's fit); intents by share per tier; fit check by our estimate, then llama.cpp's dry run before loading; apply on reload; every load verified weight by weight; web UI with machine view and placement editor (`/ui/`) | KV cache placement (v1) |
-| Monitoring | per model: requests, tokens, prompt and generation speed, disk-tier residency (`/api/aie/stats`, UI); per device: free memory and what each model holds (`/api/aie/machine`) | Prometheus (v1) |
+| Monitoring | per model: requests, tokens, prompt and generation speed, disk-tier residency (`/api/aie/stats`, UI); per device: free memory and what each model holds (`/api/aie/machine`); the machine view's RAM bar shows the last minute of host memory (ours, free, other, disk cache; blurred by how much each border moved), per NUMA node on multi-socket machines (verified on a one-node machine only); placement panel shows per-device weights/KV/scratch, expert cache split and disk-tier residency | Prometheus (v1) |
 
 Release tooling, verified so far: a non-native (`x86-64-v3`) build passes the
 end-to-end test; `tools/release.sh` produces tarballs and `SHA256SUMS`;

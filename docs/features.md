@@ -70,6 +70,7 @@ Draft: stages marked **?** are open questions, not decisions.
 | Apply a placement (reloads the model) | MVP |
 | Verified placement: after loading, show where the weights actually are, flag anything that differs from the plan | MVP |
 | Show effects users can't set: which GPU holds the expert cache, GPU 0's offload scratch space, how much may be on disk right now | MVP |
+| RAM bar that shows what placement costs: our models, free, other processes, and the OS disk cache as deliberately fuzzy segments (min to max over the last minute), per NUMA node | MVP |
 | Save placements per model and reuse them | MVP |
 | KV cache placement (which GPU, how big) | v1 |
 | Predicted speed for a plan before applying it | v1 **?** |
