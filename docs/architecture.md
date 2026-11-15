@@ -174,5 +174,13 @@ Where the first implementation refined the design above:
 - **llama.cpp links statically, in dependency order**, through
   `rustc-link-lib` (link arguments don't reach dependent crates). The CUDA
   runtime and cuBLAS stay dynamic.
-- **Machine view without CUDA in the daemon** is still open; the likely shape
-  is a short-lived `ai-engine probe` subprocess that reports devices as JSON.
+- **Machine view without CUDA in the daemon:** a short-lived `ai-engine probe`
+  subprocess reports devices as JSON (cached a few seconds).
+- **Memory: estimate, then dry run.** The worker checks an intent with our
+  estimate first (instant, also what the UI shows), then runs llama.cpp's dry
+  run (`common_fit_measure`, `no_alloc`) with the exact load parameters and
+  refuses the plan if a device would overflow. The measured per-device
+  breakdown is in the worker's status. llama.cpp's fit and dry run swap the
+  global logger, so the shim's two calls are serialised per process.
+- **The shim has two functions:** the fit and the dry run, both from
+  llama.cpp's `common` library.

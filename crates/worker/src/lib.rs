@@ -225,11 +225,36 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
     let anatomy = aie_anatomy::Anatomy::from_gguf(&gguf).map_err(|e| e.to_string())?;
     let (plan, settings) = decide(cfg, &anatomy)?;
 
-    let t0 = Instant::now();
     let opts = LoadOptions {
         settings,
         pin: cfg.pin.clone(),
     };
+    // llama.cpp's own dry run: the authoritative check before allocating.
+    let measured =
+        aie_llama::fit::measure(&cfg.model, &opts, &cfg.context).map_err(|e| e.to_string())?;
+    if matches!(cfg.placement, Placement::Intent { .. }) {
+        let short: Vec<String> = measured
+            .iter()
+            .filter(|m| m.kind == "device" && m.total > 0 && m.need() > m.free)
+            .map(|m| {
+                format!(
+                    "{} needs {} MiB, has {} MiB free",
+                    m.name,
+                    m.need() >> 20,
+                    m.free >> 20
+                )
+            })
+            .collect();
+        if !short.is_empty() {
+            return Err(format!(
+                "llama.cpp's dry run says this placement doesn't fit: {}",
+                short.join("; ")
+            ));
+        }
+    }
+    let memory_json = serde_json::to_string(&measured).map_err(|e| e.to_string())?;
+
+    let t0 = Instant::now();
     let model = Arc::new(Model::load(&cfg.model, &opts).map_err(|e| e.to_string())?);
     let load_ms = t0.elapsed().as_millis() as u64;
 
@@ -271,6 +296,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         plan_json,
         disk_tier_bytes,
         warnings,
+        memory_json,
         ..Default::default()
     };
     Ok(Loaded {

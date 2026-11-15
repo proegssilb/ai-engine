@@ -47,6 +47,9 @@ message StatusReply {
   // Things the user should know about this load, e.g. the RAM tier couldn't
   // be locked in memory.
   repeated string warnings = 18;
+  // llama.cpp's dry run before loading: per device, what it said this
+  // placement needs (aie_llama::fit::Measured rows as JSON).
+  string memory_json = 19;
 }
 
 message ChatMessage {

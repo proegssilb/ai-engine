@@ -224,6 +224,21 @@ fn context_full_and_errors() {
 }
 
 #[test]
+fn dry_run_measures_without_allocating() {
+    let Some(path) = model_path() else { return };
+    let rows = aie_llama::fit::measure(&path, &LoadOptions::cpu(), &params()).unwrap();
+    // no GPU here: weights and context are host memory
+    let host: u64 = rows
+        .iter()
+        .filter(|r| r.kind != "device")
+        .map(|r| r.model + r.context)
+        .sum();
+    let all: u64 = rows.iter().map(|r| r.model).sum();
+    assert!(all > 500 << 20, "{rows:?}");
+    assert!(host > 0, "{rows:?}");
+}
+
+#[test]
 fn llama_cpp_fit_runs_and_resolves_to_a_plan() {
     let Some(path) = model_path() else { return };
     // No GPUs here: the fit has nothing to offload, but must run cleanly and

@@ -131,6 +131,7 @@ pub async fn get_placement(
             "misplaced": w.status.misplaced,
             "load_ms": w.status.load_ms,
             "warnings": w.status.warnings,
+            "measured": serde_json::from_str::<Value>(&w.status.memory_json).unwrap_or(Value::Null),
             "planned": by_sub,
             "stats": live_stats(&w).await,
             "plan": plan,

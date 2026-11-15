@@ -37,6 +37,26 @@ impl Default for ContextParams {
     }
 }
 
+impl ContextParams {
+    /// llama.cpp's context parameters (shared by contexts and the dry run).
+    pub(crate) fn raw(&self) -> sys::llama_context_params {
+        let mut cp = unsafe { sys::llama_context_default_params() };
+        cp.n_ctx = self.n_ctx;
+        cp.n_batch = self.n_batch;
+        cp.n_ubatch = self.n_batch;
+        cp.n_threads = self.threads;
+        cp.n_threads_batch = self.threads;
+        cp.moe_cache_size = self.moe_cache_bytes as usize;
+        cp.op_offload = self.op_offload;
+        cp.flash_attn_type = match self.flash_attn {
+            Some(true) => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            Some(false) => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
+            None => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
+        };
+        cp
+    }
+}
+
 /// How to pick the next token.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sampling {
@@ -157,19 +177,7 @@ impl Context {
         cb: sys::ggml_backend_sched_eval_callback,
     ) -> Result<Context, Error> {
         let ptr = unsafe {
-            let mut cp = sys::llama_context_default_params();
-            cp.n_ctx = p.n_ctx;
-            cp.n_batch = p.n_batch;
-            cp.n_ubatch = p.n_batch;
-            cp.n_threads = p.threads;
-            cp.n_threads_batch = p.threads;
-            cp.moe_cache_size = p.moe_cache_bytes as usize;
-            cp.op_offload = p.op_offload;
-            cp.flash_attn_type = match p.flash_attn {
-                Some(true) => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_ENABLED,
-                Some(false) => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED,
-                None => sys::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_AUTO,
-            };
+            let mut cp = p.raw();
             cp.cb_eval = cb;
             sys::llama_init_from_model(model.raw(), cp)
         };

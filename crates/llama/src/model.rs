@@ -77,16 +77,27 @@ pub(crate) fn gpu_device(i: u32) -> Option<sys::ggml_backend_dev_t> {
     }
 }
 
-impl Model {
-    pub fn load(path: &Path, opts: &LoadOptions) -> Result<Model, Error> {
+pub(crate) fn c_path(path: &Path) -> Result<CString, Error> {
+    CString::new(
+        path.to_str()
+            .ok_or_else(|| Error::Load("path is not UTF-8".into()))?,
+    )
+    .map_err(|_| Error::Load("path contains NUL".into()))
+}
+
+/// llama_model_params for a load, with the memory its pointers refer to.
+/// Shared by loading and llama.cpp's dry run, so they see the same placement.
+pub(crate) struct ModelParams {
+    pub mp: sys::llama_model_params,
+    pub patterns: Vec<CString>,
+    _overrides: Vec<sys::llama_model_tensor_buft_override>,
+    _split: Vec<f32>,
+}
+
+impl ModelParams {
+    pub fn new(opts: &LoadOptions) -> Result<ModelParams, Error> {
         init();
         let s = &opts.settings;
-        let c_path = CString::new(
-            path.to_str()
-                .ok_or_else(|| Error::Load("path is not UTF-8".into()))?,
-        )
-        .map_err(|_| Error::Load("path contains NUL".into()))?;
-
         let mut patterns = Vec::with_capacity(s.overrides.len());
         let mut overrides = Vec::with_capacity(s.overrides.len() + 1);
         for o in &s.overrides {
@@ -116,36 +127,48 @@ impl Model {
         });
 
         let max_dev = unsafe { sys::llama_max_devices() };
-        let mut split = vec![0f32; max_dev];
         if s.tensor_split.len() > max_dev {
             return Err(Error::Load(format!(
                 "{} GPUs in the split, llama.cpp supports {max_dev}",
                 s.tensor_split.len()
             )));
         }
+        let mut split = vec![0f32; max_dev];
         split[..s.tensor_split.len()].copy_from_slice(&s.tensor_split);
 
-        let ptr = unsafe {
-            let mut mp = sys::llama_model_default_params();
-            mp.n_gpu_layers = s.n_gpu_layers;
-            mp.tensor_split = split.as_ptr();
-            if !s.overrides.is_empty() {
-                mp.tensor_buft_overrides = overrides.as_ptr();
-            }
-            mp.use_extra_bufts = s.use_extra_bufts;
-            mp.no_host = s.no_host;
-            mp.load_mode = if s.use_mmap {
-                sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
-            } else {
-                sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
-            };
-            sys::llama_model_load_from_file(c_path.as_ptr(), mp)
+        let mut mp = unsafe { sys::llama_model_default_params() };
+        mp.n_gpu_layers = s.n_gpu_layers;
+        mp.tensor_split = split.as_ptr();
+        if !s.overrides.is_empty() {
+            mp.tensor_buft_overrides = overrides.as_ptr();
+        }
+        mp.use_extra_bufts = s.use_extra_bufts;
+        mp.no_host = s.no_host;
+        mp.load_mode = if s.use_mmap {
+            sys::llama_load_mode_LLAMA_LOAD_MODE_MMAP
+        } else {
+            sys::llama_load_mode_LLAMA_LOAD_MODE_NONE
         };
+        Ok(ModelParams {
+            mp,
+            patterns,
+            _overrides: overrides,
+            _split: split,
+        })
+    }
+}
+
+impl Model {
+    pub fn load(path: &Path, opts: &LoadOptions) -> Result<Model, Error> {
+        init();
+        let c_path = c_path(path)?;
+        let params = ModelParams::new(opts)?;
+        let ptr = unsafe { sys::llama_model_load_from_file(c_path.as_ptr(), params.mp) };
         let ptr = NonNull::new(ptr).ok_or_else(|| Error::Load(crate::log::tail(8)))?;
         Ok(Model {
             ptr,
             path: path.to_path_buf(),
-            _patterns: patterns,
+            _patterns: params.patterns,
         })
     }
 
