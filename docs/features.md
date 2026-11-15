@@ -35,6 +35,7 @@ Draft: stages marked **?** are open questions, not decisions.
 | List and remove models; show size and family | MVP |
 | Choose which disk a model is stored on (this is the disk tier) | MVP |
 | Modelfile equivalent: base model + defaults (prompt template, context, sampling) | v1 |
+| Credentials for private OCI registries (the MVP pulls from public ones) | v1 |
 | Push models to an OCI registry | v1 |
 | Search Hugging Face, ranked by what fits this machine | v1 **?** |
 | Import from ollama's model store | v1 **?** |
