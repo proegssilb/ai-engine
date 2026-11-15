@@ -96,10 +96,24 @@ impl Daemon {
                     manifest: None,
                 })
             }
+            ModelRef::Oci(o) => {
+                let m = self
+                    .store
+                    .get(&ModelRef::Oci(o))
+                    .map_err(|e| ApiError::internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!("model {name} not found; pull it first"))
+                    })?;
+                Ok(Resolved {
+                    name: m.manifest.name.clone(),
+                    path: m.path,
+                    manifest: Some(m.manifest),
+                })
+            }
             ModelRef::Hf(h) => {
                 let found = if h.tag.is_some() {
                     self.store
-                        .get(&h)
+                        .get(&ModelRef::Hf(h.clone()))
                         .map_err(|e| ApiError::internal(e.to_string()))?
                 } else {
                     let all = self

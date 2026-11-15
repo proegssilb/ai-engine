@@ -9,6 +9,8 @@ pub enum ModelRef {
     /// `hf.co/owner/repo[:tag]`: a GGUF repo on Hugging Face; the tag picks the
     /// quantization (`Q4_K_M`).
     Hf(HfRef),
+    /// `registry/repo:tag`: a model on an OCI registry.
+    Oci(crate::OciRef),
     /// A GGUF file already on disk.
     Local(PathBuf),
 }
@@ -87,8 +89,11 @@ impl ModelRef {
         {
             return Ok(ModelRef::Local(PathBuf::from(s)));
         }
+        if let Some(r) = crate::OciRef::parse(rest) {
+            return Ok(ModelRef::Oci(r));
+        }
         Err(ParseError(format!(
-            "{s}: not a model reference; use hf.co/OWNER/REPO[:TAG] or a path to a .gguf file"
+            "{s}: not a model reference; use hf.co/OWNER/REPO[:TAG], REGISTRY/REPO[:TAG], or a path to a .gguf file"
         )))
     }
 }
@@ -126,6 +131,14 @@ mod tests {
             ModelRef::parse("/srv/x.gguf"),
             Ok(ModelRef::Local("/srv/x.gguf".into()))
         );
+        assert!(matches!(
+            ModelRef::parse("registry.ollama.ai/library/qwen3:0.6b"),
+            Ok(ModelRef::Oci(_))
+        ));
+        assert!(matches!(
+            ModelRef::parse("localhost:5000/m/q:Q8_0"),
+            Ok(ModelRef::Oci(_))
+        ));
         let Ok(ModelRef::Hf(r)) = ModelRef::parse("hf.co/a/b:Q8_0") else {
             panic!()
         };

@@ -1,6 +1,6 @@
 //! Pull a model into a store directory, or show what a reference resolves to.
 //!
-//!     cargo run -p aie-store --example pull -- [--dry-run] STORE_DIR hf.co/OWNER/REPO[:TAG]
+//!     cargo run -p aie-store --example pull -- [--dry-run] STORE_DIR hf.co/OWNER/REPO[:TAG] | REGISTRY/REPO[:TAG]
 
 use aie_store::hf::{self, Hub};
 use aie_store::{ModelRef, Store};
@@ -16,8 +16,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("usage: pull [--dry-run] STORE_DIR hf.co/OWNER/REPO[:TAG]");
         std::process::exit(2)
     };
-    let ModelRef::Hf(r) = ModelRef::parse(reference)? else {
-        return Err("only hf.co references can be pulled".into());
+    let r = match ModelRef::parse(reference)? {
+        ModelRef::Hf(r) => r,
+        ModelRef::Oci(o) => {
+            let client = aie_store::oci::Client::for_registry(&o.registry)?;
+            if dry {
+                let (digest, layers) = client.resolve(&o).await?;
+                println!("{o} @ {digest}");
+                for l in layers {
+                    println!(
+                        "  {}  {:.2} GiB  sha256 {}",
+                        l.file_name,
+                        l.size as f64 / (1u64 << 30) as f64,
+                        l.sha256
+                    );
+                }
+                return Ok(());
+            }
+            let m = Store::open(dir)?.pull_oci(&o, &mut |_| {}).await?;
+            println!("{} -> {}", m.manifest.name, m.path.display());
+            return Ok(());
+        }
+        ModelRef::Local(_) => return Err("local files don't need pulling".into()),
     };
     let hub = Hub::public()?;
     if dry {

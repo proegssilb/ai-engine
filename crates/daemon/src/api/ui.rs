@@ -21,8 +21,21 @@ fn mime(path: &str) -> &'static str {
 
 fn asset(path: &str) -> Option<Response> {
     let (_, bytes) = ASSETS.iter().find(|(p, _)| *p == path)?;
-    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
-    Some(([(header::CONTENT_TYPE, mime(path)), (header::CACHE_CONTROL, cache)], *bytes).into_response())
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, mime(path)),
+                (header::CACHE_CONTROL, cache),
+            ],
+            *bytes,
+        )
+            .into_response(),
+    )
 }
 
 const NOT_BUILT: &str = "<!doctype html><title>ai-engine</title><body style=\"font-family:system-ui;background:#15171c;color:#e7e9ee;padding:40px\">\
@@ -35,7 +48,13 @@ pub async fn index() -> Response {
 
 pub async fn file(Path(path): Path<String>) -> Response {
     // Unknown paths get the app (client-side routes); missing assets 404.
-    asset(&path).unwrap_or_else(|| if path.starts_with("assets/") { axum::http::StatusCode::NOT_FOUND.into_response() } else { app_index() })
+    asset(&path).unwrap_or_else(|| {
+        if path.starts_with("assets/") {
+            axum::http::StatusCode::NOT_FOUND.into_response()
+        } else {
+            app_index()
+        }
+    })
 }
 
 fn app_index() -> Response {

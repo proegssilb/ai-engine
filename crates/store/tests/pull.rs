@@ -140,8 +140,18 @@ async fn pulls_default_tag_and_lists() {
         .unwrap();
     assert_eq!(mock.log.lock().unwrap().len(), 1);
 
-    assert!(store.get(&hf("hf.co/o/r:Q4_K_M")).unwrap().is_some());
-    assert!(store.get(&hf("hf.co/o/r:Q8_0")).unwrap().is_none());
+    assert!(
+        store
+            .get(&ModelRef::Hf(hf("hf.co/o/r:Q4_K_M")))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .get(&ModelRef::Hf(hf("hf.co/o/r:Q8_0")))
+            .unwrap()
+            .is_none()
+    );
     assert_eq!(store.list().unwrap().len(), 1);
 }
 
@@ -263,14 +273,22 @@ async fn remove_collects_unused_blobs_only() {
         .await
         .unwrap();
     std::fs::write(store.blob_path("feed").with_extension("partial"), b"x").unwrap();
-    assert_eq!(store.remove(&hf("hf.co/o/r:Q8_0")).unwrap(), 32);
-    assert!(store.get(&hf("hf.co/o/r:Q4_K_M")).unwrap().is_some());
+    assert_eq!(
+        store.remove(&ModelRef::Hf(hf("hf.co/o/r:Q8_0"))).unwrap(),
+        32
+    );
+    assert!(
+        store
+            .get(&ModelRef::Hf(hf("hf.co/o/r:Q4_K_M")))
+            .unwrap()
+            .is_some()
+    );
     assert!(
         store.blob_path("feed").with_extension("partial").exists(),
         "partials survive gc"
     );
     assert!(matches!(
-        store.remove(&hf("hf.co/o/r:Q8_0")),
+        store.remove(&ModelRef::Hf(hf("hf.co/o/r:Q8_0"))),
         Err(Error::NotFound(_))
     ));
 }
@@ -294,4 +312,144 @@ async fn unauthorized_is_explained() {
         .unwrap_err();
     assert!(matches!(err, Error::Unauthorized(_)));
     assert!(err.to_string().contains("HF_TOKEN"));
+}
+
+/// A mock OCI registry with bearer-token auth (the WWW-Authenticate flow).
+mod oci {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[derive(Default)]
+    pub struct Reg {
+        pub blobs: HashMap<String, Vec<u8>>,
+        pub manifest: String,
+        pub addr: Mutex<String>,
+    }
+
+    async fn token() -> impl IntoResponse {
+        axum::Json(serde_json::json!({ "token": "t0k" }))
+    }
+
+    #[allow(clippy::result_large_err)] // test helper; boxing would only add noise
+    fn authed(h: &HeaderMap, reg: &Reg) -> Result<(), Response> {
+        if h.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) == Some("Bearer t0k") {
+            return Ok(());
+        }
+        let addr = reg.addr.lock().unwrap().clone();
+        let mut r = StatusCode::UNAUTHORIZED.into_response();
+        let challenge = format!(
+            "Bearer realm=\"http://{addr}/token\",service=\"test\",scope=\"repository:m/q:pull\""
+        );
+        r.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_str(&challenge).unwrap(),
+        );
+        Err(r)
+    }
+
+    async fn manifest(State(reg): State<Arc<Reg>>, h: HeaderMap) -> Response {
+        if let Err(r) = authed(&h, &reg) {
+            return r;
+        }
+        (
+            [(
+                header::CONTENT_TYPE,
+                "application/vnd.oci.image.manifest.v1+json",
+            )],
+            reg.manifest.clone(),
+        )
+            .into_response()
+    }
+
+    async fn blob(
+        State(reg): State<Arc<Reg>>,
+        Path((_ns, _repo, digest)): Path<(String, String, String)>,
+        h: HeaderMap,
+    ) -> Response {
+        if let Err(r) = authed(&h, &reg) {
+            return r;
+        }
+        match reg.blobs.get(digest.trim_start_matches("sha256:")) {
+            Some(b) => b.clone().into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    use axum::response::Response;
+
+    pub async fn serve(reg: Reg) -> String {
+        let reg = Arc::new(reg);
+        let app = Router::new()
+            .route("/token", get(token))
+            .route("/v2/{ns}/{repo}/manifests/{reference}", get(manifest))
+            .route("/v2/{ns}/{repo}/blobs/{digest}", get(blob))
+            .with_state(reg.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        *reg.addr.lock().unwrap() = addr.clone();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        addr.replace("127.0.0.1", "localhost")
+    }
+}
+
+#[tokio::test]
+async fn pulls_a_split_model_from_an_oci_registry_with_token_auth() {
+    let (a, b, cfg) = (vec![5u8; 700], vec![6u8; 300], b"{}".to_vec());
+    let layer = |d: &[u8], media: &str, title: &str| {
+        serde_json::json!({ "mediaType": media, "digest": format!("sha256:{}", sha256(d)), "size": d.len(),
+            "annotations": { "org.opencontainers.image.title": title } })
+    };
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": { "mediaType": "application/vnd.aie.config.v1+json", "digest": format!("sha256:{}", sha256(&cfg)), "size": 2 },
+        // listed out of order: split parts are sorted by title
+        "layers": [
+            layer(&b, "application/vnd.aie.model.gguf", "q-00002-of-00002.gguf"),
+            layer(b"template", "application/vnd.ollama.image.template", "template"),
+            layer(&a, "application/vnd.aie.model.gguf", "q-00001-of-00002.gguf"),
+        ]
+    });
+    let mut reg = oci::Reg {
+        manifest: manifest.to_string(),
+        ..Default::default()
+    };
+    reg.blobs.insert(sha256(&a), a.clone());
+    reg.blobs.insert(sha256(&b), b.clone());
+    let addr = oci::serve(reg).await;
+
+    let store = tmp_store("oci");
+    let r = match ModelRef::parse(&format!("{addr}/m/q:v1")).unwrap() {
+        ModelRef::Oci(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let model = store.pull_oci(&r, &mut noop()).await.unwrap();
+    assert!(model.path.ends_with("q-00001-of-00002.gguf"));
+    assert_eq!(std::fs::read(&model.path).unwrap(), a);
+    assert_eq!(
+        std::fs::read(model.path.with_file_name("q-00002-of-00002.gguf")).unwrap(),
+        b
+    );
+    assert_eq!(model.manifest.name, format!("{addr}/m/q:v1"));
+    assert!(store.get(&ModelRef::Oci(r.clone())).unwrap().is_some());
+    assert_eq!(store.list().unwrap().len(), 1);
+    assert_eq!(store.remove(&ModelRef::Oci(r)).unwrap(), 1000);
+}
+
+#[tokio::test]
+async fn oci_manifest_without_gguf_is_explained() {
+    let manifest = serde_json::json!({ "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json", "layers": [] });
+    let addr = oci::serve(oci::Reg {
+        manifest: manifest.to_string(),
+        ..Default::default()
+    })
+    .await;
+    let ModelRef::Oci(r) = ModelRef::parse(&format!("{addr}/m/q")).unwrap() else {
+        panic!()
+    };
+    let err = tmp_store("oci-empty")
+        .pull_oci(&r, &mut noop())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no GGUF layer"), "{err}");
 }

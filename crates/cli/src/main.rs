@@ -27,7 +27,7 @@ struct Cli {
 enum Cmd {
     /// Run the daemon (API on AIE_HOST; data in AIE_HOME, default ~/.ai-engine).
     Serve,
-    /// Download a model: hf.co/OWNER/REPO[:TAG].
+    /// Download a model: hf.co/OWNER/REPO[:TAG] or REGISTRY/REPO[:TAG].
     Pull { model: String },
     /// List downloaded models.
     #[command(alias = "ls")]

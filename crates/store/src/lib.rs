@@ -16,8 +16,10 @@
 //! One pull of a given blob at a time: the daemon serialises pulls.
 
 pub mod hf;
+pub mod oci;
 mod reference;
 
+pub use oci::OciRef;
 pub use reference::{HfRef, ModelRef, ParseError};
 
 use serde::{Deserialize, Serialize};
@@ -56,7 +58,10 @@ impl fmt::Display for Error {
             Error::Http(m) => f.write_str(m),
             Error::NotFound(u) => write!(f, "not found: {u}"),
             Error::Unauthorized(u) => {
-                write!(f, "not authorised: {u} (gated or private? set HF_TOKEN)")
+                write!(
+                    f,
+                    "not authorised: {u} (private or gated? for Hugging Face set HF_TOKEN; registries: public models only for now)"
+                )
             }
             Error::NoSuchTag { tag, offered } => write!(
                 f,
@@ -108,6 +113,46 @@ pub enum Source {
         tag: String,
         revision: String,
     },
+    Oci {
+        registry: String,
+        repository: String,
+        reference: String,
+        /// Manifest digest the reference resolved to.
+        digest: String,
+    },
+}
+
+impl Source {
+    /// (namespace path, tag) under manifests/ and models/. Hugging Face tags
+    /// are case-insensitive (upper-cased); OCI tags are case-sensitive.
+    fn key(&self) -> (PathBuf, String) {
+        match self {
+            Source::Hf { repo, tag, .. } => {
+                (PathBuf::from("hf.co").join(repo), tag.to_ascii_uppercase())
+            }
+            Source::Oci {
+                registry,
+                repository,
+                reference,
+                ..
+            } => (PathBuf::from(registry).join(repository), reference.clone()),
+        }
+    }
+}
+
+/// The store key a reference names, if it names one exactly.
+fn ref_key(r: &ModelRef) -> Option<(PathBuf, String)> {
+    match r {
+        ModelRef::Hf(h) => Some((
+            PathBuf::from("hf.co").join(&h.repo),
+            h.tag.as_ref()?.to_ascii_uppercase(),
+        )),
+        ModelRef::Oci(o) => Some((
+            PathBuf::from(&o.registry).join(&o.repository),
+            o.reference.clone(),
+        )),
+        ModelRef::Local(_) => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,22 +221,15 @@ impl Store {
         self.root.join("blobs/sha256").join(sha256)
     }
 
-    fn rel_dir(r: &str, tag: &str) -> PathBuf {
-        PathBuf::from("hf.co")
-            .join(r)
-            .join(tag.to_ascii_uppercase())
-    }
-
-    fn manifest_path(&self, repo: &str, tag: &str) -> PathBuf {
-        let d = Self::rel_dir(repo, tag);
+    fn manifest_path(&self, ns: &Path, tag: &str) -> PathBuf {
         self.root
             .join("manifests")
-            .join(d.parent().unwrap())
-            .join(format!("{}.json", tag.to_ascii_uppercase()))
+            .join(ns)
+            .join(format!("{tag}.json"))
     }
 
-    fn model_dir(&self, repo: &str, tag: &str) -> PathBuf {
-        self.root.join("models").join(Self::rel_dir(repo, tag))
+    fn model_dir(&self, ns: &Path, tag: &str) -> PathBuf {
+        self.root.join("models").join(ns).join(tag)
     }
 
     /// Resolve a reference against the Hub and download what's missing.
@@ -220,7 +258,7 @@ impl Store {
         for f in &chosen {
             let sha = f.sha256.clone().expect("select() requires hashes");
             let url = hub.file_url(&r.repo, &revision, &f.path);
-            self.fetch(hub, &url, &f.path, &sha, f.size, progress)
+            self.fetch(&|u| hub.get(u), &url, &f.path, &sha, f.size, progress)
                 .await?;
             entries.push(FileEntry {
                 path: f.path.clone(),
@@ -250,11 +288,55 @@ impl Store {
         self.commit(&manifest)
     }
 
+    /// Resolve a registry reference and download its GGUF layers.
+    pub async fn pull_oci(
+        &self,
+        r: &OciRef,
+        progress: &mut (dyn FnMut(Progress) + Send),
+    ) -> Result<Model, Error> {
+        let client = oci::Client::for_registry(&r.registry)?;
+        let (digest, layers) = client.resolve(r).await?;
+        let mut entries = Vec::new();
+        for l in &layers {
+            let url = client.blob_url(r, &format!("sha256:{}", l.sha256));
+            self.fetch(
+                &|u| client.get(u),
+                &url,
+                &l.file_name,
+                &l.sha256,
+                l.size,
+                progress,
+            )
+            .await?;
+            entries.push(FileEntry {
+                path: l.file_name.clone(),
+                sha256: l.sha256.clone(),
+                size: l.size,
+            });
+        }
+        let manifest = Manifest {
+            schema: 1,
+            name: r.to_string(),
+            source: Source::Oci {
+                registry: r.registry.clone(),
+                repository: r.repository.clone(),
+                reference: r.reference.clone(),
+                digest,
+            },
+            files: entries,
+            pulled_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        self.commit(&manifest)
+    }
+
     /// Download one blob unless present, resuming a partial download, and
     /// verify it against its SHA-256.
     async fn fetch(
         &self,
-        hub: &hf::Hub,
+        get: &(dyn Fn(&str) -> reqwest::RequestBuilder + Sync),
         url: &str,
         name: &str,
         sha256: &str,
@@ -295,7 +377,7 @@ impl Store {
             }
         }
 
-        let mut req = hub.get(url);
+        let mut req = get(url);
         if have > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={have}-"));
         }
@@ -348,8 +430,8 @@ impl Store {
 
     /// Write the manifest and the symlink folder.
     fn commit(&self, m: &Manifest) -> Result<Model, Error> {
-        let Source::Hf { repo, tag, .. } = &m.source;
-        let dir = self.model_dir(repo, tag);
+        let (ns, tag) = m.source.key();
+        let dir = self.model_dir(&ns, &tag);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -360,7 +442,7 @@ impl Store {
             let base = f.path.rsplit('/').next().unwrap();
             std::os::unix::fs::symlink(up.join("blobs/sha256").join(&f.sha256), dir.join(base))?;
         }
-        let mp = self.manifest_path(repo, tag);
+        let mp = self.manifest_path(&ns, &tag);
         std::fs::create_dir_all(mp.parent().unwrap())?;
         let tmp = mp.with_extension("json.tmp");
         std::fs::write(
@@ -372,21 +454,23 @@ impl Store {
     }
 
     fn model_of(&self, manifest: Manifest) -> Result<Model, Error> {
-        let Source::Hf { repo, tag, .. } = &manifest.source;
+        let (ns, tag) = manifest.source.key();
         let first = manifest
             .files
             .first()
             .ok_or_else(|| Error::Manifest(format!("{} has no files", manifest.name)))?;
         let path = self
-            .model_dir(repo, tag)
+            .model_dir(&ns, &tag)
             .join(first.path.rsplit('/').next().unwrap());
         Ok(Model { manifest, path })
     }
 
     /// A pulled model, if present and complete.
-    pub fn get(&self, r: &HfRef) -> Result<Option<Model>, Error> {
-        let Some(tag) = &r.tag else { return Ok(None) };
-        let p = self.manifest_path(&r.repo, tag);
+    pub fn get(&self, r: &ModelRef) -> Result<Option<Model>, Error> {
+        let Some((ns, tag)) = ref_key(r) else {
+            return Ok(None);
+        };
+        let p = self.manifest_path(&ns, &tag);
         if !p.exists() {
             return Ok(None);
         }
@@ -423,16 +507,18 @@ impl Store {
     }
 
     /// Remove a model, then any blobs no remaining model uses. Returns bytes freed.
-    pub fn remove(&self, r: &HfRef) -> Result<u64, Error> {
-        let Some(tag) = &r.tag else {
-            return Err(Error::Manifest("removing needs a tag".into()));
+    pub fn remove(&self, r: &ModelRef) -> Result<u64, Error> {
+        let Some((ns, tag)) = ref_key(r) else {
+            return Err(Error::Manifest(
+                "removing needs a tagged hf.co or registry reference".into(),
+            ));
         };
-        let mp = self.manifest_path(&r.repo, tag);
+        let mp = self.manifest_path(&ns, &tag);
         if !mp.exists() {
-            return Err(Error::NotFound(r.to_string()));
+            return Err(Error::NotFound(format!("{}", ns.join(&tag).display())));
         }
         std::fs::remove_file(&mp)?;
-        let dir = self.model_dir(&r.repo, tag);
+        let dir = self.model_dir(&ns, &tag);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
         }
@@ -463,6 +549,6 @@ impl Store {
     }
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

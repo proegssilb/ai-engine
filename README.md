@@ -35,6 +35,7 @@ cargo build --release -p ai-engine --features cuda  # NVIDIA; CUDA_ARCHITECTURES
 
 target/release/ai-engine serve &                    # API on 127.0.0.1:11435, data in ~/.ai-engine
 target/release/ai-engine pull hf.co/Qwen/Qwen3-8B-GGUF:Q4_K_M
+target/release/ai-engine pull registry.example.com/team/model:q4   # or any OCI registry
 curl -s localhost:11435/api/chat -d '{"model":"hf.co/Qwen/Qwen3-8B-GGUF","messages":[{"role":"user","content":"Hi"}]}'
 target/release/ai-engine place hf.co/Qwen/Qwen3-8B-GGUF   # where every weight really is
 ```
@@ -56,9 +57,9 @@ busy). Against the MVP list in [features.md](docs/features.md):
 | Area | Done | Not yet |
 |---|---|---|
 | Install | one binary (daemon, worker, CLI); config file; CUDA build | systemd unit; release builds for other CPUs (built with `GGML_NATIVE`) |
-| Models | pull by Hugging Face shorthand (verified, resumable, split models); local GGUF files; list, remove | OCI registries; choosing the disk per model |
+| Models | pull by Hugging Face shorthand and from OCI registries (verified, resumable, split models); local GGUF files; list, remove | choosing the disk per model; registry credentials (public only for now) |
 | Serving | ollama and OpenAI APIs with streaming; several models at once; keep-alive; one request at a time per model | |
-| Placement | anatomy; auto-place (llama.cpp's fit); intents by share per tier; fit check; apply on reload; every load verified weight by weight | web UI; machine view; cross-check of overhead estimates with llama.cpp's dry run |
+| Placement | anatomy; auto-place (llama.cpp's fit); intents by share per tier; fit check; apply on reload; every load verified weight by weight; web UI with machine view and placement editor (`/ui/`) | cross-check of overhead estimates with llama.cpp's dry run |
 | Monitoring | tokens and timings per response | per-model and per-device metrics; disk-tier residency |
 
 ## Layout

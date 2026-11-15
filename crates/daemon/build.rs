@@ -16,11 +16,22 @@ fn main() {
     let mut out = String::from("pub static ASSETS: &[(&str, &[u8])] = &[\n");
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
-        let rel = f.strip_prefix(&dist).unwrap().to_string_lossy().replace('\\', "/");
-        out.push_str(&format!("    ({rel:?}, include_bytes!({:?})),\n", f.canonicalize().unwrap()));
+        let rel = f
+            .strip_prefix(&dist)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push_str(&format!(
+            "    ({rel:?}, include_bytes!({:?})),\n",
+            f.canonicalize().unwrap()
+        ));
     }
     out.push_str("];\n");
-    fs::write(PathBuf::from(env::var("OUT_DIR").unwrap()).join("ui_assets.rs"), out).unwrap();
+    fs::write(
+        PathBuf::from(env::var("OUT_DIR").unwrap()).join("ui_assets.rs"),
+        out,
+    )
+    .unwrap();
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

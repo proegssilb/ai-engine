@@ -7,7 +7,7 @@ use aie_proto::worker::done::Reason;
 use aie_proto::worker::generate_event::Event;
 use aie_proto::worker::generate_request::Input;
 use aie_proto::worker::{Chat, ChatMessage};
-use aie_store::{HfRef, ModelRef};
+use aie_store::ModelRef;
 use axum::Json;
 use axum::body::Body as HttpBody;
 use axum::response::{IntoResponse, Response};
@@ -361,13 +361,10 @@ pub async fn show(st: State, Body(r): Body<ModelReq>) -> Result<Json<Value>, Api
 }
 
 pub async fn pull(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiError> {
-    let ModelRef::Hf(href) =
-        ModelRef::parse(&r.model).map_err(|e| ApiError::bad_request(e.to_string()))?
-    else {
-        return Err(ApiError::bad_request(
-            "only hf.co/OWNER/REPO[:TAG] models can be pulled",
-        ));
-    };
+    let target = ModelRef::parse(&r.model).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if matches!(target, ModelRef::Local(_)) {
+        return Err(ApiError::bad_request("local files don't need pulling"));
+    }
     let (tx, rx) = tokio::sync::mpsc::channel::<Value>(256);
     let d = st.0.clone();
     tokio::spawn(async move {
@@ -375,15 +372,17 @@ pub async fn pull(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiErr
         let _ = tx.send(json!({ "status": "pulling manifest" })).await;
         let tx2 = tx.clone();
         let mut last = std::time::Instant::now() - Duration::from_secs(1);
-        let result = d
-            .store
-            .pull(&d.hub, &href, &mut |p| {
-                if p.done == p.total || last.elapsed() > Duration::from_millis(250) {
-                    last = std::time::Instant::now();
-                    let _ = tx2.try_send(json!({ "status": format!("pulling {}", p.file), "digest": p.file, "total": p.total, "completed": p.done }));
-                }
-            })
-            .await;
+        let mut progress = |p: aie_store::Progress| {
+            if p.done == p.total || last.elapsed() > Duration::from_millis(250) {
+                last = std::time::Instant::now();
+                let _ = tx2.try_send(json!({ "status": format!("pulling {}", p.file), "digest": p.file, "total": p.total, "completed": p.done }));
+            }
+        };
+        let result = match &target {
+            ModelRef::Hf(h) => d.store.pull(&d.hub, h, &mut progress).await,
+            ModelRef::Oci(o) => d.store.pull_oci(o, &mut progress).await,
+            ModelRef::Local(_) => unreachable!(),
+        };
         let _ = match result {
             Ok(_) => {
                 let _ = tx
@@ -411,18 +410,14 @@ pub async fn pull(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiErr
 pub async fn delete(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiError> {
     let res = st.0.resolve(&r.model)?;
     st.0.workers.unload(&res.name).await;
-    let ModelRef::Hf(h) =
-        ModelRef::parse(&res.name).map_err(|e| ApiError::bad_request(e.to_string()))?
-    else {
+    let target = ModelRef::parse(&res.name).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if matches!(target, ModelRef::Local(_)) {
         return Err(ApiError::bad_request(
             "local files aren't deleted; remove them yourself",
         ));
-    };
+    }
     st.0.store
-        .remove(&HfRef {
-            repo: h.repo,
-            tag: h.tag,
-        })
+        .remove(&target)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({})).into_response())
 }
