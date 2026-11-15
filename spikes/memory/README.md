@@ -86,10 +86,33 @@ cache and everything else compete. Swap file and reservations removed after.
   effectively 12 GB *plus* the RAM tier. Fastest, but not comparable: it
   escaped the cap rather than living within it.
 
+## Phase C: no swap for the worker, without root or `mlock`
+
+Same pressure as phase B (swap on, 12 GB cap, half the experts in RAM), the
+default 8 MiB lock limit, no CUDA registration. The worker runs in a systemd
+*user* scope: recent systemd delegates the memory controller to each user's
+manager (`cpu memory pids` on the box), so an unprivileged user can forbid
+swap for their own processes.
+
+| Run (`systemd-run --user --scope -p MemoryMax=12G`) | Prefill tok/s | Decode tok/s | RAM tier swapped out |
+|---|---:|---:|---:|
+| `MemorySwapMax=infinity` | 134 | 12.5 | 2,363 MiB |
+| `MemorySwapMax=0` | 79 | 10.6 | **0** |
+
+`MemorySwapMax=0` holds the RAM tier exactly as `mlock` did, with no admin
+and no driver: the same trade-off against the disk tier, too. So whenever
+the daemon runs in a user session with a delegated memory controller, it can
+start workers that way and the RAM tier is held.
+
 ## What this means for the product
 
-1. **Locking is the right meaning of "RAM tier", and it needs the limit
-   raised.** It's the only way the placement users chose holds under pressure,
+1. **Holding the RAM tier is the right meaning of "RAM tier".** Ways that
+   need no driver: no swap on the machine; `mlock` with the limit raised
+   (service unit, ulimit, `CAP_IPC_LOCK`); or swap forbidden for the worker's
+   cgroup (`MemorySwapMax=0`, possible unprivileged in a user session, phase
+   C). Workers should report which applies, or how to fix it.
+   Earlier framing: locking is the way to hold it, and it needs the limit
+   raised. It's the only way the placement users chose holds under pressure,
    and it's free to do. The 8 MiB default defeats it silently; the worker's
    warning (added today) and `LimitMEMLOCK=infinity` in the systemd unit are
    necessary. Worth considering: register the RAM tier with CUDA by default on
