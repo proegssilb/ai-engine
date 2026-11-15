@@ -50,15 +50,11 @@ fn main() {
     let dst = cfg.build();
     let build = dst.join("build");
 
-    // Link every static library the build produced, as one group so their
-    // mutual references resolve regardless of order.
+    // Link the static libraries in dependency order (dependents first).
+    // rustc-link-lib, unlike rustc-link-arg, carries through to every crate
+    // that depends on this one.
     let mut libs = Vec::new();
     find_static_libs(&build, &mut libs);
-    libs.sort();
-    assert!(
-        libs.iter().any(|l| l.file_name().unwrap() == "libllama.a"),
-        "libllama.a not built"
-    );
     let mut dirs: Vec<PathBuf> = libs
         .iter()
         .map(|l| l.parent().unwrap().to_path_buf())
@@ -68,20 +64,46 @@ fn main() {
     for d in &dirs {
         println!("cargo:rustc-link-search=native={}", d.display());
     }
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
-    for l in &libs {
-        println!("cargo:rustc-link-arg={}", l.display());
+    let have = |n: &str| {
+        libs.iter()
+            .any(|l| l.file_name().unwrap() == format!("lib{n}.a").as_str())
+    };
+    let order = [
+        "llama-common",
+        "llama-common-base",
+        "cpp-httplib",
+        "llama",
+        "ggml",
+        "ggml-cpu",
+        "ggml-cuda",
+        "ggml-base",
+    ];
+    for n in order {
+        if have(n) {
+            println!("cargo:rustc-link-lib=static={n}");
+        }
     }
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    for l in &libs {
+        let n = l
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches("lib");
+        assert!(
+            order.contains(&n),
+            "llama.cpp built an unexpected library {n}; add it to the link order in build.rs"
+        );
+    }
     for l in ["stdc++", "m", "pthread", "dl"] {
-        println!("cargo:rustc-link-arg=-l{l}");
+        println!("cargo:rustc-link-lib=dylib={l}");
     }
     if cuda {
         for d in ["/usr/local/cuda/lib64", "/usr/lib/x86_64-linux-gnu"] {
             println!("cargo:rustc-link-search=native={d}");
         }
         for l in ["cudart", "cublas", "cublasLt", "cuda"] {
-            println!("cargo:rustc-link-arg=-l{l}");
+            println!("cargo:rustc-link-lib=dylib={l}");
         }
     }
 

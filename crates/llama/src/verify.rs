@@ -30,7 +30,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 /// Where a weight was found.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Where {
     /// A tier the planner knows: a GPU, the pinned RAM buffer, the mapped file.
     Tier(Tier),
@@ -51,7 +51,7 @@ impl fmt::Display for Where {
 }
 
 /// What the check found.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     /// Every weight the graph read, directly or through a copy.
     pub weights: BTreeMap<String, Where>,
@@ -64,7 +64,7 @@ pub struct Report {
 }
 
 /// A weight not where the plan put it.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Mismatch {
     pub tensor: String,
     pub planned: Tier,

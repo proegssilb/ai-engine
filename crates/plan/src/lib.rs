@@ -22,7 +22,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Where bytes can live.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Tier {
     /// A GPU, by index (`CUDA0` = 0).
     Gpu(u32),
@@ -43,7 +45,7 @@ impl fmt::Display for Tier {
 }
 
 /// How much of a subsystem goes to a tier.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Amount {
     /// A share of the subsystem's bytes, 0.0–1.0.
     Fraction(f64),
@@ -53,7 +55,7 @@ pub enum Amount {
     Rest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Share {
     pub tier: Tier,
     pub amount: Amount,
@@ -72,7 +74,7 @@ impl Share {
 }
 
 /// What the user asked for.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Intent {
     /// Context length the KV cache is sized for.
     pub n_ctx: u64,
@@ -109,7 +111,7 @@ impl Intent {
 }
 
 /// A concrete placement.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     /// Home of each layer (index = layer): GPU or RAM.
     pub layer_home: Vec<Tier>,

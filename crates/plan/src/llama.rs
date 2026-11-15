@@ -23,7 +23,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// A buffer an override can name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum BufDest {
     /// A GPU's device buffer (`CUDA{i}`).
     Device(u32),
@@ -63,14 +65,14 @@ impl fmt::Display for BufDest {
 }
 
 /// One `tensor_buft_overrides` entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Override {
     pub pattern: String,
     pub dest: BufDest,
 }
 
 /// The llama.cpp model and context parameters a plan sets.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub n_gpu_layers: i32,
     /// One entry per GPU; all zero when nothing is offloaded.

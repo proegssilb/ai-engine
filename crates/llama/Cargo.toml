@@ -12,6 +12,7 @@ links = "llama"
 cuda = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 aie-plan = { path = "../plan" }
 libc = "0.2"
 

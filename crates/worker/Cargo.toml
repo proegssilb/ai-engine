@@ -1,0 +1,30 @@
+[package]
+name = "aie-worker"
+description = "Worker process: one loaded model, served over gRPC on a Unix socket"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+cuda = ["aie-llama/cuda"]
+
+[dependencies]
+aie-anatomy = { path = "../anatomy" }
+aie-gguf = { path = "../gguf" }
+aie-llama = { path = "../llama" }
+aie-plan = { path = "../plan" }
+aie-proto = { path = "../proto" }
+hyper-util = { version = "0.1", features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tower = "0.5"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

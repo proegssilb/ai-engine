@@ -1,0 +1,95 @@
+// Daemon <-> worker protocol (architecture.md: gRPC over a Unix socket).
+// One worker process per loaded model; the model is loaded when the worker
+// starts, so there is no Load call. Both ends ship in the same binary.
+syntax = "proto3";
+
+package aie.worker.v1;
+
+service Worker {
+  // Ready once the model is loaded and its placement checked.
+  rpc Status(StatusRequest) returns (StatusReply);
+  // Generate from chat messages or a raw prompt. Text arrives as it's made;
+  // the last event is Done. Dropping the stream cancels generation.
+  rpc Generate(GenerateRequest) returns (stream GenerateEvent);
+  rpc Tokenize(TokenizeRequest) returns (TokenizeReply);
+}
+
+message StatusRequest {}
+
+message StatusReply {
+  string model_path = 1;
+  // e.g. "qwen3moe 30B.A3B Q4_K - Medium"
+  string description = 2;
+  uint32 n_ctx = 3;
+  uint64 weight_bytes = 4;
+  // aie_llama::verify::Report as JSON: where every weight really is.
+  string placement_json = 5;
+  // Weights not where the plan put them (0 = placement honoured).
+  uint32 misplaced = 6;
+  uint64 load_ms = 7;
+  // aie_plan::Plan as JSON: where the weights were meant to go (for auto
+  // placement, llama.cpp's fit resolved into a plan).
+  string plan_json = 8;
+}
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+}
+
+message Chat {
+  repeated ChatMessage messages = 1;
+}
+
+message Sampling {
+  // 0 = greedy
+  float temperature = 1;
+  int32 top_k = 2;
+  float top_p = 3;
+  float min_p = 4;
+  uint32 seed = 5;
+}
+
+message GenerateRequest {
+  oneof input {
+    // Formatted with the model's chat template.
+    Chat chat = 1;
+    // Used as-is.
+    string prompt = 2;
+  }
+  Sampling sampling = 3;
+  uint32 max_tokens = 4;
+  // Generation stops before any of these strings; they aren't returned.
+  repeated string stop = 5;
+}
+
+message Done {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    END_OF_TEXT = 1;
+    LENGTH = 2;
+    STOP_STRING = 3;
+    CONTEXT_FULL = 4;
+    CANCELLED = 5;
+  }
+  Reason reason = 1;
+  uint32 prompt_tokens = 2;
+  uint32 completion_tokens = 3;
+  uint64 prefill_ns = 4;
+  uint64 decode_ns = 5;
+}
+
+message GenerateEvent {
+  oneof event {
+    string text = 1;
+    Done done = 2;
+  }
+}
+
+message TokenizeRequest {
+  string text = 1;
+}
+
+message TokenizeReply {
+  repeated int32 tokens = 1;
+}

@@ -15,7 +15,9 @@ use std::fmt;
 pub const SUPPORTED_ARCHITECTURES: &[&str] = &["qwen3", "qwen3moe"];
 
 /// A placeable part of a model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Subsystem {
     /// Token embeddings (`token_embd`).
     Embeddings,
@@ -115,7 +117,7 @@ pub struct Part {
 }
 
 /// What the KV cache's size depends on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KvShape {
     pub layers: u32,
     pub kv_heads: u32,
@@ -140,7 +142,7 @@ impl KvShape {
 }
 
 /// Mixture-of-experts shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MoeShape {
     pub experts: u32,
     pub experts_used: u32,

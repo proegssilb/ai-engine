@@ -12,7 +12,7 @@ use std::fmt;
 const MIB: u64 = 1 << 20;
 
 /// Memory available on one device.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Capacity {
     pub name: String,
     pub total: u64,
@@ -21,7 +21,7 @@ pub struct Capacity {
 }
 
 /// The machine, as far as placement cares.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Machine {
     /// GPUs by index (`CUDA0` first).
     pub gpus: Vec<Capacity>,
@@ -29,7 +29,7 @@ pub struct Machine {
 }
 
 /// Memory llama.cpp needs besides weights, KV cache and expert cache.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Overheads {
     /// CUDA context on each GPU the worker uses. Not yet measured on the V100s.
     pub cuda_context: u64,
@@ -58,7 +58,7 @@ impl Default for Overheads {
 }
 
 /// What a plan needs on one device.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Need {
     pub weights: u64,
     pub kv_cache: u64,
@@ -72,7 +72,7 @@ impl Need {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceFit {
     pub tier: Tier,
     pub name: String,
@@ -87,7 +87,7 @@ impl DeviceFit {
 }
 
 /// Per-device needs. Devices the plan doesn't touch are left out.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub devices: Vec<DeviceFit>,
     /// Bytes on the disk tier (mapped, evictable; not counted against RAM).

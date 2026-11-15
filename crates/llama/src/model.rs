@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 /// How to load: llama.cpp settings compiled from a plan, and how the RAM tier
 /// (the Rust buffer) behaves.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LoadOptions {
     pub settings: Settings,
     pub pin: PinOptions,

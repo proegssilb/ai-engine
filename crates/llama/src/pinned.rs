@@ -16,7 +16,7 @@ use std::ffi::{CStr, CString, c_void};
 use std::ptr;
 use std::sync::Mutex;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinOptions {
     /// mbind the allocation to this NUMA node (MPOL_BIND).
     pub numa_node: Option<u32>,

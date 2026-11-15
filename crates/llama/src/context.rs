@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Context settings.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextParams {
     pub n_ctx: u32,
     /// Tokens per decode call (and per micro-batch).
@@ -38,7 +38,7 @@ impl Default for ContextParams {
 }
 
 /// How to pick the next token.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Sampling {
     /// 0 = greedy.
     pub temperature: f32,
