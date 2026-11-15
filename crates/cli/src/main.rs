@@ -49,6 +49,9 @@ enum Cmd {
         #[arg(long)]
         reload: bool,
     },
+    /// Internal: print the devices llama.cpp sees, as JSON (used by the daemon).
+    #[command(hide = true)]
+    Probe,
     /// Internal: one model's worker process, started by the daemon.
     #[command(hide = true)]
     Worker {
@@ -71,6 +74,10 @@ fn main() {
                         .ok_or(format!("bad --host {}", cli.host))?;
                 }
                 aie_daemon::serve(cfg).await
+            }
+            Cmd::Probe => {
+                println!("{}", aie_worker::probe());
+                Ok(())
             }
             Cmd::Worker { config, socket } => {
                 let text = std::fs::read_to_string(&config)

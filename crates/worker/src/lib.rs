@@ -56,6 +56,55 @@ pub struct Config {
     pub context: ContextParams,
 }
 
+/// What `ai-engine probe` prints: the devices as llama.cpp sees them, host RAM
+/// and its NUMA nodes. Runs in a short-lived process so the daemon never
+/// initialises CUDA.
+pub fn probe() -> serde_json::Value {
+    let devices: Vec<serde_json::Value> = aie_llama::devices()
+        .into_iter()
+        .map(|d| serde_json::json!({ "name": d.name, "description": d.description, "total": d.total, "free": d.free, "gpu": d.is_gpu }))
+        .collect();
+    let m = machine();
+    let mut numa = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") {
+        let mut nodes: Vec<(u32, std::path::PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let n = e
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_prefix("node")?
+                    .parse()
+                    .ok()?;
+                Some((n, e.path()))
+            })
+            .collect();
+        nodes.sort();
+        for (n, path) in nodes {
+            let info = std::fs::read_to_string(path.join("meminfo")).unwrap_or_default();
+            let kib = |key: &str| {
+                info.lines()
+                    .find(|l| l.contains(key))
+                    .and_then(|l| l.split_whitespace().rev().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    * 1024
+            };
+            let cpus = std::fs::read_to_string(path.join("cpulist"))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            numa.push(serde_json::json!({ "node": n, "total": kib("MemTotal:"), "free": kib("MemFree:"), "cpus": cpus }));
+        }
+    }
+    serde_json::json!({
+        "devices": devices,
+        "ram": { "total": m.ram.total, "available": m.ram.free },
+        "numa": numa,
+        "cuda_build": aie_llama::CUDA,
+    })
+}
+
 /// GPUs as llama.cpp sees them, and host RAM from /proc/meminfo.
 pub fn machine() -> aie_plan::fit::Machine {
     let gpus = aie_llama::devices()

@@ -175,6 +175,24 @@ async fn serve_load_chat_place() {
         .unwrap();
     assert_eq!(ps["models"].as_array().unwrap().len(), 0, "{ps}");
 
+    // the machine view: devices from the probe subprocess, the store's disk
+    let m: Value = c
+        .get(format!("{base}/api/aie/machine"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        m["devices"].as_array().is_some_and(|d| !d.is_empty()),
+        "{m}"
+    );
+    assert!(
+        m["ram"]["total"].as_u64().unwrap() > 0 && m["disk"]["total"].as_u64().unwrap() > 0,
+        "{m}"
+    );
+
     // unknown models are a clean 404
     let (code, v) = post(&c, &base, "/api/chat", json!({ "model": "hf.co/nobody/nothing:Q4_K_M", "messages": [{ "role": "user", "content": "x" }] })).await;
     assert_eq!(code, 404, "{v}");

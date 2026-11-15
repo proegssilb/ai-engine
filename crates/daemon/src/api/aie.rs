@@ -155,3 +155,66 @@ pub async fn put_placement(st: State, Body(r): Body<PutReq>) -> Result<Json<Valu
         json!({ "model": res.name, "saved": r.intent.is_some(), "unloaded": unloaded }),
     ))
 }
+
+/// Free bytes and size of the filesystem holding `path`.
+fn disk(path: &std::path::Path) -> Option<(u64, u64)> {
+    let c = std::ffi::CString::new(path.to_str()?).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| {
+        (
+            st.f_bavail as u64 * st.f_frsize as u64,
+            st.f_blocks as u64 * st.f_frsize as u64,
+        )
+    })
+}
+
+async fn probe(exe: &std::path::Path) -> Result<Value, ApiError> {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Value)>> =
+        std::sync::Mutex::new(None);
+    if let Some((t, v)) = CACHE.lock().unwrap().as_ref()
+        && t.elapsed() < std::time::Duration::from_secs(5)
+    {
+        return Ok(v.clone());
+    }
+    let out = tokio::process::Command::new(exe)
+        .arg("probe")
+        .output()
+        .await
+        .map_err(|e| ApiError::internal(format!("probe: {e}")))?;
+    if !out.status.success() {
+        return Err(ApiError::internal(format!(
+            "probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| ApiError::internal(format!("probe output: {e}")))?;
+    *CACHE.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    Ok(v)
+}
+
+/// The machine for the placement view: devices with free memory, RAM per
+/// NUMA node, the store's disk, and what each loaded model planned where.
+pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
+    let mut v = probe(&st.0.cfg.worker_exe).await?;
+    let (free, total) = disk(&st.0.cfg.store).unwrap_or((0, 0));
+    v["disk"] = json!({ "path": st.0.cfg.store, "total": total, "free": free });
+    let mut models = Vec::new();
+    for w in st.0.workers.list().await {
+        let Ok(plan) = serde_json::from_str::<Plan>(&w.status.plan_json) else {
+            continue;
+        };
+        let Ok(a) = anatomy(&w.model_path) else {
+            continue;
+        };
+        let by: BTreeMap<String, u64> = plan
+            .bytes_by_tier(&a)
+            .iter()
+            .map(|(t, b)| (tier_key(t), *b))
+            .collect();
+        models
+            .push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced }));
+    }
+    v["models"] = json!(models);
+    Ok(Json(v))
+}
