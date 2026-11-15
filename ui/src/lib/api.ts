@@ -51,6 +51,20 @@ export interface Machine {
   models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null }[]
 }
 
+/** One row of llama.cpp's dry-run memory breakdown (aie_llama::fit::Measured). */
+export interface Measured {
+  name: string
+  kind: 'device' | 'host' | 'buffer_type'
+  total: number
+  free: number
+  /** weights */
+  model: number
+  /** KV cache and state */
+  context: number
+  /** compute scratch */
+  compute: number
+}
+
 export interface Placement {
   model: string
   anatomy: {
@@ -69,6 +83,10 @@ export interface Placement {
     load_ms: number
     /** subsystem label -> tier key (gpu0, ram, disk) -> bytes */
     planned: Record<string, Record<string, number>>
+    /** llama.cpp's dry-run breakdown per device, before the load (null if not available) */
+    measured: Measured[] | null
+    /** how the expert cache is split over GPUs (empty when it isn't in use) */
+    expert_cache: { gpu: number; bytes: number }[]
     stats: Stats | null
     warnings: string[]
   }

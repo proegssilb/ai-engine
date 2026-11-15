@@ -126,6 +126,16 @@ pub async fn get_placement(
                 }
             }
         }
+        // The expert cache follows the layer split; users can't place it.
+        let expert_cache: Vec<Value> = plan
+            .as_ref()
+            .map(|p| {
+                aie_plan::fit::expert_cache_split(&a, p)
+                    .into_iter()
+                    .map(|(gpu, bytes)| json!({ "gpu": gpu, "bytes": bytes }))
+                    .collect()
+            })
+            .unwrap_or_default();
         out["loaded"] = json!({
             "description": w.status.description,
             "n_ctx": w.n_ctx,
@@ -134,6 +144,7 @@ pub async fn get_placement(
             "warnings": w.status.warnings,
             "measured": serde_json::from_str::<Value>(&w.status.memory_json).unwrap_or(Value::Null),
             "planned": by_sub,
+            "expert_cache": expert_cache,
             "stats": live_stats(&w).await,
             "plan": plan,
             "verified": report,

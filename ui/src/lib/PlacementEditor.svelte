@@ -28,6 +28,18 @@
       .reduce((s, [, b]) => s + b, 0),
   )
 
+  // The dry run's rows that hold anything: GPUs, host memory, special buffer types.
+  const memRows = $derived(
+    (p?.loaded?.measured ?? []).filter((m) => m.model + m.context + m.compute > 0),
+  )
+  // Weights outside GPU memory make llama.cpp stage them on GPU 0 for big batches.
+  const offloadScratch = $derived(
+    memRows.some((m) => m.name === 'CUDA0') &&
+      Object.entries(p?.loaded?.planned ?? {}).some(
+        ([sub, t]) => !['embeddings', 'output head', 'other'].includes(sub) && (t.ram ?? 0) + (t.disk ?? 0) > 0,
+      ),
+  )
+
   function toPercents(shares: Share[], keys: string[], total: number): Record<string, number> {
     const out: Record<string, number> = Object.fromEntries(keys.map((k) => [k, 0]))
     let rest: string | null = null
@@ -242,6 +254,57 @@
             {/if}
           </div>
         {/if}
+        {#if memRows.length > 0}
+          <h3 class="sub">Memory per device</h3>
+          <table class="mem">
+            <thead>
+              <tr>
+                <th>Device</th><th>Weights</th><th>KV cache &amp; context</th><th>Compute scratch</th><th>Total</th><th>Free before load</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each memRows as m (m.name)}
+                <tr>
+                  <td>{m.kind === 'host' ? 'RAM (host)' : m.name}</td>
+                  <td class="mono">{bytes(m.model)}</td>
+                  <td class="mono">{bytes(m.context)}</td>
+                  <td class="mono">{bytes(m.compute)}</td>
+                  <td class="mono">{bytes(m.model + m.context + m.compute)}</td>
+                  <td class="mono" class:error={m.total > 0 && m.model + m.context + m.compute > m.free}>
+                    {m.total > 0 ? bytes(m.free) : ''}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          <ul class="effects">
+            {#if offloadScratch}
+              <li>
+                <strong>GPU 0's compute scratch is larger than the others'</strong>: with weights in RAM or on disk,
+                llama.cpp copies them to GPU 0 in pieces for big batches, and the staging space comes out of GPU 0.
+              </li>
+            {/if}
+            {#if p.loaded.expert_cache.length > 0}
+              <li>
+                <strong>Expert cache</strong> (busy experts kept on a GPU, you set only its size):
+                {p.loaded.expert_cache.map((c) => `GPU ${c.gpu} ${bytes(c.bytes)}`).join(', ')}.
+                It follows the layer split: each GPU gets a share in proportion to the layers it holds.
+              </li>
+            {:else if (p.intent?.expert_cache_bytes ?? 0) > 0}
+              <li>
+                <strong>Expert cache</strong> is set but not in use: llama.cpp only uses it when some layer has all
+                its experts in RAM or on disk.
+              </li>
+            {/if}
+            {#if p.loaded.stats && p.loaded.stats.disk_tier_bytes > 0}
+              <li>
+                <strong>Disk tier</strong>: {bytes(p.loaded.stats.disk_tier_bytes)} stays in the model file, and
+                {bytes(p.loaded.stats.disk_tier_resident)} of it is in RAM right now. The system may drop the rest
+                from RAM and read it again when needed.
+              </li>
+            {/if}
+          </ul>
+        {/if}
         <table>
           <thead><tr><th>Subsystem</th><th>Where</th><th></th></tr></thead>
           <tbody>
@@ -343,6 +406,25 @@
     margin: 8px 0 0;
     padding-left: 18px;
     font-size: 12.5px;
+  }
+  .sub {
+    margin: 14px 0 0;
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 500;
+  }
+  .mem td:not(:first-child),
+  .mem th:not(:first-child) {
+    text-align: right;
+  }
+  .effects {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .effects li {
+    margin: 4px 0;
   }
   .stats {
     display: flex;

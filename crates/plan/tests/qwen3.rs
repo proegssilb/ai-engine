@@ -269,6 +269,8 @@ fn expert_cache_only_when_some_layer_is_all_host() {
     let r = fit::check(&a, &p, &test_box(), &Overheads::default());
     let cache: u64 = r.devices.iter().map(|d| d.need.expert_cache).sum();
     assert_eq!(cache, 4 * GIB);
+    let split = fit::expert_cache_split(&a, &p);
+    assert_eq!(split.iter().map(|(_, b)| b).sum::<u64>(), 4 * GIB);
     let s = llama::compile(&a, &p, 2).unwrap();
     assert_eq!(s.moe_cache_size, 4 * GIB);
 
@@ -276,6 +278,7 @@ fn expert_cache_only_when_some_layer_is_all_host() {
     all_gpu.expert_cache_bytes = 4 * GIB;
     let p = plan(&a, &all_gpu, 2).unwrap();
     assert!(!fit::expert_cache_active(&a, &p));
+    assert!(fit::expert_cache_split(&a, &p).is_empty());
 }
 
 #[test]

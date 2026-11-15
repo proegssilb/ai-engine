@@ -163,24 +163,9 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
         }
     }
 
-    // llama.cpp's expert cache: only used if some layer has all its routed
-    // experts in host memory; split across GPUs like the layers.
-    if plan.expert_cache_bytes > 0 && expert_cache_active(a, plan) {
-        let homes: Vec<u32> = plan
-            .layer_home
-            .iter()
-            .filter_map(|t| if let Tier::Gpu(i) = t { Some(*i) } else { None })
-            .collect();
-        for i in 0..n_gpus as u32 {
-            let share = homes.iter().filter(|&&h| h == i).count() as u64;
-            if share > 0 {
-                add(
-                    Tier::Gpu(i),
-                    plan.expert_cache_bytes * share / homes.len() as u64,
-                    |n| &mut n.expert_cache,
-                );
-            }
-        }
+    // llama.cpp's expert cache (see `expert_cache_split`).
+    for (i, bytes) in expert_cache_split(a, plan) {
+        add(Tier::Gpu(i), bytes, |n| &mut n.expert_cache);
     }
 
     for (i, n) in gpu.iter_mut().enumerate() {
@@ -216,6 +201,30 @@ pub fn check(a: &Anatomy, plan: &Plan, machine: &Machine, o: &Overheads) -> Repo
         devices,
         disk_bytes: disk,
     }
+}
+
+/// Where the expert cache goes: `(gpu, bytes)` for each GPU that holds layers.
+/// llama.cpp only uses the cache if some layer has all its routed experts in
+/// host memory, and divides it between the GPUs like the layers, so users
+/// can't place it: it follows the layer split. Empty when it isn't in use.
+pub fn expert_cache_split(a: &Anatomy, plan: &Plan) -> Vec<(u32, u64)> {
+    if plan.expert_cache_bytes == 0 || !expert_cache_active(a, plan) {
+        return Vec::new();
+    }
+    let homes: Vec<u32> = plan
+        .layer_home
+        .iter()
+        .filter_map(|t| if let Tier::Gpu(i) = t { Some(*i) } else { None })
+        .collect();
+    let mut gpus = homes.clone();
+    gpus.sort_unstable();
+    gpus.dedup();
+    gpus.into_iter()
+        .map(|i| {
+            let share = homes.iter().filter(|&&h| h == i).count() as u64;
+            (i, plan.expert_cache_bytes * share / homes.len() as u64)
+        })
+        .collect()
 }
 
 /// Whether llama.cpp will enable the expert cache: some layer must have all of
