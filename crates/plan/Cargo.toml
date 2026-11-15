@@ -1,0 +1,17 @@
+[package]
+name = "aie-plan"
+description = "Placement planning: intent by size and tier -> concrete plan -> fit check -> llama.cpp settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aie-anatomy = { path = "../anatomy" }
+regex = "1.13"
+
+[dev-dependencies]
+aie-gguf = { path = "../gguf" }
+
+[lints]
+workspace = true
