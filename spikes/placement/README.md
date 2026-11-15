@@ -4,6 +4,8 @@
 where each piece of a model lives, including the RAM vs SSD split that
 llama.cpp's own flags can't express?
 
+> Project context for this spike: [../../docs/vision.md](../../docs/vision.md) (what we're building) and [../../docs/decisions.md](../../docs/decisions.md) (why it's a control plane, and the boundary we'd own).
+
 **Answer: yes, for weights.** A buffer type implemented in Rust and passed
 through `llama_model_params.tensor_buft_overrides` puts the matching tensors in
 memory we allocate. The tensors left on llama.cpp's default CPU buffer stay
