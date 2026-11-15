@@ -62,19 +62,21 @@ bit-identical output.
 
 | Stage | Target | Backend | What we mostly build |
 |---|---|---|---|
-| **MVP** | Works with a couple of specific model families (Qwen3 dense + MoE, plus a speech model via whisper.cpp) | llama.cpp (+ whisper.cpp) | Model-anatomy parser, memory estimator, placement compiler (rules → backend flags), process/lifecycle manager |
+| **MVP** | Works with a couple of specific model families (Qwen3 dense + MoE) | llama.cpp | Model-anatomy parser, memory estimator, placement compiler (rules → backend flags), process/lifecycle manager |
 | **v1** | Feature-compatible with ollama | Same | Model pulling + registry, keep-alive, ollama/OpenAI-compatible APIs, a Modelfile equivalent |
 | **v2** | Any model on Hugging Face (within backend limits) | Add vLLM / SGLang | Per-backend capability model, UI that adapts to what each backend can actually place |
 
-The deciding experiment for "wrapper vs. engine" is still ahead: the GPU
-benchmark on the test box (see the spike README). If llama.cpp's placement is
-competitive with hand-tuned setups, "wrapper now, own engine later" holds. If its
-scheduler makes cross-device placements slow, that's the first real push toward
-owning more of the engine.
+"Wrapper now, own engine later" holds for now. The GPU spike found llama.cpp's
+placement leaks a little but works, and no other engine does better on this
+hardware (D5 in [decisions.md](decisions.md)). The MVP has to be as easy to use
+as ollama, so some v1 items may move into it; see the open questions in
+[features.md](features.md). The custom engine comes after the MVP proves demand.
 
 ## Status
 
 - Product direction: documented here, not yet built.
-- Placement feasibility: spiked and confirmed on CPU; GPU path prepared but not
-  yet run. See [../spikes/placement/README.md](../spikes/placement/README.md).
-- Everything in the roadmap table past "feasibility": not started.
+- Placement feasibility: confirmed on CPU and on 2× V100, with every weight's
+  location checked. See [../spikes/placement/README.md](../spikes/placement/README.md).
+- Feature and architecture breakdown: drafted in [features.md](features.md) and
+  [architecture.md](architecture.md).
+- Everything else in the roadmap: not started.

@@ -47,7 +47,7 @@ a `RESULT {json}` line. Locations come from llama.cpp's own debug log
 records. "% in RAM" is measured with `mincore()` on each tensor's real
 address.
 
-## Running on the test box (2× V100, 5800X3D, 64 GB, 1 NVMe)
+## Running on the test box (2× V100-class GPUs)
 
 ```bash
 huggingface-cli download Qwen/Qwen3-30B-A3B-GGUF Qwen3-30B-A3B-Q4_K_M.gguf --local-dir ~/models
@@ -71,14 +71,65 @@ to start under CUDA 13 while targeting sm_70.
 | `moecache` | llama.cpp's own GPU expert cache over each CPU-side tier |
 | `pressure` | Process capped at `MEMCAP` (10G) so mmap'd experts stream from NVMe; compares with a third of the experts pinned |
 
-**Not verified here:** this container has no GPU and its sandbox blocked
-installing a CUDA toolkit, so the `cuda` feature has never been compiled. The
-CPU path, the result format and the summary script are tested. Expect possible
-small fixes to `build.rs` on the first CUDA build. Throughput numbers from
-this VM varied 2× between identical runs and mean nothing; that's why runs
-report the median of `--repeat` (default 3).
+**Status of the benchmark:** the CUDA build works unchanged (CUDA 12.4,
+sm_70). The benchmark itself hasn't run in full, and it mostly measures
+llama.cpp's own policies (op offload, the expert cache) rather than the cost of
+honouring a placement. See the GPU results below.
 
-## Results
+## GPU results (2026-11-15)
+
+Machine: Debian 13 VM, 2× Tesla PG500-216 (V100-class, 32 GB, PCIe gen3 x8 each),
+Ryzen 5800X (8 vCPU), 47 GB RAM. Model: Qwen3-30B-A3B Q4_K_M (18.6 GB).
+
+**How placement was checked.** `src/verify.rs` evaluates one prompt batch and one
+token in a separate context with a scheduler eval callback. For every weight the
+graph reads it records the real buffer and data address: inside the file
+mapping means mmap'd, inside a Rust allocation means pinned, otherwise the
+buffer's name. It also records the scheduler's run-time copies and the expert
+cache's stand-in tensors. `--no-verify` skips it. The old log-derived table is
+kept but shouldn't be trusted (below).
+
+**Placement at rest (all held where noted):**
+
+| Rules | Result |
+|---|---|
+| none, all layers on GPU | every weight on its layer's GPU; embeddings mmap'd |
+| experts `=pinned` (all, half, or with `--cuda-register`) | all in the Rust buffer |
+| attention `=pinned` | all in the Rust buffer |
+| layers 0-19 experts `=CUDA1` (llama.cpp put those layers on CUDA0) | all on CUDA1 |
+| experts `=CPU` with mmap | all mmap'd; **the log-derived table said `CUDA_Host`** |
+| experts `=CPU`, `--load-mode none` | **`CUDA_Host`** (pinned via CUDA) unless `--no-host` |
+| experts `=CPU`, `--extra-bufts --no-host` | 120 of 144 **copied into `CPU_REPACK`** |
+
+**At run time:**
+- **Op offload:** on batches of 32+ tokens, the experts each batch selects are
+  copied from host RAM to GPU 0 for every batch (about 9 GB for 64 tokens, 12 GB
+  for 512), through about 140 MiB of scratch reserved at startup. `--no-op-offload`
+  stops it: 91 vs. 37 tok/s on 64-token prompts, 161 vs. 203 tok/s on 512.
+- **Expert cache** (`--moe-cache`): on batches of up to 32 tokens the graph reads
+  the cache instead of the placed experts; misses are copied from the placed
+  tensors.
+- **Any `--place` rule disables pipeline parallelism.** No difference measured on
+  single-sequence runs (970 vs. 972 tok/s prefill, all on GPU).
+
+**Pinned vs. pageable host memory** (experts in RAM, 3 runs each):
+
+| Host memory | Prefill 512 | Prefill 2048 | Decode |
+|---|---|---|---|
+| Rust buffer, not registered | 196 tok/s | 275 tok/s | 13.5–13.7 |
+| plain CPU buffer | 197 | 275 | 13.5 |
+| Rust buffer + `cudaHostRegister` | 203 | 283 | 13.7–14.0 |
+| llama.cpp `CUDA_Host` | 203 | 282 | 13.8–14.0 |
+
+All on GPU for comparison: about 1000 tok/s prefill and 113–129 tok/s decode on
+short runs.
+
+**Known flaws in `verify.rs`** (from an independent review): copy volume counts
+whole tensors instead of the selected experts, expert-cache counts include its
+backing tensors, and weights only read through a scheduler copy show as copies
+rather than as the weight (the 48 "unread" `attn_q_norm` tensors).
+
+## CPU results (tiny model)
 
 Pins: `blk\.[01]\.ffn_.*_exps` (routed experts of layers 0–1), `--numa 0`.
 "In RAM" is measured with `mincore()` on each tensor's real address, not
