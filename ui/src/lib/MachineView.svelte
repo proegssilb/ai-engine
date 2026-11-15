@@ -2,7 +2,7 @@
   // The machine as boxes: GPUs, RAM (per NUMA node when there are several),
   // and the store's disk, each with what loaded models planned there.
   import RamBar from './RamBar.svelte'
-  import { bytes, type Machine, type MemBox } from './api'
+  import { bytes, sockets, type Machine, type MemBox } from './api'
 
   let { machine, colors }: { machine: Machine; colors: Record<string, string> } = $props()
 
@@ -13,6 +13,8 @@
     total: number
     used: number
     models: { model: string; bytes: number }[]
+    /** shown as "runs" chips instead of byte chips (CPU boxes) */
+    runs?: boolean
     /** the fuzzy RAM bar, for RAM boxes once the daemon has samples */
     mem?: MemBox
   }
@@ -28,17 +30,32 @@
       )
     // One RAM box, or one per NUMA node when there are several.
     const mem = machine.memory
-    if (machine.numa.length > 1) {
-      machine.numa.forEach((n) => {
+    const socks = sockets(machine.numa)
+    if (socks.length > 1) {
+      // Per socket, as in the mockup: a CPU box (models whose threads run
+      // there) and a RAM box (models' RAM tier, where it measurably is).
+      socks.forEach((n) => {
         const mb = mem?.nodes.find((x) => x.node === n.node)
         out.push({
+          key: `cpu${n.node}`,
+          title: `CPU ${n.node}`,
+          detail: `Compute only. Runs what sits in RAM ${n.node}. CPUs ${n.cpus}`,
+          total: 0,
+          used: 0,
+          runs: true,
+          models: machine.models
+            .filter((m) => m.host?.node === n.node)
+            .map((m) => ({ model: m.model, bytes: m.host?.affinity.cpus ?? 0 })),
+        })
+        out.push({
           key: `ram${n.node}`,
-          title: `RAM, node ${n.node}`,
-          detail: `CPUs ${n.cpus}`,
+          title: `RAM ${n.node}`,
+          detail: `Socket ${n.node}`,
           total: n.total,
           used: n.total - n.free,
-          // which node a model's RAM sits on isn't tracked per model; the bar shows it
-          models: [],
+          models: machine.models
+            .map((m) => ({ model: m.model, bytes: m.host?.ram_tier_by_node?.[String(n.node)] ?? 0 }))
+            .filter((m) => m.bytes > 0),
           mem: mb,
         })
       })
@@ -80,10 +97,12 @@
     <div class="box panel" style="min-height: {height(b.total)}px">
       <div class="head">
         <h3>{b.title}</h3>
-        <span class="muted mono">{bytes(b.used)} / {bytes(b.total)}</span>
+        {#if !b.runs}<span class="muted mono">{bytes(b.used)} / {bytes(b.total)}</span>{/if}
       </div>
       <div class="muted detail" title={b.detail}>{b.detail}</div>
-      {#if b.mem}
+      {#if b.runs}
+        <!-- CPU boxes have no bar: they run what sits in their RAM box -->
+      {:else if b.mem}
         <RamBar box={b.mem} {colors} />
       {:else}
         <div class="bar"><span style="width: {(100 * b.used) / Math.max(b.total, 1)}%; background: var(--accent)"></span></div>
@@ -92,9 +111,10 @@
         <div class="chip" style="border-color: {colors[m.model]}">
           <span class="swatch" style="background: {colors[m.model]}"></span>
           <span class="name" title={m.model}>{m.model.replace(/^hf\.co\//, '')}</span>
-          <span class="mono">{bytes(m.bytes)}</span>
+          <span class="mono">{b.runs ? 'runs' : bytes(m.bytes)}</span>
         </div>
       {/each}
+      {#if b.runs && !b.models.length}<div class="muted small">No model's threads run here.</div>{/if}
       {#if b.key.startsWith('disk') && b.models.length}
         <div class="muted small">Disk tier: may be dropped from RAM, never forced out.</div>
       {/if}

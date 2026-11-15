@@ -1,7 +1,7 @@
 <script lang="ts">
   import MachineView from './lib/MachineView.svelte'
   import PlacementEditor from './lib/PlacementEditor.svelte'
-  import { api, bytes, type Machine, type ModelTag, type Running } from './lib/api'
+  import { api, bytes, sockets, type Machine, type ModelTag, type Running } from './lib/api'
 
   let models = $state<ModelTag[]>([])
   let running = $state<Running[]>([])
@@ -100,7 +100,7 @@
 
     {#if selected}
       <h2>Placement</h2>
-      <PlacementEditor model={selected} gpus={gpuCount} onchange={refresh} />
+      <PlacementEditor model={selected} gpus={gpuCount} sockets={machine ? sockets(machine.numa).map((n) => n.node) : []} onchange={refresh} />
     {/if}
   </section>
 </main>

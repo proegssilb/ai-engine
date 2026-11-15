@@ -16,6 +16,8 @@ export interface Intent {
   output: Tier | null
   expert_cache_bytes: number
   allow_repack: boolean
+  /** socket (NUMA node) for the host side; null/absent = next to its GPU */
+  host_node?: number | null
 }
 
 export interface ModelTag {
@@ -70,6 +72,21 @@ export interface MemoryWindow {
   nodes: MemBox[]
 }
 
+/** Where a model's host side is pinned and where it really is (aie_worker::numa::HostReport). */
+export interface HostReport {
+  node: number
+  auto: boolean
+  reason: string
+  sockets: number
+  threads: number
+  affinity: { cpus: number; nodes: number[]; on_node: boolean; error: string | null }
+  policy: { mode: string; node: number; verified: boolean; error: string | null }
+  /** node -> bytes of the RAM tier (estimated from sampled pages) */
+  ram_tier_by_node: Record<string, number>
+  memory_by_node: Record<string, number>
+  problems: string[]
+}
+
 export interface Machine {
   devices: Device[]
   ram: { total: number; available: number }
@@ -79,7 +96,7 @@ export interface Machine {
   cuda_build: boolean
   /** null until the daemon has taken its first sample */
   memory: MemoryWindow | null
-  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null }[]
+  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null; host?: HostReport | null }[]
 }
 
 /** One row of llama.cpp's dry-run memory breakdown (aie_llama::fit::Measured). */
@@ -119,6 +136,7 @@ export interface Placement {
     /** how the expert cache is split over GPUs (empty when it isn't in use) */
     expert_cache: { gpu: number; bytes: number }[]
     stats: Stats | null
+    host: HostReport | null
     warnings: string[]
   }
 }
@@ -199,6 +217,11 @@ export const api = {
       }
     }
   },
+}
+
+/** Nodes that can host a model (those with CPUs); several means the socket choice matters. */
+export function sockets(numa: Machine['numa']): Machine['numa'] {
+  return numa.filter((n) => n.cpus.trim() !== '')
 }
 
 export function bytes(b: number): string {

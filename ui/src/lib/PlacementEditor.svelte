@@ -5,7 +5,7 @@
   import SplitEditor from './SplitEditor.svelte'
   import { api, bytes, tierFromKey, tierKey, tierLabel, type Intent, type Placement, type Share } from './api'
 
-  let { model, gpus, onchange }: { model: string; gpus: number; onchange: () => void } = $props()
+  let { model, gpus, sockets, onchange }: { model: string; gpus: number; sockets: number[]; onchange: () => void } = $props()
 
   let p = $state<Placement | null>(null)
   let error = $state('')
@@ -15,6 +15,8 @@
   let bulkPct = $state<Record<string, number>>({})
   let cacheGiB = $state(0)
   let nCtx = $state(4096)
+  /** socket for the host side; null = automatic (next to its GPU) */
+  let hostNode = $state<number | null>(null)
 
   const gpuKeys = $derived(Array.from({ length: gpus }, (_, i) => `gpu${i}`))
   const layerTiers = $derived([...gpuKeys, 'ram'])
@@ -76,12 +78,14 @@
       if (i) {
         mode = 'custom'
         nCtx = i.n_ctx
+        hostNode = i.host_node ?? null
         cacheGiB = i.expert_cache_bytes / (1 << 30)
         layerPct = toPercents(i.layers, layerTiers, p.anatomy.layers)
         const bulkTotal = p.anatomy.subsystems[bulkLabel] ?? 0
         bulkPct = i.subsystems[bulkKey] ? toPercents(i.subsystems[bulkKey], bulkTiers, bulkTotal) : { ...layerPct, disk: 0 }
       } else {
         mode = 'auto'
+        hostNode = null
         defaults()
       }
     } catch (e) {
@@ -113,6 +117,7 @@
         output: null,
         expert_cache_bytes: Math.round(cacheGiB * (1 << 30)),
         allow_repack: false,
+        host_node: sockets.length > 1 ? hostNode : null,
       }
     }
     try {
@@ -181,6 +186,18 @@
           note="Whole layers at a time, so shares are approximate. GPU shares prefer layers that already live on that GPU."
         />
       </section>
+      {#if sockets.length > 1}
+        <section>
+          <h2>Host socket</h2>
+          <select bind:value={hostNode}>
+            <option value={null}>Automatic: next to its GPU</option>
+            {#each sockets as n (n)}<option value={n}>Socket {n}</option>{/each}
+          </select>
+          <div class="muted note">
+            The model's RAM tier, CPU threads and host-side buffers all go on one socket, never split. Applies to custom splits.
+          </div>
+        </section>
+      {/if}
       <section class="row">
         <label>Context <input type="number" min="512" step="512" bind:value={nCtx} /> tokens</label>
         {#if p.anatomy.moe}
@@ -207,7 +224,17 @@
             <span class="error">{p.loaded.misplaced} weights not where planned</span>
           {/if}
         </div>
-        {#each p.loaded.warnings ?? [] as w (w)}
+        {#if p.loaded.host && p.loaded.host.sockets > 1}
+          {@const h = p.loaded.host}
+          <div class="ramtier" class:bad={h.problems.length > 0}>
+            <strong>Host socket {h.node}</strong>
+            <span class="muted">({h.auto ? h.reason : 'chosen'})</span> ·
+            {h.threads} threads on {h.affinity.cpus} CPUs{h.affinity.on_node ? '' : ', not only this socket'} ·
+            RAM tier {Object.entries(h.ram_tier_by_node).map(([n, b]) => `socket ${n} ${bytes(b)}`).join(', ') || 'empty'}
+            {#each h.problems as pr (pr)}<div class="error">{pr}</div>{/each}
+          </div>
+        {/if}
+        {#each (p.loaded.warnings ?? []).filter((w) => !(p?.loaded?.host?.problems ?? []).includes(w)) as w (w)}
           <div class="error">Warning: {w}</div>
         {/each}
         {#if p.loaded.stats?.ram_tier && p.loaded.stats.ram_tier.bytes > 0}
@@ -406,6 +433,10 @@
     margin: 8px 0 0;
     padding-left: 18px;
     font-size: 12.5px;
+  }
+  .note {
+    font-size: 12.5px;
+    margin-top: 6px;
   }
   .sub {
     margin: 14px 0 0;
