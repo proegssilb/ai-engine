@@ -301,7 +301,7 @@ pub fn details(path: &std::path::Path) -> Value {
 
 pub async fn tags(st: State) -> Result<Json<Value>, ApiError> {
     let models =
-        st.0.store
+        st.0.stores
             .list()
             .map_err(|e| ApiError::internal(e.to_string()))?;
     let list: Vec<Value> = models
@@ -326,6 +326,8 @@ pub struct ModelReq {
     #[serde(alias = "name")]
     model: String,
     stream: Option<bool>,
+    /// Pull only: which store (disk) to put it in, by root path; default the first.
+    store: Option<String>,
 }
 
 pub async fn show(st: State, Body(r): Body<ModelReq>) -> Result<Json<Value>, ApiError> {
@@ -365,6 +367,10 @@ pub async fn pull(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiErr
     if matches!(target, ModelRef::Local(_)) {
         return Err(ApiError::bad_request("local files don't need pulling"));
     }
+    st.0.stores
+        .pick(r.store.as_deref())
+        .map_err(ApiError::bad_request)?;
+    let store = r.store.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Value>(256);
     let d = st.0.clone();
     tokio::spawn(async move {
@@ -379,8 +385,20 @@ pub async fn pull(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiErr
             }
         };
         let result = match &target {
-            ModelRef::Hf(h) => d.store.pull(&d.hub, h, &mut progress).await,
-            ModelRef::Oci(o) => d.store.pull_oci(o, &mut progress).await,
+            ModelRef::Hf(h) => {
+                d.stores
+                    .pick(store.as_deref())
+                    .expect("store checked before the pull started")
+                    .pull(&d.hub, h, &mut progress)
+                    .await
+            }
+            ModelRef::Oci(o) => {
+                d.stores
+                    .pick(store.as_deref())
+                    .expect("store checked before the pull started")
+                    .pull_oci(o, &mut progress)
+                    .await
+            }
             ModelRef::Local(_) => unreachable!(),
         };
         let _ = match result {
@@ -416,7 +434,7 @@ pub async fn delete(st: State, Body(r): Body<ModelReq>) -> Result<Response, ApiE
             "local files aren't deleted; remove them yourself",
         ));
     }
-    st.0.store
+    st.0.stores
         .remove(&target)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(Json(json!({})).into_response())

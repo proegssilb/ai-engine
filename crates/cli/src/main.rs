@@ -28,7 +28,12 @@ enum Cmd {
     /// Run the daemon (API on AIE_HOST; data in AIE_HOME, default ~/.ai-engine).
     Serve,
     /// Download a model: hf.co/OWNER/REPO[:TAG] or REGISTRY/REPO[:TAG].
-    Pull { model: String },
+    Pull {
+        model: String,
+        /// Which store (disk) to put it in, by root path; default the first.
+        #[arg(long)]
+        store: Option<String>,
+    },
     /// List downloaded models.
     #[command(alias = "ls")]
     List,
@@ -86,7 +91,7 @@ fn main() {
                     .map_err(|e| format!("{}: {e}", config.display()))?;
                 aie_worker::run(cfg, &socket).await
             }
-            Cmd::Pull { model } => pull(&cli.host, &model).await,
+            Cmd::Pull { model, store } => pull(&cli.host, &model, store).await,
             Cmd::List => list(&cli.host).await,
             Cmd::Rm { model } => {
                 call(
@@ -157,10 +162,10 @@ fn human(b: u64) -> String {
     }
 }
 
-async fn pull(host: &str, model: &str) -> Result<(), String> {
+async fn pull(host: &str, model: &str, store: Option<String>) -> Result<(), String> {
     let mut resp = reqwest::Client::new()
         .post(url(host, "/api/pull"))
-        .json(&json!({ "model": model, "stream": true }))
+        .json(&json!({ "model": model, "stream": true, "store": store }))
         .send()
         .await
         .map_err(|e| format!("can't reach the daemon at {host} ({e})"))?;

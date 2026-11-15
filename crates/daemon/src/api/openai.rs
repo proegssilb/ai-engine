@@ -47,7 +47,7 @@ fn finish_reason(r: i32) -> &'static str {
 }
 
 pub async fn models(st: State) -> Response {
-    match st.0.store.list() {
+    match st.0.stores.list() {
         Ok(ms) => Json(json!({
             "object": "list",
             "data": ms.iter().map(|m| json!({ "id": m.manifest.name, "object": "model", "created": m.manifest.pulled_at, "owned_by": "ai-engine" })).collect::<Vec<_>>(),

@@ -13,8 +13,9 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Everything the daemon keeps: store, placements, sockets, logs.
     pub home: PathBuf,
-    /// Model store root (default `$AIE_HOME/store`); its disk is the disk tier.
-    pub store: PathBuf,
+    /// Model store roots, one per disk (default `$AIE_HOME/store`). A model's
+    /// store is its disk tier; pulls go to the first unless told otherwise.
+    pub stores: Vec<PathBuf>,
     /// How long an idle model stays loaded (ollama's keep_alive default).
     pub keep_alive: Duration,
     /// Context length when a request doesn't say.
@@ -35,6 +36,7 @@ pub struct Config {
 struct File {
     listen: Option<SocketAddr>,
     store: Option<PathBuf>,
+    stores: Option<Vec<PathBuf>>,
     keep_alive: Option<String>,
     n_ctx: Option<u32>,
     n_batch: Option<u32>,
@@ -49,7 +51,7 @@ impl Config {
     pub fn new(home: PathBuf) -> Config {
         Config {
             listen: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
-            store: home.join("store"),
+            stores: vec![home.join("store")],
             home,
             keep_alive: Duration::from_secs(300),
             n_ctx: 4096,
@@ -76,7 +78,13 @@ impl Config {
                 c.listen = v;
             }
             if let Some(v) = f.store {
-                c.store = v;
+                c.stores = vec![v];
+            }
+            if let Some(v) = f.stores {
+                if v.is_empty() {
+                    return Err(format!("{}: stores is empty", path.display()));
+                }
+                c.stores = v;
             }
             if let Some(v) = f.keep_alive {
                 c.keep_alive =

@@ -46,8 +46,9 @@ export interface Machine {
   ram: { total: number; available: number }
   numa: { node: number; total: number; free: number; cpus: string }[]
   disk: { path: string; total: number; free: number }
+  disks: { path: string; total: number; free: number }[]
   cuda_build: boolean
-  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number }[]
+  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null }[]
 }
 
 export interface Placement {

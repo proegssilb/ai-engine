@@ -234,8 +234,16 @@ async fn probe(exe: &std::path::Path) -> Result<Value, ApiError> {
 /// NUMA node, the store's disk, and what each loaded model planned where.
 pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
     let mut v = probe(&st.0.cfg.worker_exe).await?;
-    let (free, total) = disk(&st.0.cfg.store).unwrap_or((0, 0));
-    v["disk"] = json!({ "path": st.0.cfg.store, "total": total, "free": free });
+    let disks: Vec<Value> =
+        st.0.stores
+            .roots()
+            .map(|p| {
+                let (free, total) = disk(p).unwrap_or((0, 0));
+                json!({ "path": p, "total": total, "free": free })
+            })
+            .collect();
+    v["disk"] = disks[0].clone();
+    v["disks"] = json!(disks);
     let mut models = Vec::new();
     for w in st.0.workers.list().await {
         let Ok(plan) = serde_json::from_str::<Plan>(&w.status.plan_json) else {
@@ -249,8 +257,13 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
             .iter()
             .map(|(t, b)| (tier_key(t), *b))
             .collect();
-        models
-            .push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced }));
+        // the store (disk) the model's file lives on: its disk tier
+        let store =
+            st.0.stores
+                .roots()
+                .find(|r| w.model_path.starts_with(r))
+                .map(|r| r.display().to_string());
+        models.push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced, "store": store }));
     }
     v["models"] = json!(models);
     Ok(Json(v))

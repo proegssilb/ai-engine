@@ -32,14 +32,21 @@
       used: machine.ram.total - machine.ram.available,
       models: usage('ram'),
     })
-    out.push({
-      key: 'disk',
-      title: 'Disk',
-      detail: machine.disk.path,
-      total: machine.disk.total,
-      used: machine.disk.total - machine.disk.free,
-      models: usage('disk'),
-    })
+    // one box per store: a model's disk tier is on the disk its store is on
+    const disks = machine.disks?.length ? machine.disks : [machine.disk]
+    disks.forEach((d, i) =>
+      out.push({
+        key: `disk:${d.path}`,
+        title: disks.length > 1 ? `Disk ${i}` : 'Disk',
+        detail: d.path,
+        total: d.total,
+        used: d.total - d.free,
+        models: machine.models
+          .filter((m) => (m.store ?? disks[0].path) === d.path)
+          .map((m) => ({ model: m.model, bytes: m.bytes_by_tier['disk'] ?? 0 }))
+          .filter((m) => m.bytes > 0),
+      }),
+    )
     return out
   })
 
@@ -63,7 +70,7 @@
           <span class="mono">{bytes(m.bytes)}</span>
         </div>
       {/each}
-      {#if b.key === 'disk' && b.models.length}
+      {#if b.key.startsWith('disk') && b.models.length}
         <div class="muted small">Disk tier: may be dropped from RAM, never forced out.</div>
       {/if}
     </div>

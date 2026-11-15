@@ -5,13 +5,14 @@
 
 pub mod api;
 pub mod config;
+pub mod stores;
 pub mod workers;
 
 pub use config::Config;
 
 use aie_plan::Intent;
 use aie_proto::worker::{GenerateEvent, GenerateRequest, Sampling, generate_request::Input};
-use aie_store::{ModelRef, Store};
+use aie_store::ModelRef;
 use aie_worker::Placement;
 use futures_util::{Stream, StreamExt};
 use std::path::PathBuf;
@@ -22,7 +23,7 @@ use workers::{Lease, LoadSpec, Manager};
 /// Shared daemon state.
 pub struct Daemon {
     pub cfg: Config,
-    pub store: Store,
+    pub stores: stores::Stores,
     pub hub: aie_store::hf::Hub,
     pub workers: Arc<Manager>,
     /// One pull at a time (the store serialises per blob).
@@ -66,13 +67,13 @@ pub struct GenOptions {
 
 impl Daemon {
     pub fn new(cfg: Config) -> Result<Arc<Daemon>, String> {
-        let store = Store::open(&cfg.store).map_err(|e| e.to_string())?;
+        let stores = stores::Stores::open(&cfg.stores)?;
         let hub = aie_store::hf::Hub::public().map_err(|e| e.to_string())?;
         std::fs::create_dir_all(cfg.home.join("placements")).map_err(|e| e.to_string())?;
         Ok(Arc::new(Daemon {
             workers: Manager::new(cfg.clone()),
             cfg,
-            store,
+            stores,
             hub,
             pulling: tokio::sync::Mutex::new(()),
         }))
@@ -98,7 +99,7 @@ impl Daemon {
             }
             ModelRef::Oci(o) => {
                 let m = self
-                    .store
+                    .stores
                     .get(&ModelRef::Oci(o))
                     .map_err(|e| ApiError::internal(e.to_string()))?
                     .ok_or_else(|| {
@@ -112,12 +113,12 @@ impl Daemon {
             }
             ModelRef::Hf(h) => {
                 let found = if h.tag.is_some() {
-                    self.store
+                    self.stores
                         .get(&ModelRef::Hf(h.clone()))
                         .map_err(|e| ApiError::internal(e.to_string()))?
                 } else {
                     let all = self
-                        .store
+                        .stores
                         .list()
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     let mut same: Vec<_> = all
@@ -327,7 +328,12 @@ pub async fn serve(cfg: Config) -> Result<(), String> {
         .map_err(|e| format!("{listen}: {e}"))?;
     eprintln!(
         "ai-engine listening on http://{listen} (store: {})",
-        d.cfg.store.display()
+        d.cfg
+            .stores
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let workers = d.workers.clone();
     axum::serve(listener, api::router(d))

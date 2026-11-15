@@ -55,7 +55,11 @@ async fn serve_load_chat_place() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(
         home.join("config.toml"),
-        format!("store = {:?}\nn_ctx = 2048\nthreads = 4\n", store),
+        format!(
+            "stores = [{:?}, {:?}]\nn_ctx = 2048\nthreads = 4\n",
+            store,
+            home.join("store2")
+        ),
     )
     .unwrap();
     let port = 20000 + (std::process::id() % 20000) as u16;
@@ -210,6 +214,17 @@ async fn serve_load_chat_place() {
         m["ram"]["total"].as_u64().unwrap() > 0 && m["disk"]["total"].as_u64().unwrap() > 0,
         "{m}"
     );
+
+    // two stores: both disks shown; pulling into one that isn't configured is refused
+    assert_eq!(m["disks"].as_array().unwrap().len(), 2, "{m}");
+    let (code, v) = post(
+        &c,
+        &base,
+        "/api/pull",
+        json!({ "model": "hf.co/a/b:Q4_K_M", "store": "/nowhere", "stream": false }),
+    )
+    .await;
+    assert_eq!(code, 400, "{v}");
 
     // unknown models are a clean 404
     let (code, v) = post(&c, &base, "/api/chat", json!({ "model": "hf.co/nobody/nothing:Q4_K_M", "messages": [{ "role": "user", "content": "x" }] })).await;
