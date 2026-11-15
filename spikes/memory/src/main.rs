@@ -205,6 +205,7 @@ fn main() {
             "buffers_after_load": after_load,
             "buffers_after_runs": buffers(),
             "VmLck": proc_status("VmLck:"),
+            "VmPin": proc_status("VmPin:"),
             "VmSwap": proc_status("VmSwap:"),
             "VmRSS": proc_status("VmRSS:"),
         })
