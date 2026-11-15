@@ -1,0 +1,145 @@
+// Typed access to the daemon: ollama-compatible /api and placement /api/aie.
+
+export type Tier = { Gpu: number } | 'Ram' | 'Disk'
+export type Amount = { Fraction: number } | { Bytes: number } | 'Rest'
+export interface Share {
+  tier: Tier
+  amount: Amount
+}
+
+/** aie_plan::Intent (decision D6: shares per tier, by size). */
+export interface Intent {
+  n_ctx: number
+  layers: Share[]
+  subsystems: Record<string, Share[]>
+  embeddings: Tier | null
+  output: Tier | null
+  expert_cache_bytes: number
+  allow_repack: boolean
+}
+
+export interface ModelTag {
+  name: string
+  size: number
+  modified_at: string
+  details: { family?: string; parameter_size?: string; quantization_level?: string }
+}
+
+export interface Running {
+  name: string
+  size: number
+  size_vram: number
+  context_length: number
+  expires_at: string
+}
+
+export interface Device {
+  name: string
+  description: string
+  total: number
+  free: number
+  gpu: boolean
+}
+
+export interface Machine {
+  devices: Device[]
+  ram: { total: number; available: number }
+  numa: { node: number; total: number; free: number; cpus: string }[]
+  disk: { path: string; total: number; free: number }
+  cuda_build: boolean
+  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number }[]
+}
+
+export interface Placement {
+  model: string
+  anatomy: {
+    architecture: string
+    supported: boolean
+    layers: number
+    moe: { experts: number; experts_used: number } | null
+    bytes: number
+    subsystems: Record<string, number>
+  }
+  intent: Intent | null
+  loaded: null | {
+    description: string
+    n_ctx: number
+    misplaced: number
+    load_ms: number
+    /** subsystem label -> tier key (gpu0, ram, disk) -> bytes */
+    planned: Record<string, Record<string, number>>
+  }
+}
+
+export class ApiError extends Error {}
+
+async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  const r = await fetch(path, {
+    method,
+    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const text = await r.text()
+  const v = text ? JSON.parse(text) : null
+  if (!r.ok) {
+    const msg = v?.error?.message ?? v?.error ?? `HTTP ${r.status}`
+    throw new ApiError(String(msg))
+  }
+  return v as T
+}
+
+export const api = {
+  tags: () => call<{ models: ModelTag[] }>('GET', '/api/tags').then((v) => v.models),
+  ps: () => call<{ models: Running[] }>('GET', '/api/ps').then((v) => v.models),
+  machine: () => call<Machine>('GET', '/api/aie/machine'),
+  placement: (model: string) => call<Placement>('GET', `/api/aie/placement?model=${encodeURIComponent(model)}`),
+  savePlacement: (model: string, intent: Intent | null, reload: boolean) =>
+    call<{ saved: boolean; unloaded: boolean }>('PUT', '/api/aie/placement', { model, intent, reload }),
+  /** Load a model (an empty chat loads it, as in ollama). */
+  load: (model: string) => call<unknown>('POST', '/api/chat', { model, messages: [] }),
+  unload: (model: string) => call<unknown>('POST', '/api/chat', { model, messages: [], keep_alive: 0 }),
+  remove: (model: string) => call<unknown>('DELETE', '/api/delete', { model }),
+
+  /** Pull with progress; resolves when done, rejects on error. */
+  async pull(model: string, progress: (status: string, done?: number, total?: number) => void) {
+    const r = await fetch('/api/pull', { method: 'POST', body: JSON.stringify({ model, stream: true }) })
+    if (!r.ok || !r.body) throw new ApiError(`HTTP ${r.status}`)
+    const reader = r.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += dec.decode(value, { stream: true })
+      let i
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i)
+        buf = buf.slice(i + 1)
+        if (!line.trim()) continue
+        const v = JSON.parse(line)
+        if (v.error) throw new ApiError(v.error)
+        progress(v.status, v.completed, v.total)
+      }
+    }
+  },
+}
+
+export function bytes(b: number): string {
+  if (b >= 1 << 30) return `${(b / (1 << 30)).toFixed(1)} GiB`
+  if (b >= 1 << 20) return `${(b / (1 << 20)).toFixed(0)} MiB`
+  return `${(b / 1024).toFixed(0)} KiB`
+}
+
+export function tierKey(t: Tier): string {
+  return typeof t === 'object' ? `gpu${t.Gpu}` : t.toLowerCase()
+}
+
+export function tierLabel(key: string): string {
+  if (key.startsWith('gpu')) return `GPU ${key.slice(3)}`
+  return key === 'ram' ? 'RAM' : key === 'disk' ? 'Disk' : key
+}
+
+export function tierFromKey(key: string): Tier {
+  if (key.startsWith('gpu')) return { Gpu: Number(key.slice(3)) }
+  return key === 'ram' ? 'Ram' : 'Disk'
+}

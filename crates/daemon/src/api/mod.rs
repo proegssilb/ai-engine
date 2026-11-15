@@ -3,6 +3,7 @@
 pub mod aie;
 pub mod ollama;
 pub mod openai;
+pub mod ui;
 
 use crate::{ApiError, Daemon};
 use aie_proto::worker::Sampling;
@@ -36,6 +37,10 @@ pub fn router(d: Arc<Daemon>) -> Router {
             get(aie::get_placement).put(aie::put_placement),
         )
         .route("/api/aie/machine", get(aie::machine))
+        // web UI
+        .route("/ui", get(ui::redirect))
+        .route("/ui/", get(ui::index))
+        .route("/ui/{*path}", get(ui::file))
         .with_state(d)
 }
 
