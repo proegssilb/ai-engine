@@ -1,0 +1,13 @@
+[package]
+name = "aie-anatomy"
+description = "Break a model into the subsystems users place: attention, experts, embeddings, ..."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aie-gguf = { path = "../gguf" }
+
+[lints]
+workspace = true
