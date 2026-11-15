@@ -184,6 +184,54 @@ async fn serve_load_chat_place() {
         assert!(!rt["fixes"].as_array().unwrap().is_empty(), "{rt}");
     }
 
+    // the host side: pinned to socket 0's CPUs, and measured
+    let host = &stats["loaded"]["host"];
+    assert_eq!(host["node"], 0, "{host}");
+    assert_eq!(host["threads"], 4, "{host}"); // from config.toml
+    assert_eq!(host["affinity"]["on_node"], true, "{host}");
+    assert_eq!(host["affinity"]["nodes"], json!([0]), "{host}");
+    assert!(host["affinity"]["cpus"].as_u64().unwrap() >= 1, "{host}");
+    assert!(host["policy"]["mode"].is_string(), "{host}");
+    assert_eq!(host["sockets"], 1, "{host}");
+    assert!(host["problems"].as_array().unwrap().is_empty(), "{host}");
+    let by_node = host["ram_tier_by_node"].as_object().unwrap();
+    assert!(
+        by_node.keys().all(|k| k == "0") && by_node.values().all(|v| v.as_u64().unwrap() > 0),
+        "{host}"
+    );
+    assert!(host["memory_by_node"]["0"].as_u64().unwrap() > 0, "{host}");
+    // the machine view carries it per model
+    let m: Value = c
+        .get(format!("{base}/api/aie/machine"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(m["models"][0]["host"]["node"], 0, "{m}");
+    // a socket this machine doesn't have is refused before it's saved
+    let mut other = intent.clone();
+    other["host_node"] = json!(1);
+    let r = c
+        .put(format!("{base}/api/aie/placement"))
+        .json(&json!({ "model": MODEL, "intent": other }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+    let msg = r.text().await.unwrap();
+    assert!(msg.contains("socket 1 doesn't exist"), "{msg}");
+    // socket 0 is fine
+    other["host_node"] = json!(0);
+    let r = c
+        .put(format!("{base}/api/aie/placement"))
+        .json(&json!({ "model": MODEL, "intent": other }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+
     // a placement that can't work is refused before it's saved
     let bad = json!({ "n_ctx": 2048, "layers": [{ "tier": "Disk", "amount": "Rest" }], "subsystems": {}, "embeddings": null, "output": null, "expert_cache_bytes": 0, "allow_repack": false });
     let r = c

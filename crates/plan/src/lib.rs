@@ -93,6 +93,11 @@ pub struct Intent {
     /// Let llama.cpp repack CPU weights. Faster CPU kernels, but repacked
     /// weights leave the tier they were placed in (decision D4).
     pub allow_repack: bool,
+    /// The NUMA node (socket) for everything on the host side: RAM-tier
+    /// memory, CPU threads, host-side buffers. `None` = automatic: the node
+    /// of the GPU hosting the model's layers. Never split across nodes.
+    #[serde(default)]
+    pub host_node: Option<u32>,
 }
 
 impl Intent {
@@ -106,6 +111,7 @@ impl Intent {
             output: None,
             expert_cache_bytes: 0,
             allow_repack: false,
+            host_node: None,
         }
     }
 }
@@ -120,6 +126,10 @@ pub struct Plan {
     pub n_ctx: u64,
     pub expert_cache_bytes: u64,
     pub allow_repack: bool,
+    /// The user's choice of NUMA node for the host side; `None` = automatic
+    /// (the worker resolves it and reports the node it used).
+    #[serde(default)]
+    pub host_node: Option<u32>,
 }
 
 impl Plan {
@@ -152,5 +162,22 @@ impl Plan {
             *m.entry(*t).or_insert(0) += 1;
         }
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_intents_without_host_node_still_load() {
+        let mut v = serde_json::to_value(Intent::all_on(Tier::Ram, 4096)).unwrap();
+        v.as_object_mut().unwrap().remove("host_node");
+        let i: Intent = serde_json::from_value(v).unwrap();
+        assert_eq!(i.host_node, None);
+        let mut i = Intent::all_on(Tier::Ram, 4096);
+        i.host_node = Some(1);
+        let back: Intent = serde_json::from_str(&serde_json::to_string(&i).unwrap()).unwrap();
+        assert_eq!(back.host_node, Some(1));
     }
 }

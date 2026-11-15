@@ -58,6 +58,7 @@ pub async fn live_stats(w: &Worker) -> Value {
         "disk_tier_bytes": st.disk_tier_bytes,
         "disk_tier_resident": st.disk_tier_resident,
         "ram_tier": serde_json::from_str::<Value>(&st.ram_tier_json).unwrap_or(Value::Null),
+        "host": serde_json::from_str::<Value>(&st.host_json).unwrap_or(Value::Null),
     })
 }
 
@@ -136,6 +137,7 @@ pub async fn get_placement(
                     .collect()
             })
             .unwrap_or_default();
+        let stats = live_stats(&w).await;
         out["loaded"] = json!({
             "description": w.status.description,
             "n_ctx": w.n_ctx,
@@ -145,7 +147,9 @@ pub async fn get_placement(
             "measured": serde_json::from_str::<Value>(&w.status.memory_json).unwrap_or(Value::Null),
             "planned": by_sub,
             "expert_cache": expert_cache,
-            "stats": live_stats(&w).await,
+            // which socket the host side is pinned to, and where it really is
+            "host": stats["host"].clone(),
+            "stats": stats,
             "plan": plan,
             "verified": report,
         });
@@ -194,6 +198,9 @@ pub async fn put_placement(st: State, Body(r): Body<PutReq>) -> Result<Json<Valu
             .max()
             .unwrap_or(0);
         aie_plan::plan(&a, i, gpus).map_err(|e| ApiError::bad_request(e.to_string()))?;
+        // The socket must exist here (the daemon reads the same sysfs the workers do).
+        let topo = aie_worker::numa::Topology::read(std::path::Path::new("/"));
+        aie_worker::numa::choose(&topo, i.host_node, &[], &[]).map_err(ApiError::bad_request)?;
     }
     st.0.save_intent(&res.name, r.intent.as_ref())?;
     let unloaded = if r.reload {
@@ -276,7 +283,9 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
                 .roots()
                 .find(|r| w.model_path.starts_with(r))
                 .map(|r| r.display().to_string());
-        models.push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced, "store": store }));
+        // the live host report: socket, affinity, RAM tier per node
+        let host = live_stats(&w).await["host"].clone();
+        models.push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced, "store": store, "host": host }));
     }
     v["models"] = json!(models);
     // RAM over the last minute (latest, min, max), for the fuzzy RAM bar.

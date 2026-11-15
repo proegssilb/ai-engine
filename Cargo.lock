@@ -80,6 +80,7 @@ dependencies = [
  "aie-gguf",
  "regex",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -80,6 +80,8 @@ pub struct Device {
     pub free: u64,
     pub total: u64,
     pub is_gpu: bool,
+    /// PCI address as ggml reports it (`0000:c1:00.0`), when it knows one.
+    pub pci_bus_id: Option<String>,
 }
 
 /// Devices llama.cpp can use, in its order (GPU index = position among GPUs).
@@ -91,6 +93,13 @@ pub fn devices() -> Vec<Device> {
                 let d = sys::ggml_backend_dev_get(i);
                 let (mut free, mut total) = (0usize, 0usize);
                 sys::ggml_backend_dev_memory(d, &mut free, &mut total);
+                let mut props: sys::ggml_backend_dev_props = std::mem::zeroed();
+                sys::ggml_backend_dev_get_props(d, &mut props);
+                let pci_bus_id = (!props.device_id.is_null()).then(|| {
+                    CStr::from_ptr(props.device_id)
+                        .to_string_lossy()
+                        .to_lowercase()
+                });
                 Device {
                     name: CStr::from_ptr(sys::ggml_backend_dev_name(d))
                         .to_string_lossy()
@@ -102,6 +111,7 @@ pub fn devices() -> Vec<Device> {
                     total: total as u64,
                     is_gpu: sys::ggml_backend_dev_type(d)
                         == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU,
+                    pci_bus_id,
                 }
             })
             .collect()

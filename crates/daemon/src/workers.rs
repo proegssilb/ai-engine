@@ -231,13 +231,8 @@ impl Manager {
             context: aie_worker::ContextParams {
                 n_ctx: spec.n_ctx,
                 n_batch: self.cfg.n_batch,
-                threads: if self.cfg.threads > 0 {
-                    self.cfg.threads
-                } else {
-                    std::thread::available_parallelism()
-                        .map(|n| n.get() as i32)
-                        .unwrap_or(4)
-                },
+                // 0 = the worker uses one thread per CPU of its socket.
+                threads: self.cfg.threads.max(0),
                 ..Default::default()
             },
         };

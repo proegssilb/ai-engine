@@ -5,6 +5,7 @@
 //! service on a Unix socket. Requests run one at a time (an MVP-only limit;
 //! the protocol already allows more in flight).
 
+pub mod numa;
 pub mod ram_tier;
 pub mod stop;
 
@@ -63,41 +64,19 @@ pub struct Config {
 pub fn probe() -> serde_json::Value {
     let devices: Vec<serde_json::Value> = aie_llama::devices()
         .into_iter()
-        .map(|d| serde_json::json!({ "name": d.name, "description": d.description, "total": d.total, "free": d.free, "gpu": d.is_gpu }))
+        .map(|d| {
+            let node = d.pci_bus_id.as_deref().map(|p| numa::pci_node(Path::new("/"), p));
+            serde_json::json!({ "name": d.name, "description": d.description, "total": d.total, "free": d.free, "gpu": d.is_gpu, "pci_bus_id": d.pci_bus_id, "numa_node": node })
+        })
         .collect();
     let m = machine();
-    let mut numa = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("/sys/devices/system/node") {
-        let mut nodes: Vec<(u32, std::path::PathBuf)> = rd
-            .flatten()
-            .filter_map(|e| {
-                let n = e
-                    .file_name()
-                    .to_string_lossy()
-                    .strip_prefix("node")?
-                    .parse()
-                    .ok()?;
-                Some((n, e.path()))
-            })
-            .collect();
-        nodes.sort();
-        for (n, path) in nodes {
-            let info = std::fs::read_to_string(path.join("meminfo")).unwrap_or_default();
-            let kib = |key: &str| {
-                info.lines()
-                    .find(|l| l.contains(key))
-                    .and_then(|l| l.split_whitespace().rev().nth(1))
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    * 1024
-            };
-            let cpus = std::fs::read_to_string(path.join("cpulist"))
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            numa.push(serde_json::json!({ "node": n, "total": kib("MemTotal:"), "free": kib("MemFree:"), "cpus": cpus }));
-        }
-    }
+    let root = Path::new("/");
+    let topo = numa::Topology::read(root);
+    let numa: Vec<serde_json::Value> = topo
+        .nodes
+        .iter()
+        .map(|n| serde_json::json!({ "node": n.id, "total": n.total, "free": n.free, "cpus": n.cpulist }))
+        .collect();
     serde_json::json!({
         "devices": devices,
         "ram": { "total": m.ram.total, "available": m.ram.free },
@@ -169,6 +148,7 @@ fn decide(cfg: &Config, anatomy: &aie_anatomy::Anatomy) -> Result<(Plan, Setting
                 n_ctx: s.n_ctx,
                 expert_cache_bytes: 0,
                 allow_repack: false,
+                host_node: None,
             };
             Ok((plan, s))
         }
@@ -182,6 +162,10 @@ struct Loaded {
     /// File ranges (offset, length) of weights on the disk tier.
     disk_ranges: Vec<(u64, u64)>,
     stats: std::sync::Mutex<Stats>,
+    /// Where the host side was pinned (see [`numa`]), and the machine's sockets.
+    host: numa::Applied,
+    topo: numa::Topology,
+    threads: i32,
 }
 
 #[derive(Default)]
@@ -223,16 +207,49 @@ fn load_warnings() -> Vec<String> {
 fn load(cfg: &Config) -> Result<Loaded, String> {
     let gguf = aie_gguf::Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
     let anatomy = aie_anatomy::Anatomy::from_gguf(&gguf).map_err(|e| e.to_string())?;
+    // Refuse a socket that doesn't exist before doing anything expensive.
+    let root = Path::new("/");
+    let topo = numa::Topology::read(root);
+    let requested = match &cfg.placement {
+        Placement::Intent { intent } => intent.host_node,
+        Placement::Planned { plan, .. } => plan.host_node,
+        Placement::Auto { .. } => None,
+    };
+    numa::choose(&topo, requested, &[], &[])?;
     let (plan, settings) = decide(cfg, &anatomy)?;
+
+    // Pin the host side to one socket before llama.cpp allocates or starts
+    // threads: next to the GPU holding the layers, unless chosen.
+    let gpu_nodes: Vec<u32> = aie_llama::devices()
+        .iter()
+        .filter(|d| d.is_gpu)
+        .map(|d| {
+            d.pci_bus_id
+                .as_deref()
+                .map_or(0, |p| numa::pci_node(root, p))
+        })
+        .collect();
+    let choice = numa::choose(&topo, plan.host_node, &gpu_nodes, &plan.layer_home)?;
+    let host = numa::apply(&topo, &choice)?;
+    let mut context = cfg.context.clone();
+    if context.threads <= 0 {
+        context.threads = numa::default_threads(&host);
+    }
+    let threads = context.threads;
 
     // Driver features are used when they're there (spikes/memory): CUDA
     // registration only with a CUDA build and a GPU to copy to.
     let mut pin = cfg.pin.clone();
     pin.cuda_register &= aie_llama::CUDA && aie_llama::devices().iter().any(|d| d.is_gpu);
+    // The RAM tier binds strictly to the node. On one socket there's nothing
+    // to bind to, so it stays as it always was.
+    if topo.multi() {
+        pin.numa_node = Some(host.node);
+    }
     let opts = LoadOptions { settings, pin };
     // llama.cpp's own dry run: the authoritative check before allocating.
     let measured =
-        aie_llama::fit::measure(&cfg.model, &opts, &cfg.context).map_err(|e| e.to_string())?;
+        aie_llama::fit::measure(&cfg.model, &opts, &context).map_err(|e| e.to_string())?;
     if matches!(cfg.placement, Placement::Intent { .. }) {
         let short: Vec<String> = measured
             .iter()
@@ -267,7 +284,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         .map_err(|e| e.to_string())?;
     let report = verify::check(
         &model,
-        &cfg.context,
+        &context,
         &prompt,
         anatomy.parts.iter().map(|p| p.name.clone()),
     )
@@ -283,9 +300,16 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         .map(|t| (gguf.file_offset(t), t.size))
         .collect();
     let disk_tier_bytes = disk_ranges.iter().map(|r| r.1).sum();
-    let warnings = load_warnings();
+    let mut warnings = load_warnings();
 
-    let ctx = Context::new(model.clone(), cfg.context.clone()).map_err(|e| e.to_string())?;
+    let ctx = Context::new(model.clone(), context.clone()).map_err(|e| e.to_string())?;
+    // Measure where things landed; on several sockets, say what isn't where promised.
+    let hr = numa::report(&topo, &host, threads);
+    for p in &hr.problems {
+        if !warnings.contains(p) {
+            warnings.push(p.clone());
+        }
+    }
     let status = pb::StatusReply {
         model_path: cfg.model.display().to_string(),
         description: model.description(),
@@ -306,6 +330,9 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         status,
         disk_ranges,
         stats: Default::default(),
+        host,
+        topo,
+        threads,
     })
 }
 
@@ -343,6 +370,7 @@ impl Worker for Service {
             st.last_decode_tps = s.last_decode_tps;
         }
         st.ram_tier_json = serde_json::to_string(&ram_tier::status()).unwrap_or_default();
+        st.host_json = numa::report_json(&self.0.topo, &self.0.host, self.0.threads);
         st.disk_tier_resident =
             aie_llama::residency::resident_file_bytes(self.0.model.path(), &self.0.disk_ranges);
         Ok(Response::new(st))

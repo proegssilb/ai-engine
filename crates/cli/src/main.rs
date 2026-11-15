@@ -72,7 +72,13 @@ fn main() {
     // panicking on the failed write, as command-line tools do.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    // Threads the runtime starts later (the blocking pool runs the model) get
+    // the worker's socket pinning; before a worker applies one this does nothing.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(aie_worker::numa::init_thread)
+        .build()
+        .expect("tokio runtime");
     let result = rt.block_on(async move {
         match cli.cmd {
             Cmd::Serve => {
@@ -382,6 +388,32 @@ async fn place(
             for f in rt["fixes"].as_array().into_iter().flatten() {
                 println!("  fix: {}", f.as_str().unwrap_or(""));
             }
+        }
+    }
+    // The host side's socket, only where there's a choice of sockets.
+    let host = &loaded["host"];
+    if host["sockets"].as_u64().unwrap_or(1) > 1 {
+        let gbs = |m: &Value| -> String {
+            m.as_object()
+                .into_iter()
+                .flatten()
+                .map(|(n, b)| format!("socket {n} {}", human(b.as_u64().unwrap_or(0))))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "host: socket {} ({}), {} threads; RAM tier on {}",
+            host["node"],
+            if host["auto"].as_bool() == Some(true) {
+                host["reason"].as_str().unwrap_or("automatic")
+            } else {
+                "chosen"
+            },
+            host["threads"],
+            gbs(&host["ram_tier_by_node"])
+        );
+        for p in host["problems"].as_array().into_iter().flatten() {
+            println!("  problem: {}", p.as_str().unwrap_or(""));
         }
     }
     println!("{:<16} where (planned, verified)", "subsystem");

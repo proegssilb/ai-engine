@@ -13,6 +13,7 @@ regex = "1.13"
 
 [dev-dependencies]
 aie-gguf = { path = "../gguf" }
+serde_json = "1"
 
 [lints]
 workspace = true

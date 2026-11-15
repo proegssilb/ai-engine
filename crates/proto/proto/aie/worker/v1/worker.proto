@@ -53,6 +53,10 @@ message StatusReply {
   // Is the RAM tier staying in RAM, by what, and how to fix it if not
   // (aie_worker::ram_tier::RamTier as JSON; measured on each call).
   string ram_tier_json = 20;
+  // Which socket (NUMA node) the model's host side is pinned to, and where its
+  // memory and threads really are (aie_worker::numa::HostReport as JSON;
+  // measured on each call, cached for two seconds).
+  string host_json = 21;
 }
 
 message ChatMessage {

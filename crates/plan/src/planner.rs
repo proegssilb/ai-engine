@@ -126,6 +126,7 @@ pub fn plan(a: &Anatomy, intent: &Intent, gpus: u32) -> Result<Plan, PlanError> 
         n_ctx: intent.n_ctx,
         expert_cache_bytes: intent.expert_cache_bytes,
         allow_repack: intent.allow_repack,
+        host_node: intent.host_node,
     })
 }
 
