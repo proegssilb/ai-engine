@@ -261,6 +261,20 @@ struct LeasedStream {
     on_end: Option<(Arc<Manager>, String)>,
 }
 
+impl LeasedStream {
+    /// Release the worker, and unload it if the request asked (keep_alive 0).
+    fn finish(&mut self) {
+        self._lease = None;
+        if let Some((m, n)) = self.on_end.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                m.unload(&n).await;
+            });
+        }
+    }
+}
+
 impl Stream for LeasedStream {
     type Item = Result<GenerateEvent, tonic::Status>;
     fn poll_next(
@@ -269,14 +283,17 @@ impl Stream for LeasedStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let r = std::pin::Pin::new(&mut self.inner).poll_next(cx);
         if let std::task::Poll::Ready(None) = r {
-            self._lease = None;
-            if let Some((m, n)) = self.on_end.take() {
-                tokio::spawn(async move {
-                    m.unload(&n).await;
-                });
-            }
+            self.finish();
         }
         r
+    }
+}
+
+/// Non-streaming handlers stop reading at the final event and drop the
+/// stream rather than draining it; finish then too.
+impl Drop for LeasedStream {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 

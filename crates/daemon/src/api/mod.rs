@@ -35,6 +35,7 @@ pub fn router(d: Arc<Daemon>) -> Router {
             "/api/aie/placement",
             get(aie::get_placement).put(aie::put_placement),
         )
+        .route("/api/aie/machine", get(aie::machine))
         .with_state(d)
 }
 
