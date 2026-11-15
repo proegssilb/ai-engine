@@ -152,3 +152,27 @@ Decided (2026-11-15):
 Consequence to live with, not a choice: **llama.cpp stays pinned.** The Rust
 buffer depends on an internal header (`ggml-backend-impl.h`), so every upgrade
 means regenerating bindings and running the placement regression test.
+
+## As built (2026-11-15)
+
+Where the first implementation refined the design above:
+
+- **The daemon never initialises CUDA.** Anything that needs the devices runs
+  in a worker: llama.cpp's fit (auto-place), and planning a saved intent
+  (which needs the GPU count and free memory). A worker therefore takes one of
+  three placements: `Auto` (llama.cpp's fit, resolved into a plan), `Intent`
+  (planned, fit-checked and compiled in the worker; refused with the reason if
+  it doesn't fit), or `Planned` (already compiled). Every load is then verified
+  weight by weight against its plan, and the worker's `Status` carries both.
+- **The fit shim is the only C++** (`crates/llama/shim/fit.cpp`), linked into
+  the worker, as decided in D3's exception.
+- **Saved placements are files** (`AIE_HOME/placements/<model>.json`, the
+  intent as JSON). The model index is the store's manifests for now; SQLite
+  arrives with the first thing that needs queries (metrics history).
+- **Worker sockets live in `$XDG_RUNTIME_DIR/ai-engine` or `/tmp/aie-<uid>`**,
+  not under `AIE_HOME`: Unix socket paths max out at about 108 bytes.
+- **llama.cpp links statically, in dependency order**, through
+  `rustc-link-lib` (link arguments don't reach dependent crates). The CUDA
+  runtime and cuBLAS stay dynamic.
+- **Machine view without CUDA in the daemon** is still open; the likely shape
+  is a short-lived `ai-engine probe` subprocess that reports devices as JSON.
