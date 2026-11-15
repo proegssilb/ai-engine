@@ -1,0 +1,10 @@
+[package]
+name = "aie-gguf"
+description = "Read GGUF headers, metadata and tensor tables without loading weights"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
