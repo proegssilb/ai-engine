@@ -4,6 +4,7 @@
 # (cd spikes/placement && cargo build --release).
 # Usage: crates/gguf/xcheck/run.sh FILE.gguf [FILE.gguf ...]
 set -euo pipefail
+command -v cargo > /dev/null || source "$HOME/.cargo/env"
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 LIB=$(dirname "$(find "$ROOT/spikes/placement/target/release/build" -name 'libggml-base.so' | head -1)")
 TMP=$(mktemp -d)
