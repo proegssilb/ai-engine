@@ -5,6 +5,7 @@
 //! service on a Unix socket. Requests run one at a time (an MVP-only limit;
 //! the protocol already allows more in flight).
 
+pub mod ram_tier;
 pub mod stop;
 
 pub use aie_llama::ContextParams;
@@ -203,12 +204,6 @@ fn load_warnings() -> Vec<String> {
         .iter()
         .filter(|b| !b.freed)
     {
-        if let Some(Err(e)) = b.mlock_result {
-            out.push(format!(
-                "the RAM tier ({:.0} MiB) couldn't be locked in memory (mlock errno {e}), so it may be swapped out; raise the memlock limit (systemd: LimitMEMLOCK=infinity; shell: ulimit -l unlimited)",
-                b.len as f64 / 1048576.0
-            ));
-        }
         if let Some(Err(e)) = b.hugetlb_result {
             out.push(format!(
                 "the RAM tier asked for reserved huge pages but got normal ones (mmap errno {e}); reserve more (vm.nr_hugepages / /sys/kernel/mm/hugepages)"
@@ -230,10 +225,11 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
     let anatomy = aie_anatomy::Anatomy::from_gguf(&gguf).map_err(|e| e.to_string())?;
     let (plan, settings) = decide(cfg, &anatomy)?;
 
-    let opts = LoadOptions {
-        settings,
-        pin: cfg.pin.clone(),
-    };
+    // Driver features are used when they're there (spikes/memory): CUDA
+    // registration only with a CUDA build and a GPU to copy to.
+    let mut pin = cfg.pin.clone();
+    pin.cuda_register &= aie_llama::CUDA && aie_llama::devices().iter().any(|d| d.is_gpu);
+    let opts = LoadOptions { settings, pin };
     // llama.cpp's own dry run: the authoritative check before allocating.
     let measured =
         aie_llama::fit::measure(&cfg.model, &opts, &cfg.context).map_err(|e| e.to_string())?;
@@ -346,6 +342,7 @@ impl Worker for Service {
             st.last_prefill_tps = s.last_prefill_tps;
             st.last_decode_tps = s.last_decode_tps;
         }
+        st.ram_tier_json = serde_json::to_string(&ram_tier::status()).unwrap_or_default();
         st.disk_tier_resident =
             aie_llama::residency::resident_file_bytes(self.0.model.path(), &self.0.disk_ranges);
         Ok(Response::new(st))

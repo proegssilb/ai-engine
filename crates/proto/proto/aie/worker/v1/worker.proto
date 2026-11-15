@@ -50,6 +50,9 @@ message StatusReply {
   // llama.cpp's dry run before loading: per device, what it said this
   // placement needs (aie_llama::fit::Measured rows as JSON).
   string memory_json = 19;
+  // Is the RAM tier staying in RAM, by what, and how to fix it if not
+  // (aie_worker::ram_tier::RamTier as JSON; measured on each call).
+  string ram_tier_json = 20;
 }
 
 message ChatMessage {

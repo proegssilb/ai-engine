@@ -68,6 +68,9 @@ enum Cmd {
 }
 
 fn main() {
+    // Exit quietly when a pipe closes (`ai-engine list | head`) instead of
+    // panicking on the failed write, as command-line tools do.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let result = rt.block_on(async move {
@@ -327,6 +330,59 @@ async fn place(
     );
     for w in loaded["warnings"].as_array().into_iter().flatten() {
         println!("warning: {}", w.as_str().unwrap_or(""));
+    }
+    let rt = &loaded["stats"]["ram_tier"];
+    if rt["bytes"].as_u64().unwrap_or(0) > 0 {
+        let held = rt["held"].as_bool() == Some(true);
+        let by: Vec<String> = rt["mechanisms"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|m| m["ok"].as_bool() == Some(true))
+            .map(|m| {
+                format!(
+                    "{}{}",
+                    m["name"].as_str().unwrap_or(""),
+                    if m["layer"] == "os" {
+                        String::new()
+                    } else {
+                        format!(" ({})", m["layer"].as_str().unwrap_or(""))
+                    }
+                )
+            })
+            .collect();
+        println!(
+            "RAM tier: {} in RAM, {} swapped: {}",
+            human(rt["resident"].as_u64().unwrap_or(0)),
+            human(rt["swapped"].as_u64().unwrap_or(0)),
+            if !held {
+                "NOT HELD, may be swapped out".to_string()
+            } else if rt["held_by_os"].as_bool() == Some(true) {
+                format!("held ({})", by.join(", "))
+            } else {
+                format!(
+                    "held only by the driver ({}); no OS-level backstop",
+                    by.join(", ")
+                )
+            }
+        );
+        if rt["held_by_os"].as_bool() != Some(true) {
+            for m in rt["mechanisms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| m["ok"].as_bool() == Some(false))
+            {
+                println!(
+                    "  {}: {}",
+                    m["name"].as_str().unwrap_or(""),
+                    m["detail"].as_str().unwrap_or("")
+                );
+            }
+            for f in rt["fixes"].as_array().into_iter().flatten() {
+                println!("  fix: {}", f.as_str().unwrap_or(""));
+            }
+        }
     }
     println!("{:<16} where (planned, verified)", "subsystem");
     for (s, tiers) in loaded["planned"].as_object().into_iter().flatten() {

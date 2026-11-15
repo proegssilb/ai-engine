@@ -17,6 +17,7 @@ cuda = ["aie-worker/cuda"]
 aie-daemon = { path = "../daemon" }
 aie-worker = { path = "../worker" }
 clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
 reqwest = { version = "0.13", features = ["json"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

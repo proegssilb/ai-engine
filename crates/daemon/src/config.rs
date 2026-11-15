@@ -26,6 +26,9 @@ pub struct Config {
     pub threads: i32,
     /// How long a worker may take to load and check its placement.
     pub load_timeout: Duration,
+    /// Start workers with swap forbidden (systemd user scope) when possible,
+    /// so the RAM tier stays in RAM without mlock.
+    pub forbid_worker_swap: bool,
     /// The executable to start workers with (`<exe> worker ...`); the daemon's own by default.
     pub worker_exe: PathBuf,
 }
@@ -42,6 +45,7 @@ struct File {
     n_batch: Option<u32>,
     threads: Option<i32>,
     load_timeout: Option<String>,
+    forbid_worker_swap: Option<bool>,
 }
 
 pub const DEFAULT_PORT: u16 = 11435;
@@ -58,6 +62,7 @@ impl Config {
             n_batch: 512,
             threads: 0,
             load_timeout: Duration::from_secs(1800),
+            forbid_worker_swap: true,
             worker_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ai-engine")),
         }
     }
@@ -98,6 +103,9 @@ impl Config {
             }
             if let Some(v) = f.threads {
                 c.threads = v;
+            }
+            if let Some(v) = f.forbid_worker_swap {
+                c.forbid_worker_swap = v;
             }
             if let Some(v) = f.load_timeout {
                 c.load_timeout =

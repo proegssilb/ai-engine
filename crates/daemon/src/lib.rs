@@ -327,6 +327,14 @@ pub async fn serve(cfg: Config) -> Result<(), String> {
         .await
         .map_err(|e| format!("{listen}: {e}"))?;
     eprintln!(
+        "workers start {}",
+        if d.workers.swap_free_scope() {
+            "with swap forbidden (systemd user scope)"
+        } else {
+            "normally (RAM tier relies on mlock or no swap)"
+        }
+    );
+    eprintln!(
         "ai-engine listening on http://{listen} (store: {})",
         d.cfg
             .stores

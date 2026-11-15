@@ -80,6 +80,33 @@ pub struct Manager {
     /// Loads happen one at a time: each needs to see the memory the previous one took.
     loading: Mutex<()>,
     seq: AtomicU64,
+    /// Start workers in a systemd user scope with swap forbidden: holds the
+    /// RAM tier without root, mlock or a driver (spikes/memory, phase C).
+    swap_free_scope: bool,
+}
+
+/// Can workers be started with swap forbidden from here? Only outside a
+/// system service (the unit handles that) and with a systemd user manager
+/// that controls memory; one trial run decides.
+fn swap_free_scope_available() -> bool {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    if cg.contains("/system.slice/") {
+        return false;
+    }
+    std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "-q",
+            "--collect",
+            "-p",
+            "MemorySwapMax=0",
+            "true",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 fn sanitize(name: &str) -> String {
@@ -96,16 +123,23 @@ fn sanitize(name: &str) -> String {
 
 impl Manager {
     pub fn new(cfg: Config) -> Arc<Manager> {
+        let swap_free_scope = cfg.forbid_worker_swap && swap_free_scope_available();
         Arc::new(Manager {
             cfg,
             workers: Mutex::new(HashMap::new()),
             loading: Mutex::new(()),
             seq: AtomicU64::new(0),
+            swap_free_scope,
         })
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Whether workers start with swap forbidden (systemd user scope).
+    pub fn swap_free_scope(&self) -> bool {
+        self.swap_free_scope
     }
 
     /// A worker for the model, loading it if needed. `keep_alive` (`None` =
@@ -209,7 +243,23 @@ impl Manager {
         let log =
             std::fs::File::create(&log_path).map_err(|e| format!("{}: {e}", log_path.display()))?;
 
-        let mut child = Command::new(&self.cfg.worker_exe)
+        let mut cmd = if self.swap_free_scope {
+            // `systemd-run --scope` execs the worker: same PID, own cgroup.
+            let mut c = Command::new("systemd-run");
+            c.args([
+                "--user",
+                "--scope",
+                "-q",
+                "--collect",
+                "-p",
+                "MemorySwapMax=0",
+            ])
+            .arg(&self.cfg.worker_exe);
+            c
+        } else {
+            Command::new(&self.cfg.worker_exe)
+        };
+        let mut child = cmd
             .arg("worker")
             .arg("--config")
             .arg(&cfg_path)
@@ -333,6 +383,9 @@ fn aie_llama_pin_defaults() -> aie_worker::PinOptions {
     aie_worker::PinOptions {
         mlock: true,
         hugepages: true,
+        // CUDA registration when the worker has a GPU (driver speed-up; the
+        // worker drops it otherwise). Locking is the OS-level backstop.
+        cuda_register: true,
         ..Default::default()
     }
 }

@@ -28,6 +28,8 @@ RestartSec=5
 # The RAM tier mlocks its memory so the kernel can't swap it out; the
 # default lock limit (8 MiB) would make that fail.
 LimitMEMLOCK=infinity
+# Backstop: never swap the engine's memory, even if locking fails.
+MemorySwapMax=0
 # Large models map big files and pin a lot of memory.
 LimitNOFILE=65536
 # Give workers time to free GPU memory on stop.

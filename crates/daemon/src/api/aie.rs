@@ -57,6 +57,7 @@ pub async fn live_stats(w: &Worker) -> Value {
         "last_decode_tps": st.last_decode_tps,
         "disk_tier_bytes": st.disk_tier_bytes,
         "disk_tier_resident": st.disk_tier_resident,
+        "ram_tier": serde_json::from_str::<Value>(&st.ram_tier_json).unwrap_or(Value::Null),
     })
 }
 

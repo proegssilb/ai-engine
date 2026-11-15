@@ -131,7 +131,14 @@ unsafe extern "C" fn buft_alloc_buffer(
 ) -> sys::ggml_backend_buffer_t {
     let opts = unsafe { buft_ctx(buft).opts.clone() };
     let anon = |len: usize, extra: libc::c_int| unsafe {
-        libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra, -1, 0)
+        libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra,
+            -1,
+            0,
+        )
     };
     // Reserved huge pages first, if asked; else (or on failure) normal pages.
     // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
@@ -175,7 +182,11 @@ unsafe extern "C" fn buft_alloc_buffer(
     };
 
     if !matches!(rec.hugetlb_result, Some(Ok(_))) {
-        let advice = if opts.hugepages { libc::MADV_HUGEPAGE } else { libc::MADV_NOHUGEPAGE };
+        let advice = if opts.hugepages {
+            libc::MADV_HUGEPAGE
+        } else {
+            libc::MADV_NOHUGEPAGE
+        };
         unsafe { libc::madvise(base, map_len, advice) };
     }
     if let Some(node) = opts.numa_node {
@@ -207,7 +218,9 @@ unsafe extern "C" fn buft_alloc_buffer(
     }
     if opts.cuda_register {
         rec.cuda_register_result = Some(match cudart() {
-            Some(c) => match unsafe { (c.register)(base, map_len, 0) } {
+            // cudaHostRegisterPortable: page-locked for every CUDA context, so
+            // all GPUs (not only the current one) copy from it at full speed.
+            Some(c) => match unsafe { (c.register)(base, map_len, 1) } {
                 0 => Ok(()),
                 e => Err(e),
             },

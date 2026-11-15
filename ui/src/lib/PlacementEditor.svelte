@@ -198,6 +198,34 @@
         {#each p.loaded.warnings ?? [] as w (w)}
           <div class="error">Warning: {w}</div>
         {/each}
+        {#if p.loaded.stats?.ram_tier && p.loaded.stats.ram_tier.bytes > 0}
+          {@const rt = p.loaded.stats.ram_tier}
+          <div class="ramtier" class:bad={!rt.held_by_os}>
+            <div>
+              <strong>RAM tier</strong>
+              {bytes(rt.resident)} in RAM{#if rt.swapped > 0}, <span class="error">{bytes(rt.swapped)} swapped out</span>{/if} ·
+              {#if !rt.held}
+                <span class="error">not held: may be swapped out</span>
+              {:else if rt.held_by_os}
+                <span class="ok">held</span>
+              {:else}
+                <span class="error">held only by the GPU driver, no OS backstop</span>
+              {/if}
+            </div>
+            <div class="mechs">
+              {#each rt.mechanisms as m (m.name)}
+                <span class="mech" class:on={m.ok} title={m.detail}>
+                  {m.ok ? '✓' : '·'} {m.name}{m.layer !== 'os' ? ` (${m.layer})` : ''}
+                </span>
+              {/each}
+            </div>
+            {#if !rt.held_by_os}
+              <ul class="fixes">
+                {#each rt.fixes as f (f)}<li>{f}</li>{/each}
+              </ul>
+            {/if}
+          </div>
+        {/if}
         {#if p.loaded.stats}
           {@const st = p.loaded.stats}
           <div class="stats mono">
@@ -290,6 +318,31 @@
   }
   .wide {
     width: 180px;
+  }
+  .ramtier {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .ramtier.bad {
+    border-color: var(--bad);
+  }
+  .mechs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    margin-top: 6px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .mech.on {
+    color: var(--ok);
+  }
+  .fixes {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    font-size: 12.5px;
   }
   .stats {
     display: flex;

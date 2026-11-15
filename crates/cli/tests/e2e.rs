@@ -173,6 +173,16 @@ async fn serve_load_chat_place() {
     );
     assert!(s["disk_tier_bytes"].as_u64().unwrap() > 0, "{s}");
     assert!(s["disk_tier_resident"].as_u64().unwrap() > 0, "{s}");
+    // the RAM tier reports whether it's held and by what
+    let rt = &s["ram_tier"];
+    assert!(rt["bytes"].as_u64().unwrap() > 0, "{rt}");
+    assert!(
+        rt["held"].is_boolean() && rt["mechanisms"].as_array().is_some_and(|m| !m.is_empty()),
+        "{rt}"
+    );
+    if rt["held_by_os"] == false {
+        assert!(!rt["fixes"].as_array().unwrap().is_empty(), "{rt}");
+    }
 
     // a placement that can't work is refused before it's saved
     let bad = json!({ "n_ctx": 2048, "layers": [{ "tier": "Disk", "amount": "Rest" }], "subsystems": {}, "embeddings": null, "output": null, "expert_cache_bytes": 0, "allow_repack": false });

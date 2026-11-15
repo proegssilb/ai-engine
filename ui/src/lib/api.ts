@@ -84,6 +84,19 @@ export interface Stats {
   last_decode_tps: number
   disk_tier_bytes: number
   disk_tier_resident: number
+  ram_tier: RamTier | null
+}
+
+/** Is the RAM tier staying in RAM: OS-level backstop plus driver features. */
+export interface RamTier {
+  bytes: number
+  resident: number
+  swapped: number
+  held: boolean
+  held_by_os: boolean
+  mechanisms: { layer: string; name: string; ok: boolean; detail: string }[]
+  environment: string
+  fixes: string[]
 }
 
 export class ApiError extends Error {}
