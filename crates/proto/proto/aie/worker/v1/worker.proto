@@ -44,6 +44,9 @@ message StatusReply {
   // them are in RAM right now (mincore; the kernel may drop them any time).
   uint64 disk_tier_bytes = 16;
   uint64 disk_tier_resident = 17;
+  // Things the user should know about this load, e.g. the RAM tier couldn't
+  // be locked in memory.
+  repeated string warnings = 18;
 }
 
 message ChatMessage {

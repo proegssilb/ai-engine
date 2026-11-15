@@ -195,6 +195,9 @@
             <span class="error">{p.loaded.misplaced} weights not where planned</span>
           {/if}
         </div>
+        {#each p.loaded.warnings ?? [] as w (w)}
+          <div class="error">Warning: {w}</div>
+        {/each}
         {#if p.loaded.stats}
           {@const st = p.loaded.stats}
           <div class="stats mono">

@@ -194,6 +194,31 @@ struct Stats {
     last_decode_tps: f32,
 }
 
+/// Problems with the RAM tier's buffers that don't stop the load.
+fn load_warnings() -> Vec<String> {
+    let mut out = Vec::new();
+    for b in aie_llama::pinned::REGISTRY
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|b| !b.freed)
+    {
+        if let Some(Err(e)) = b.mlock_result {
+            out.push(format!(
+                "the RAM tier ({:.0} MiB) couldn't be locked in memory (mlock errno {e}), so it may be swapped out; raise the memlock limit (systemd: LimitMEMLOCK=infinity; shell: ulimit -l unlimited)",
+                b.len as f64 / 1048576.0
+            ));
+        }
+        if let Some(Err(e)) = b.mbind_result {
+            out.push(format!(
+                "the RAM tier couldn't be bound to its NUMA node (mbind errno {e})"
+            ));
+        }
+    }
+    out.dedup();
+    out
+}
+
 /// Load the model and check its placement. Blocking; run before serving.
 fn load(cfg: &Config) -> Result<Loaded, String> {
     let gguf = aie_gguf::Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
@@ -232,6 +257,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         .map(|t| (gguf.file_offset(t), t.size))
         .collect();
     let disk_tier_bytes = disk_ranges.iter().map(|r| r.1).sum();
+    let warnings = load_warnings();
 
     let ctx = Context::new(model.clone(), cfg.context.clone()).map_err(|e| e.to_string())?;
     let status = pb::StatusReply {
@@ -244,6 +270,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         load_ms,
         plan_json,
         disk_tier_bytes,
+        warnings,
         ..Default::default()
     };
     Ok(Loaded {

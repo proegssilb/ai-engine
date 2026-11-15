@@ -130,6 +130,7 @@ pub async fn get_placement(
             "n_ctx": w.n_ctx,
             "misplaced": w.status.misplaced,
             "load_ms": w.status.load_ms,
+            "warnings": w.status.warnings,
             "planned": by_sub,
             "stats": live_stats(&w).await,
             "plan": plan,

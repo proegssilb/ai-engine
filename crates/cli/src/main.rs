@@ -320,6 +320,9 @@ async fn place(
             None => String::new(),
         }
     );
+    for w in loaded["warnings"].as_array().into_iter().flatten() {
+        println!("warning: {}", w.as_str().unwrap_or(""));
+    }
     println!("{:<16} where (planned, verified)", "subsystem");
     for (s, tiers) in loaded["planned"].as_object().into_iter().flatten() {
         let parts: Vec<String> = tiers

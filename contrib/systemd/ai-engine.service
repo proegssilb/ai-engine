@@ -1,0 +1,37 @@
+# ai-engine as a system service.
+#
+#   sudo useradd --system --home /var/lib/ai-engine --create-home ai-engine
+#   sudo usermod -aG video,render ai-engine      # GPU device access, if needed
+#   sudo install -m755 target/release/ai-engine /usr/local/bin/
+#   sudo cp contrib/systemd/ai-engine.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ai-engine
+#
+# Settings: /var/lib/ai-engine/config.toml (listen, store, keep_alive, ...).
+# Logs: journalctl -u ai-engine; per-model worker logs in /var/lib/ai-engine/logs/.
+
+[Unit]
+Description=ai-engine inference control plane
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ai-engine
+Group=ai-engine
+Environment=AIE_HOME=/var/lib/ai-engine
+# Worker sockets go in $XDG_RUNTIME_DIR/ai-engine, i.e. /run/ai-engine.
+Environment=XDG_RUNTIME_DIR=/run
+RuntimeDirectory=ai-engine
+ExecStart=/usr/local/bin/ai-engine serve
+Restart=on-failure
+RestartSec=5
+# The RAM tier mlocks its memory so the kernel can't swap it out; the
+# default lock limit (8 MiB) would make that fail.
+LimitMEMLOCK=infinity
+# Large models map big files and pin a lot of memory.
+LimitNOFILE=65536
+# Give workers time to free GPU memory on stop.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

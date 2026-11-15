@@ -69,6 +69,7 @@ export interface Placement {
     /** subsystem label -> tier key (gpu0, ram, disk) -> bytes */
     planned: Record<string, Record<string, number>>
     stats: Stats | null
+    warnings: string[]
   }
 }
 
