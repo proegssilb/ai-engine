@@ -223,7 +223,7 @@ impl Sampler {
                         .ok()
                         .and_then(|h| {
                             serde_json::from_value::<BTreeMap<String, u64>>(
-                                h.get("disk_tier_by_node")?.clone(),
+                                h.get("file_cache_by_node")?.clone(),
                             )
                             .ok()
                         })

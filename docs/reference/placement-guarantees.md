@@ -45,7 +45,11 @@ RAM right now (`mincore`), so a user can see what the tier costs.
 
 On a machine with several sockets (NUMA nodes), a model's **host side** runs on
 one socket: its RAM-tier memory, its CPU threads, and host-side allocations
-(KV cache and compute buffers on the host, page cache pages it reads). The UI's
+(KV cache and compute buffers on the host). The page cache, including the disk
+tier's cached pages, is the kernel's and isn't part of this: it is reported
+per socket, never placed. RAM-tier weights are never read from the mapped
+file after load (the address check above confirms it), so where the file's
+cached pages sit doesn't affect them. The UI's
 "RAM 0" and "CPU 0" boxes depend on this being true. llama.cpp doesn't
 partition CPU work by node, so a model is never split across sockets.
 
@@ -79,7 +83,7 @@ or starts threads:
   under `taskset` elsewhere) the load is refused.
 - **Memory policy**: `set_mempolicy` with `MPOL_PREFERRED` for the node. It is
   tolerant: a full node spills to another instead of killing the process. It
-  covers host-side buffers and page cache pages the model faults in.
+  covers host-side buffers.
 - **RAM tier**: the pinned buffer is `mbind`ed strictly (`MPOL_BIND`) to the
   node before its first touch. This is only done on machines with several
   sockets, so single-socket machines run exactly as before.
@@ -103,53 +107,41 @@ Every status call (cached for two seconds) the worker reports:
 - the RAM tier's bytes per node, from `move_pages` (without a destination) on
   up to 8192 evenly spaced pages of each buffer (exact when the buffer has no
   more pages than that; an estimate otherwise);
-- the disk tier's cached pages per node (the mapped model file, `numa_maps`
-  `file=` lines), and the host buffers per node (anonymous memory that isn't
+- the model file's cached pages per node (`numa_maps` `file=` lines), for the
+  RAM bars only, and the host buffers per node (anonymous memory that isn't
   the RAM tier: KV cache, compute buffers);
 - all of the process's mapped memory per node, from `/proc/self/numa_maps`.
 
 ### What is claimed for the socket
 
-The UI puts a model's RAM tier in the socket's RAM box and the help text says
-host-side buffers and page cache pages it reads are on the socket too. So the
-claim, and what is checked, is: the RAM tier, the host buffers, and the
-model file's cached pages (the disk tier's in-RAM share). Other memory of the
-process (libraries, other files) isn't claimed and isn't checked.
-
-Memory policy only decides where *new* pages go. A page cache page has one
-physical copy and stays on whichever node first read it, even for a different
-process earlier. So after loading, and on every status measurement that finds
-cached model-file pages on another node, the worker moves them: pages cached
-but not yet mapped are mapped (`MADV_POPULATE_READ`, only the resident runs,
-no I/O), then `mbind(MPOL_PREFERRED, MPOL_MF_MOVE)` over them; the mapping also
-keeps the preference for pages read later. Then it measures again.
-
-What can't be guaranteed: `MPOL_MF_MOVE` skips pages another process maps too
-(moving those needs `CAP_SYS_NICE`). Two workers on different sockets using the
-same model file can't both have it local; the one that doesn't hold the pages
-reports it, naming the other process as the likely cause. Pages read after the
-last measurement can also land elsewhere if another process cached them first;
-the next status measurement moves them again.
+The RAM tier, the CPU threads and the host buffers. The page cache isn't
+claimed: the kernel decides where cached file pages live (they stay on
+whichever node first read them, whatever the memory policy says) and may drop
+them. Other memory of the process (libraries, other files) isn't claimed either.
 
 ### When it isn't where promised
 
 On several sockets, the report turns into plain-language problems, shown in the
 placement panel and added to the load warnings, for example "4.1 GB of the RAM
 tier is on socket 1, not socket 0", "some threads of this model may run on
-socket 1", "0.6 GB of the disk tier's cached pages are on socket 1, not socket
-0" (with the reason and fix), or that more than a tenth of the host buffers
-(and over 256 MiB) are on another socket. Memory that isn't claimed (libraries,
-unrelated files) is never reported. Failures of the syscalls themselves are reported the same
+socket 1", or that more than a tenth of the host buffers
+(and over 256 MiB) are on another socket. Memory that isn't claimed (the page
+cache, libraries) is never a problem. Failures of the syscalls themselves are reported the same
 way. A load isn't refused for them, except for the cases above. On one socket,
 nothing is ever reported as a problem.
 
 ### Verification status
 
-Verified on single-socket hardware only: the container used for development has
-one node, where the worker pins to node 0's CPUs and reports it, a node that
-doesn't exist is refused, and older saved intents load (end-to-end test). The
-multi-socket logic (choosing a node, cpulist and PCI node parsing, problem
-wording, memory per node from `numa_maps`) is covered by unit tests with fake
-sysfs trees. The strict `mbind` path and the real placement of pages across two
-nodes, and the PCI id lookup on real GPUs, have not been exercised on a
-multi-socket machine.
+- **Single socket** (the development container): the worker pins to node 0's
+  CPUs and reports it, a node that doesn't exist is refused, and older saved
+  intents load (end-to-end test).
+- **Two sockets** (a VM with two virtual NUMA nodes of 4 CPUs and 3.9 GiB each,
+  no GPU, Qwen3-0.6B, 2026-11-16): for socket 0 and for socket 1, the threads
+  ran only on that socket's CPUs and the whole RAM tier was on that node. The
+  host buffers were on that node too, confirmed with `numastat`. Socket 2 was
+  refused. A model on a nearly full node still loaded with its RAM tier there:
+  the kernel dropped cache to make room.
+- **Unit tests** with fake sysfs trees cover choosing a node, parsing cpulists
+  and PCI nodes, problem wording and memory per node from `numa_maps`.
+- **Not yet exercised:** real multi-socket hardware, and the PCI id lookup on
+  real GPUs.

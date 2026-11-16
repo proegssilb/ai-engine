@@ -467,11 +467,9 @@ pub fn parse_numa_maps(text: &str) -> BTreeMap<u32, u64> {
 /// split by what backs them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MapsSplit {
-    /// Pages of the given file (the model), per node.
+    /// Pages of the given file (the model) mapped by this process, per node:
+    /// page cache, which the kernel manages. Reported, never placed.
     pub file: BTreeMap<u32, u64>,
-    /// Of `file`, bytes per node in mappings where some page is also mapped
-    /// by another process (`mapmax` above 1): `mbind` can't move those.
-    pub file_shared: BTreeMap<u32, u64>,
     /// Anonymous memory (allocations, stacks), per node.
     pub anon: BTreeMap<u32, u64>,
 }
@@ -493,12 +491,6 @@ pub fn split_numa_maps(text: &str, file: &str) -> MapsSplit {
             .find_map(|t| t.strip_prefix("kernelpagesize_kB="))
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(4);
-        let shared = toks
-            .iter()
-            .find_map(|t| t.strip_prefix("mapmax="))
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1)
-            > 1;
         for t in &toks {
             if let Some(rest) = t.strip_prefix('N')
                 && let Some((n, pages)) = rest.split_once('=')
@@ -507,9 +499,6 @@ pub fn split_numa_maps(text: &str, file: &str) -> MapsSplit {
                 let b = pages * page_kb * 1024;
                 if is_file {
                     *out.file.entry(n).or_insert(0) += b;
-                    if shared {
-                        *out.file_shared.entry(n).or_insert(0) += b;
-                    }
                 } else {
                     *out.anon.entry(n).or_insert(0) += b;
                 }
@@ -517,73 +506,6 @@ pub fn split_numa_maps(text: &str, file: &str) -> MapsSplit {
         }
     }
     out
-}
-
-const MPOL_MF_MOVE: libc::c_ulong = 1 << 1;
-const MADV_POPULATE_READ: libc::c_int = 22;
-
-/// Move the model file's cached pages that this process maps onto `node`, and
-/// make later faults of the mapping prefer it. Page cache pages stay on
-/// whichever node first read them, whatever the memory policy says, so this
-/// is what makes the file's in-RAM share be on the socket. Pages that are in
-/// the page cache but not yet mapped are mapped first (no I/O: only the
-/// resident runs). Pages also mapped by another process are skipped by the
-/// kernel (that needs CAP_SYS_NICE), so the caller re-measures.
-/// Returns the first error (errno) from `mbind`.
-pub fn migrate_file(path: &Path, node: u32) -> Result<(), i32> {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    let mask = node_mask(node);
-    let mut err = None;
-    for (start, end, _) in aie_llama::residency::mappings(path) {
-        let len = end - start;
-        let pages = len / page;
-        let mut vec = vec![0u8; pages];
-        let ok = unsafe { libc::mincore(start as *mut libc::c_void, len, vec.as_mut_ptr()) } == 0;
-        if !ok {
-            continue;
-        }
-        let mut i = 0;
-        while i < pages {
-            if vec[i] & 1 == 0 {
-                i += 1;
-                continue;
-            }
-            let mut j = i;
-            while j < pages && vec[j] & 1 == 1 {
-                j += 1;
-            }
-            let (a, l) = (start + i * page, (j - i) * page);
-            unsafe { libc::madvise(a as *mut libc::c_void, l, MADV_POPULATE_READ) };
-            let r = unsafe {
-                libc::syscall(
-                    libc::SYS_mbind,
-                    a,
-                    l,
-                    MPOL_PREFERRED,
-                    mask.as_ptr(),
-                    (mask.len() * 64) as libc::c_ulong,
-                    MPOL_MF_MOVE,
-                )
-            };
-            if r != 0 && err.is_none() {
-                err = Some(errno());
-            }
-            i = j;
-        }
-        // Whatever isn't cached yet is read later under the mapping's policy.
-        unsafe {
-            libc::syscall(
-                libc::SYS_mbind,
-                start,
-                len,
-                MPOL_PREFERRED,
-                mask.as_ptr(),
-                (mask.len() * 64) as libc::c_ulong,
-                0 as libc::c_ulong,
-            )
-        };
-    }
-    err.map_or(Ok(()), Err)
 }
 
 /// Estimated bytes per node of `len` bytes from `base`, by asking the kernel
@@ -639,10 +561,6 @@ pub struct Facts<'a> {
     /// Sockets (by node) any thread may run on that aren't `node`.
     pub other_sockets_allowed: &'a [u32],
     pub ram_tier_by_node: &'a BTreeMap<u32, u64>,
-    /// The model file's cached pages mapped by this process, per node, and
-    /// the part of them another process maps too.
-    pub file_by_node: &'a BTreeMap<u32, u64>,
-    pub file_shared_by_node: &'a BTreeMap<u32, u64>,
     /// Anonymous memory that isn't the RAM tier (KV cache, compute buffers,
     /// host-side allocations), per node.
     pub buffers_by_node: &'a BTreeMap<u32, u64>,
@@ -675,25 +593,6 @@ pub fn problems(f: &Facts) -> Vec<String> {
                 gb(*b)
             ));
         }
-    }
-    // The disk tier is the mapped model file; its cached pages are host memory
-    // this model claims for its socket.
-    for (n, b) in f.file_by_node {
-        if *n == sock || *b < (64 << 20) {
-            continue;
-        }
-        let shared = f.file_shared_by_node.get(n).copied().unwrap_or(0);
-        let why = if shared * 2 > *b {
-            format!(
-                "another process maps them too (likely another model using this file from socket {n}); one copy can't be on both sockets: put both models on one socket, or drop the cache (echo 1 | sudo tee /proc/sys/vm/drop_caches) with no model using the file"
-            )
-        } else {
-            "they couldn't be moved (read after the move, or the kernel refused)".to_string()
-        };
-        out.push(format!(
-            "{} of the disk tier's cached pages are on socket {n}, not socket {sock}: {why}",
-            gb(*b)
-        ));
     }
     let total: u64 = f.buffers_by_node.values().sum();
     let off: u64 = f
@@ -728,8 +627,10 @@ pub struct HostReport {
     pub ram_tier_exact: bool,
     /// All of this process's mapped memory per node (numa_maps).
     pub memory_by_node: BTreeMap<u32, u64>,
-    /// The disk tier's cached pages (the mapped model file) per node.
-    pub disk_tier_by_node: BTreeMap<u32, u64>,
+    /// The model file's pages in the page cache that this process maps, per
+    /// node. Reported only: the kernel manages the page cache, so where these
+    /// sit isn't part of the socket's promise.
+    pub file_cache_by_node: BTreeMap<u32, u64>,
     /// KV cache, compute buffers and other host allocations per node.
     pub host_buffers_by_node: BTreeMap<u32, u64>,
     pub problems: Vec<String>,
@@ -790,22 +691,9 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
         .map(|c| c.display().to_string())
         .unwrap_or_default();
     let read_maps = || std::fs::read_to_string("/proc/self/numa_maps").unwrap_or_default();
-    let mut text = read_maps();
-    let mut split = split_numa_maps(&text, &canon);
+    let text = read_maps();
+    let split = split_numa_maps(&text, &canon);
     let mut errors = Vec::new();
-    // The disk tier's cached pages are claimed for this socket: move any that
-    // are elsewhere, then look again.
-    let off_file = |s: &MapsSplit| s.file.iter().any(|(n, b)| *n != a.node && *b > 0);
-    if topo.multi() && off_file(&split) {
-        if let Err(e) = migrate_file(model, a.node) {
-            errors.push(format!(
-                "moving the disk tier's cached pages to socket {} failed (mbind errno {e})",
-                a.node
-            ));
-        }
-        text = read_maps();
-        split = split_numa_maps(&text, &canon);
-    }
     let memory = parse_numa_maps(&text);
     let mut buffers = split.anon.clone();
     for (n, b) in &tier {
@@ -822,8 +710,6 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
         multi: topo.multi(),
         other_sockets_allowed: &other,
         ram_tier_by_node: &tier,
-        file_by_node: &split.file,
-        file_shared_by_node: &split.file_shared,
         buffers_by_node: &buffers,
         errors: &errors,
     });
@@ -848,7 +734,7 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
         ram_tier_by_node: tier,
         ram_tier_exact: exact,
         memory_by_node: memory,
-        disk_tier_by_node: split.file,
+        file_cache_by_node: split.file,
         host_buffers_by_node: buffers,
         problems,
     }
@@ -1060,16 +946,12 @@ mod tests {
         let m = split_numa_maps(text, "/m.gguf");
         assert_eq!(m.file[&0], 4096);
         assert_eq!(m.file[&1], 4 * 4096);
-        assert_eq!(m.file_shared[&1], 2 * 4096);
-        assert!(!m.file_shared.contains_key(&0));
         assert_eq!(m.anon[&0], 6 * 4096);
         assert_eq!(m.anon[&1], 4 * 4096);
     }
 
     fn facts<'a>(
         tier: &'a BTreeMap<u32, u64>,
-        file: &'a BTreeMap<u32, u64>,
-        shared: &'a BTreeMap<u32, u64>,
         bufs: &'a BTreeMap<u32, u64>,
         errors: &'a [String],
     ) -> Facts<'a> {
@@ -1078,8 +960,6 @@ mod tests {
             multi: true,
             other_sockets_allowed: &[],
             ram_tier_by_node: tier,
-            file_by_node: file,
-            file_shared_by_node: shared,
             buffers_by_node: bufs,
             errors,
         }
@@ -1089,10 +969,9 @@ mod tests {
     fn problems_name_what_is_claimed_and_wrong() {
         let none = BTreeMap::new();
         let tier: BTreeMap<u32, u64> = [(0, 6_000_000_000), (1, 4_100_000_000)].into();
-        let file: BTreeMap<u32, u64> = [(0, 1_000_000_000), (1, 600_000_000)].into();
         let bufs: BTreeMap<u32, u64> = [(0, 1_000_000_000), (1, 900_000_000)].into();
         let errs = ["sched_setaffinity failed (errno 1)".to_string()];
-        let mut f = facts(&tier, &file, &none, &bufs, &errs);
+        let mut f = facts(&tier, &bufs, &errs);
         f.other_sockets_allowed = &[1];
         let p = problems(&f);
         assert!(
@@ -1101,32 +980,17 @@ mod tests {
         );
         assert!(p.iter().any(|s| s.contains("may run on socket 1")), "{p:?}");
         assert!(
-            p.iter().any(|s| s.starts_with(
-                "0.6 GB of the disk tier's cached pages are on socket 1, not socket 0"
-            )),
-            "{p:?}"
-        );
-        assert!(
             p.iter()
                 .any(|s| s.contains("0.9 GB of the host-side buffers")),
             "{p:?}"
         );
         assert!(p.iter().any(|s| s.contains("sched_setaffinity")), "{p:?}");
-        // pages another process maps too are named as shared
-        let shared: BTreeMap<u32, u64> = [(1, 600_000_000)].into();
-        let p = problems(&facts(&none, &file, &shared, &none, &[]));
-        assert!(
-            p.iter().any(|s| s.contains("another process maps them")),
-            "{p:?}"
-        );
-        // strays and unclaimed things are not problems: under 1% of the tier,
-        // a few MiB of file pages, other mappings' memory
+        // strays aren't problems: under 1% of the tier
         let tier: BTreeMap<u32, u64> = [(0, 10_000_000_000), (1, 10_000_000)].into();
-        let file: BTreeMap<u32, u64> = [(1, 10_000_000)].into();
-        let p = problems(&facts(&tier, &file, &none, &none, &[]));
+        let p = problems(&facts(&tier, &none, &[]));
         assert!(p.is_empty(), "{p:?}");
         // one socket: never a problem, whatever is measured
-        let mut f = facts(&tier, &file, &none, &none, &errs);
+        let mut f = facts(&tier, &none, &errs);
         f.multi = false;
         assert!(problems(&f).is_empty());
     }
