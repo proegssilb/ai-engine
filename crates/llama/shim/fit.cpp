@@ -61,3 +61,28 @@ extern "C" int aie_measure(const char * model_path, const llama_model_params * m
         return -1;
     }
 }
+
+// The same breakdown for a live context: what this context really allocated,
+// per device and on the host. Returns the row count, or -1 on failure.
+extern "C" int aie_ctx_breakdown(const llama_context * ctx, aie_mem_row * rows, int max_rows) {
+    try {
+        auto r = common_memory_breakdown_rows(ctx);
+        int n = 0;
+        for (const auto & x : r) {
+            if (n >= max_rows) {
+                break;
+            }
+            aie_mem_row & o = rows[n++];
+            snprintf(o.name, sizeof(o.name), "%s", x.name.c_str());
+            o.kind    = (int32_t) x.kind;
+            o.total   = (uint64_t) x.total;
+            o.free    = (uint64_t) x.free;
+            o.model   = (uint64_t) x.model;
+            o.context = (uint64_t) x.context;
+            o.compute = (uint64_t) x.compute;
+        }
+        return n;
+    } catch (...) {
+        return -1;
+    }
+}

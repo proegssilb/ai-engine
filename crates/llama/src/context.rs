@@ -193,6 +193,11 @@ impl Context {
         &self.model
     }
 
+    /// What this context really allocated, per device and on the host.
+    pub fn memory_breakdown(&self) -> Vec<crate::fit::Measured> {
+        crate::fit::breakdown(self.ptr.as_ptr())
+    }
+
     pub fn n_ctx(&self) -> u32 {
         unsafe { sys::llama_n_ctx(self.ptr.as_ptr()) }
     }

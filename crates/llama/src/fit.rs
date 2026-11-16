@@ -26,6 +26,7 @@ unsafe extern "C" {
         rows: *mut MemRow,
         max_rows: i32,
     ) -> i32;
+    fn aie_ctx_breakdown(ctx: *const sys::llama_context, rows: *mut MemRow, max_rows: i32) -> i32;
 }
 
 /// llama.cpp's fit and dry run swap the global logger and restore whatever
@@ -106,8 +107,11 @@ pub fn measure(
             crate::log::tail(6)
         )));
     }
-    Ok(rows[..n as usize]
-        .iter()
+    Ok(convert(&rows[..n as usize]))
+}
+
+fn convert(rows: &[MemRow]) -> Vec<Measured> {
+    rows.iter()
         .map(|r| Measured {
             name: unsafe { CStr::from_ptr(r.name.as_ptr()) }
                 .to_string_lossy()
@@ -124,7 +128,29 @@ pub fn measure(
             context: r.context,
             compute: r.compute,
         })
-        .collect())
+        .collect()
+}
+
+/// What a live context really allocated, per device and on the host: the
+/// same rows as [`measure`], but read from the allocated buffers.
+pub fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
+    let mut rows = vec![
+        MemRow {
+            name: [0; 128],
+            kind: 0,
+            total: 0,
+            free: 0,
+            model: 0,
+            context: 0,
+            compute: 0
+        };
+        64
+    ];
+    let n = unsafe { aie_ctx_breakdown(ctx, rows.as_mut_ptr(), rows.len() as i32) };
+    if n < 0 {
+        return Vec::new();
+    }
+    convert(&rows[..n as usize])
 }
 
 /// What llama.cpp's fit chose.

@@ -150,6 +150,55 @@ pub fn pci_node(root: &Path, pci_bus_id: &str) -> u32 {
     .map_or(0, |n| n as u32)
 }
 
+/// The NUMA node of a PCI device, or `None` when the kernel doesn't know
+/// (`-1`, no file). Unlike [`pci_node`] this never guesses.
+pub fn pci_node_opt(root: &Path, pci_bus_id: &str) -> Option<u32> {
+    read_node(
+        &root
+            .join("sys/bus/pci/devices")
+            .join(pci_bus_id)
+            .join("numa_node"),
+    )
+}
+
+/// A sysfs `numa_node` file's value; `-1` (unknown) and unreadable are `None`.
+fn read_node(file: &Path) -> Option<u32> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u32)
+}
+
+/// The NUMA node of the block device `major:minor` (what a store's filesystem
+/// sits on). A partition or an NVMe namespace has no `numa_node` of its own:
+/// the walk goes up through its parents (the disk, the controller, the PCI
+/// device) and takes the first `numa_node` file that exists. `None` if there
+/// is none or the first one says unknown (`-1`).
+pub fn block_node(root: &Path, major: u32, minor: u32) -> Option<u32> {
+    let link = root.join(format!("sys/dev/block/{major}:{minor}"));
+    let mut dir = std::fs::canonicalize(&link).ok()?;
+    let top = std::fs::canonicalize(root.join("sys")).ok()?;
+    while dir.starts_with(&top) && dir != top {
+        for f in [dir.join("device/numa_node"), dir.join("numa_node")] {
+            if f.is_file() {
+                return read_node(&f);
+            }
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+    None
+}
+
+/// The node of the block device holding `path`, from its `st_dev`.
+pub fn path_node(root: &Path, path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    block_node(root, libc::major(dev), libc::minor(dev))
+}
+
 /// Why a node was picked, and which.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Choice {
@@ -633,6 +682,13 @@ pub struct HostReport {
     pub file_cache_by_node: BTreeMap<u32, u64>,
     /// KV cache, compute buffers and other host allocations per node.
     pub host_buffers_by_node: BTreeMap<u32, u64>,
+    /// `host_buffers_by_node` told apart: the KV cache, the compute scratch
+    /// (both sized by llama.cpp's own breakdown of the live context, and
+    /// counted only as far as measured resident on that node), and the rest
+    /// of the worker's host allocations.
+    pub kv_cache_by_node: BTreeMap<u32, u64>,
+    pub compute_by_node: BTreeMap<u32, u64>,
+    pub other_buffers_by_node: BTreeMap<u32, u64>,
     pub problems: Vec<String>,
 }
 
@@ -655,8 +711,48 @@ pub struct Policy {
     pub error: Option<String>,
 }
 
+/// What llama.cpp's breakdown of the live context says it allocated on the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostAlloc {
+    pub kv_cache: u64,
+    pub compute: u64,
+}
+
+/// Per node: the KV cache, the compute scratch and everything else, out of the
+/// measured host buffers. The chosen node is filled first (that is where they
+/// were allocated); a node never gets more than was measured on it.
+pub fn attribute(
+    buffers: &BTreeMap<u32, u64>,
+    node: u32,
+    alloc: HostAlloc,
+) -> [BTreeMap<u32, u64>; 3] {
+    let (mut kv, mut cp, mut other) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let (mut kv_left, mut cp_left) = (alloc.kv_cache, alloc.compute);
+    let mut order: Vec<u32> = buffers.keys().copied().collect();
+    order.sort_by_key(|n| (*n != node, *n));
+    for n in order {
+        let mut avail = buffers[&n];
+        let k = kv_left.min(avail);
+        avail -= k;
+        let c = cp_left.min(avail);
+        avail -= c;
+        kv_left -= k;
+        cp_left -= c;
+        kv.insert(n, k);
+        cp.insert(n, c);
+        other.insert(n, avail);
+    }
+    [kv, cp, other]
+}
+
 /// Measure now. `threads` is what llama.cpp was told to use.
-pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostReport {
+pub fn report(
+    topo: &Topology,
+    a: &Applied,
+    threads: i32,
+    model: &Path,
+    alloc: HostAlloc,
+) -> HostReport {
     // Every thread's affinity, not just this one's.
     let mut cpus: Vec<u32> = thread_ids().into_iter().flat_map(affinity_of).collect();
     cpus.sort();
@@ -713,6 +809,7 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
         buffers_by_node: &buffers,
         errors: &errors,
     });
+    let [kv, cp, other] = attribute(&buffers, a.node, alloc);
     HostReport {
         node: a.node,
         auto: a.auto,
@@ -735,6 +832,9 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
         ram_tier_exact: exact,
         memory_by_node: memory,
         file_cache_by_node: split.file,
+        kv_cache_by_node: kv,
+        compute_by_node: cp,
+        other_buffers_by_node: other,
         host_buffers_by_node: buffers,
         problems,
     }
@@ -742,7 +842,13 @@ pub fn report(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> HostR
 
 /// [`report`] as JSON, at most every two seconds: it walks the process's page
 /// tables, and the UI polls.
-pub fn report_json(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> String {
+pub fn report_json(
+    topo: &Topology,
+    a: &Applied,
+    threads: i32,
+    model: &Path,
+    alloc: HostAlloc,
+) -> String {
     static CACHE: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
     let mut c = CACHE.lock().unwrap();
     if let Some((t, s)) = c.as_ref()
@@ -750,7 +856,7 @@ pub fn report_json(topo: &Topology, a: &Applied, threads: i32, model: &Path) -> 
     {
         return s.clone();
     }
-    let s = serde_json::to_string(&report(topo, a, threads, model)).unwrap_or_default();
+    let s = serde_json::to_string(&report(topo, a, threads, model, alloc)).unwrap_or_default();
     *c = Some((std::time::Instant::now(), s.clone()));
     s
 }
@@ -1041,12 +1147,78 @@ mod tests {
         };
         let a = apply(&real, &choice).unwrap();
         assert!(!a.cpus.is_empty());
-        let r = report(&real, &a, default_threads(&a), Path::new("/nonexistent"));
+        let r = report(
+            &real,
+            &a,
+            default_threads(&a),
+            Path::new("/nonexistent"),
+            HostAlloc::default(),
+        );
         assert_eq!(r.node, n0);
         assert!(r.affinity.on_node, "{:?}", r.affinity);
         assert!(r.problems.is_empty() || real.multi(), "{:?}", r.problems);
         for (t, cpus) in before {
             let _ = set_affinity(t, &cpus);
         }
+    }
+
+    #[test]
+    fn attributes_host_buffers_to_kv_scratch_and_rest() {
+        let bufs: BTreeMap<u32, u64> = [(0, 100), (1, 1000)].into();
+        let alloc = HostAlloc {
+            kv_cache: 300,
+            compute: 200,
+        };
+        // chosen node 1 first: 300 + 200 fit there, the other 500 are "other"
+        let [kv, cp, other] = attribute(&bufs, 1, alloc);
+        assert_eq!((kv[&1], cp[&1], other[&1]), (300, 200, 500));
+        assert_eq!((kv[&0], cp[&0], other[&0]), (0, 0, 100));
+        // less measured than allocated: counted only as far as measured
+        let bufs: BTreeMap<u32, u64> = [(0, 250)].into();
+        let [kv, cp, other] = attribute(&bufs, 0, alloc);
+        assert_eq!((kv[&0], cp[&0], other[&0]), (250, 0, 0));
+    }
+
+    #[test]
+    fn block_node_walks_up_from_a_partition_or_namespace() {
+        let dir = tempdir::Dir::new();
+        let root = dir.path();
+        let w = |p: &str, c: &str| {
+            let f = root.join(p);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(f, c).unwrap();
+        };
+        let link = |target: &str, name: &str| {
+            let l = root.join(name);
+            fs::create_dir_all(l.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(root.join(target), l).unwrap();
+        };
+        // sda1 -> sda, whose device/ has numa_node 1
+        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1")).unwrap();
+        w("sys/devices/pci0000:00/0000:00:1f.2/block/sda/device/numa_node", "1\n");
+        link("sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1", "sys/dev/block/8:1");
+        link("sys/devices/pci0000:00/0000:00:1f.2/block/sda", "sys/dev/block/8:0");
+        assert_eq!(block_node(root, 8, 1), Some(1));
+        assert_eq!(block_node(root, 8, 0), Some(1));
+        // NVMe namespace: only the PCI device up the tree knows
+        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2")).unwrap();
+        w("sys/devices/pci0000:00/0000:00:04.0/numa_node", "0\n");
+        link("sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2", "sys/dev/block/259:2");
+        assert_eq!(block_node(root, 259, 2), Some(0));
+        // unknown (-1) is unknown, not node 0
+        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda")).unwrap();
+        w("sys/devices/pci0000:00/0000:00:05.0/numa_node", "-1\n");
+        link("sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda", "sys/dev/block/252:0");
+        assert_eq!(block_node(root, 252, 0), None);
+        // no such device
+        assert_eq!(block_node(root, 1, 1), None);
+    }
+
+    #[test]
+    fn pci_node_opt_never_guesses() {
+        let (dir, _) = two_sockets();
+        assert_eq!(pci_node_opt(dir.path(), "0000:af:00.0"), Some(1));
+        assert_eq!(pci_node_opt(dir.path(), "0000:5e:00.0"), None);
+        assert_eq!(pci_node_opt(dir.path(), "0000:ff:00.0"), None);
     }
 }

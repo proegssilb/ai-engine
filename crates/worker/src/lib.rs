@@ -65,7 +65,8 @@ pub fn probe() -> serde_json::Value {
     let devices: Vec<serde_json::Value> = aie_llama::devices()
         .into_iter()
         .map(|d| {
-            let node = d.pci_bus_id.as_deref().map(|p| numa::pci_node(Path::new("/"), p));
+            // unknown stays unknown here: the UI decides where such a device goes
+            let node = d.pci_bus_id.as_deref().and_then(|p| numa::pci_node_opt(Path::new("/"), p));
             serde_json::json!({ "name": d.name, "description": d.description, "total": d.total, "free": d.free, "gpu": d.is_gpu, "pci_bus_id": d.pci_bus_id, "numa_node": node })
         })
         .collect();
@@ -166,6 +167,8 @@ struct Loaded {
     host: numa::Applied,
     topo: numa::Topology,
     threads: i32,
+    /// What llama.cpp allocated on the host for this context (KV cache, scratch).
+    host_alloc: numa::HostAlloc,
 }
 
 #[derive(Default)]
@@ -304,7 +307,30 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
 
     let ctx = Context::new(model.clone(), context.clone()).map_err(|e| e.to_string())?;
     // Measure where things landed; on several sockets, say what isn't where promised.
-    let hr = numa::report(&topo, &host, threads, &cfg.model);
+    // What the live context really allocated, per device and on the host.
+    // The table the UI shows is this, with the free memory the dry run saw
+    // before the load.
+    let mut live = ctx.memory_breakdown();
+    for row in &mut live {
+        if let Some(m) = measured.iter().find(|m| m.name == row.name) {
+            row.total = m.total;
+            row.free = m.free;
+        }
+    }
+    let host_alloc = live
+        .iter()
+        .find(|r| r.kind == "host")
+        .map(|r| numa::HostAlloc {
+            kv_cache: r.context,
+            compute: r.compute,
+        })
+        .unwrap_or_default();
+    let memory_json = if live.is_empty() {
+        memory_json
+    } else {
+        serde_json::to_string(&live).map_err(|e| e.to_string())?
+    };
+    let hr = numa::report(&topo, &host, threads, &cfg.model, host_alloc);
     for p in &hr.problems {
         if !warnings.contains(p) {
             warnings.push(p.clone());
@@ -333,6 +359,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
         host,
         topo,
         threads,
+        host_alloc,
     })
 }
 
@@ -375,6 +402,7 @@ impl Worker for Service {
             &self.0.host,
             self.0.threads,
             self.0.model.path(),
+            self.0.host_alloc,
         );
         st.disk_tier_resident =
             aie_llama::residency::resident_file_bytes(self.0.model.path(), &self.0.disk_ranges);

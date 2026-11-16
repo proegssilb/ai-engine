@@ -86,6 +86,33 @@ pub fn gpu_bytes(w: &Worker) -> u64 {
         .sum()
 }
 
+/// Bytes per subsystem per tier key, as a plan puts them.
+fn planned_by_subsystem(a: &Anatomy, plan: &Plan) -> BTreeMap<String, BTreeMap<String, u64>> {
+    let mut by_sub: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    for part in &a.parts {
+        if let Some(t) = plan.tensors.get(&part.name) {
+            *by_sub
+                .entry(part.subsystem.label().to_string())
+                .or_default()
+                .entry(tier_key(t))
+                .or_default() += part.bytes;
+        }
+    }
+    by_sub
+}
+
+/// How many GPUs an intent mentions (the daemon has no CUDA to ask).
+fn intent_gpus(i: &Intent) -> u32 {
+    let gpu = |t: &Tier| if let Tier::Gpu(g) = t { Some(g + 1) } else { None };
+    i.layers
+        .iter()
+        .chain(i.subsystems.values().flatten())
+        .filter_map(|s| gpu(&s.tier))
+        .chain([i.embeddings, i.output].into_iter().flatten().filter_map(|t| gpu(&t)))
+        .max()
+        .unwrap_or(0)
+}
+
 pub async fn get_placement(
     st: State,
     Query(q): Query<ModelQuery>,
@@ -111,22 +138,21 @@ pub async fn get_placement(
         "intent": st.0.saved_intent(&r.name)?,
         "loaded": Value::Null,
     });
+    // A saved placement that isn't loaded: where it would put each subsystem.
+    if let Some(i) = st.0.saved_intent(&r.name)?
+        && st.0.workers.get(&r.name).await.is_none()
+        && let Ok(plan) = aie_plan::plan(&a, &i, intent_gpus(&i))
+    {
+        out["intended"] = json!(planned_by_subsystem(&a, &plan));
+    }
     if let Some(w) = st.0.workers.get(&r.name).await {
         let plan: Option<Plan> = serde_json::from_str(&w.status.plan_json).ok();
         let report: Option<Value> = serde_json::from_str(&w.status.placement_json).ok();
         // per-subsystem bytes per tier, as planned
-        let mut by_sub: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
-        if let Some(p) = &plan {
-            for part in &a.parts {
-                if let Some(t) = p.tensors.get(&part.name) {
-                    *by_sub
-                        .entry(part.subsystem.label().to_string())
-                        .or_default()
-                        .entry(tier_key(t))
-                        .or_default() += part.bytes;
-                }
-            }
-        }
+        let by_sub = plan
+            .as_ref()
+            .map(|p| planned_by_subsystem(&a, p))
+            .unwrap_or_default();
         // The expert cache follows the layer split; users can't place it.
         let expert_cache: Vec<Value> = plan
             .as_ref()
@@ -172,31 +198,7 @@ pub async fn put_placement(st: State, Body(r): Body<PutReq>) -> Result<Json<Valu
         // load. The GPU count isn't known in the daemon (no CUDA here), so
         // allow as many GPUs as the intent mentions.
         let a = anatomy(&res.path)?;
-        let gpus = i
-            .layers
-            .iter()
-            .chain(i.subsystems.values().flatten())
-            .filter_map(|s| {
-                if let Tier::Gpu(g) = s.tier {
-                    Some(g + 1)
-                } else {
-                    None
-                }
-            })
-            .chain(
-                [i.embeddings, i.output]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|t| {
-                        if let Tier::Gpu(g) = t {
-                            Some(g + 1)
-                        } else {
-                            None
-                        }
-                    }),
-            )
-            .max()
-            .unwrap_or(0);
+        let gpus = intent_gpus(i);
         aie_plan::plan(&a, i, gpus).map_err(|e| ApiError::bad_request(e.to_string()))?;
         // The socket must exist here (the daemon reads the same sysfs the workers do).
         let topo = aie_worker::numa::Topology::read(std::path::Path::new("/"));
@@ -259,7 +261,9 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
             .roots()
             .map(|p| {
                 let (free, total) = disk(p).unwrap_or((0, 0));
-                json!({ "path": p, "total": total, "free": free })
+                // the socket its block device hangs off; null when unknown
+                let node = aie_worker::numa::path_node(std::path::Path::new("/"), p);
+                json!({ "path": p, "total": total, "free": free, "numa_node": node })
             })
             .collect();
     v["disk"] = disks[0].clone();
@@ -285,7 +289,17 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
                 .map(|r| r.display().to_string());
         // the live host report: socket, affinity, RAM tier per node
         let host = live_stats(&w).await["host"].clone();
-        models.push(json!({ "model": w.name, "bytes_by_tier": by, "misplaced": w.status.misplaced, "store": store, "host": host }));
+        models.push(json!({
+            "model": w.name,
+            "bytes_by_tier": by,
+            "planned": planned_by_subsystem(&a, &plan),
+            // what the live context allocated per device and on the host
+            "memory": serde_json::from_str::<Value>(&w.status.memory_json).unwrap_or(Value::Null),
+            "n_ctx": w.n_ctx,
+            "misplaced": w.status.misplaced,
+            "store": store,
+            "host": host,
+        }));
     }
     v["models"] = json!(models);
     // RAM over the last minute (latest, min, max), for the fuzzy RAM bar.

@@ -1,11 +1,13 @@
 //! A rolling picture of host memory for the machine view's RAM bar.
 //!
 //! Every 2 s the daemon reads /proc/meminfo (and each NUMA node's meminfo on
-//! multi-socket machines) and how much memory its own processes hold: the
-//! daemon and one worker per loaded model. It keeps 60 s of samples and
-//! reports the latest value plus the window's min and max for each quantity.
-//! The UI draws the bar with fuzzy edges between segments whose width is that
-//! spread, so a value that jumps about looks blurred and a steady one sharp.
+//! multi-socket machines) and asks each worker what it holds, measured
+//! exactly per node: the RAM tier's weights, the KV cache and the compute
+//! scratch. Those are "ours" and drawn sharp. The daemon's own memory is not
+//! the models', so it stays in "other", like every other process. The
+//! window keeps 60 s of samples and reports the latest value plus the min and
+//! max for each quantity; the UI draws the borders of the segments that are
+//! not exact (free, other, the kernel's cache) blurred by that spread.
 //! The point is to show what placement choices cost (page cache the OS gives
 //! up, memory other processes hold), not to limit anything.
 //!
@@ -59,76 +61,52 @@ pub fn parse_meminfo(text: &str) -> Meminfo {
     m
 }
 
-/// Memory a process holds that is not a file mapping: `RssAnon + RssShmem`
-/// from /proc/PID/status. File-backed pages (the mapped model file, the
-/// binary) are page cache already counted in the cache segment, so counting
-/// them here would show them twice.
-pub fn parse_own_rss(status: &str) -> u64 {
-    let kb = |key: &str| -> u64 {
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix(key))
-            .and_then(|v| v.split_whitespace().next()?.parse().ok())
-            .unwrap_or(0)
-    };
-    (kb("RssAnon:") + kb("RssShmem:")) * 1024
-}
-
-/// Anonymous memory per NUMA node from /proc/PID/numa_maps: mappings with no
-/// `file=` and some `anon=` pages, counting each node's `N<i>=pages`.
-pub fn parse_numa_maps_anon(text: &str) -> BTreeMap<u32, u64> {
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let mut anon = false;
-        let mut file = false;
-        let mut page = 4096u64;
-        let mut nodes = Vec::new();
-        for tok in line.split_whitespace().skip(2) {
-            if tok.starts_with("file=") {
-                file = true;
-            } else if tok.starts_with("anon=") || tok == "heap" || tok == "stack" {
-                anon = true;
-            } else if let Some(kb) = tok.strip_prefix("kernelpagesize_kB=") {
-                page = kb.parse::<u64>().unwrap_or(4) * 1024;
-            } else if let Some((n, pages)) = tok.strip_prefix('N').and_then(|t| t.split_once('='))
-                && let (Ok(n), Ok(p)) = (n.parse::<u32>(), pages.parse::<u64>())
-            {
-                nodes.push((n, p));
-            }
-        }
-        if anon && !file {
-            for (n, p) in nodes {
-                *out.entry(n).or_default() += p * page;
-            }
-        }
-    }
-    out
-}
-
 /// One process's (or model's) share of a box.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ModelMem {
-    /// Model name; empty for the daemon itself.
     model: String,
-    ours: u64,
+    /// The RAM tier's weights, as measured on this node.
+    weights: u64,
+    /// KV cache on this node.
+    kv: u64,
+    /// Compute scratch on this node.
+    scratch: u64,
     disk_tier_bytes: u64,
     disk_resident: u64,
 }
 
-/// What one of our processes holds, as read from /proc.
-struct Held {
-    model: String,
-    rss: u64,
-    per_node: BTreeMap<u32, u64>,
-    disk: u64,
-    resident: u64,
-    /// Where the model file's cached pages measurably are (the worker's report).
-    file_by_node: BTreeMap<u32, u64>,
+impl ModelMem {
+    /// Everything of the model that is its own memory (not page cache).
+    fn ours(&self) -> u64 {
+        self.weights + self.kv + self.scratch
+    }
 }
 
-/// A worker as the sampler sees it: model, pid, disk-tier bytes, how much of
-/// it is in RAM, and the model file's cached pages per node.
-type Proc = (String, Option<u32>, u64, u64, BTreeMap<u32, u64>);
+/// A worker as the sampler sees it, from its status.
+#[derive(Clone, Debug, Default)]
+struct Proc {
+    model: String,
+    /// Disk-tier bytes and how much of them is in RAM (mincore over the
+    /// disk tier's own byte ranges).
+    disk: u64,
+    resident: u64,
+    /// Where the model file's cached pages measurably are. Used only to say
+    /// which socket the disk tier's resident share belongs to.
+    file_by_node: BTreeMap<u32, u64>,
+    /// The worker's exact measurements per node.
+    tier_by_node: BTreeMap<u32, u64>,
+    kv_by_node: BTreeMap<u32, u64>,
+    compute_by_node: BTreeMap<u32, u64>,
+}
+
+fn node_map(h: &Value, key: &str) -> BTreeMap<u32, u64> {
+    h.get(key)
+        .and_then(|v| serde_json::from_value::<BTreeMap<String, u64>>(v.clone()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| Some((k.parse().ok()?, v)))
+        .collect()
+}
 
 /// One box (all RAM, or one NUMA node) at one instant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +131,7 @@ struct Segments {
 impl BoxSample {
     fn segments(&self) -> Segments {
         let m = &self.mem;
-        let ours: u64 = self.models.iter().map(|x| x.ours).sum();
+        let ours: u64 = self.models.iter().map(|x| x.ours()).sum();
         let cache = (m.cached + m.buffers).saturating_sub(m.shmem);
         let other = m
             .total
@@ -216,26 +194,21 @@ impl Sampler {
                 w.client().status(aie_proto::worker::StatusRequest {}),
             )
             .await;
-            let (bytes, resident, by_node) = match st {
-                Ok(Ok(r)) => {
-                    let r = r.into_inner();
-                    let by_node = serde_json::from_str::<Value>(&r.host_json)
-                        .ok()
-                        .and_then(|h| {
-                            serde_json::from_value::<BTreeMap<String, u64>>(
-                                h.get("file_cache_by_node")?.clone(),
-                            )
-                            .ok()
-                        })
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|(k, v)| Some((k.parse().ok()?, v)))
-                        .collect();
-                    (r.disk_tier_bytes, r.disk_tier_resident, by_node)
-                }
-                _ => (0, 0, BTreeMap::new()),
+            let mut p = Proc {
+                model: w.name.clone(),
+                ..Default::default()
             };
-            procs.push((w.name.clone(), w.pid().await, bytes, resident, by_node));
+            if let Ok(Ok(r)) = st {
+                let r = r.into_inner();
+                let h: Value = serde_json::from_str(&r.host_json).unwrap_or(Value::Null);
+                p.disk = r.disk_tier_bytes;
+                p.resident = r.disk_tier_resident;
+                p.file_by_node = node_map(&h, "file_cache_by_node");
+                p.tier_by_node = node_map(&h, "ram_tier_by_node");
+                p.kv_by_node = node_map(&h, "kv_cache_by_node");
+                p.compute_by_node = node_map(&h, "compute_by_node");
+            }
+            procs.push(p);
         }
         let sample = tokio::task::spawn_blocking(move || read_sample(Path::new("/"), &procs))
             .await
@@ -288,7 +261,10 @@ fn box_json<'a>(node: Option<u32>, boxes: impl Iterator<Item = &'a BoxSample> + 
             };
             json!({
                 "model": m.model,
-                "ours": stat(mine().map(|x| x.ours)),
+                "ours": stat(mine().map(|x| x.ours())),
+                "weights": stat(mine().map(|x| x.weights)),
+                "kv": stat(mine().map(|x| x.kv)),
+                "scratch": stat(mine().map(|x| x.scratch)),
                 "disk_tier_bytes": m.disk_tier_bytes,
                 "disk_tier_resident": stat(mine().map(|x| x.disk_resident)),
             })
@@ -321,8 +297,8 @@ fn read(path: impl AsRef<Path>) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Read one sample from `root` (`/`; a fake tree in tests). `procs` is each
-/// worker's model, pid, disk-tier bytes and how much of it is in RAM.
+/// Read one sample from `root` (`/`; a fake tree in tests). `procs` is what
+/// each worker reported.
 fn read_sample(root: &Path, procs: &[Proc]) -> Sample {
     let node_dir = root.join("sys/devices/system/node");
     let mut node_ids: Vec<u32> = std::fs::read_dir(&node_dir)
@@ -334,45 +310,17 @@ fn read_sample(root: &Path, procs: &[Proc]) -> Sample {
     node_ids.sort_unstable();
     let multi = node_ids.len() > 1;
 
-    let mut ours: Vec<Held> = Vec::new();
-    let mut add = |model: String, pid: String, disk: u64, resident: u64, file_by_node| {
-        let proc = root.join("proc").join(pid);
-        let rss = parse_own_rss(&read(proc.join("status")));
-        let per_node = if multi {
-            parse_numa_maps_anon(&read(proc.join("numa_maps")))
-        } else {
-            BTreeMap::new()
-        };
-        ours.push(Held {
-            model,
-            rss,
-            per_node,
-            disk,
-            resident,
-            file_by_node,
-        });
-    };
-    add(String::new(), "self".into(), 0, 0, BTreeMap::new());
-    for (model, pid, disk, resident, by_node) in procs {
-        if let Some(pid) = pid {
-            add(
-                model.clone(),
-                pid.to_string(),
-                *disk,
-                *resident,
-                by_node.clone(),
-            );
-        }
-    }
-
+    let sum = |m: &BTreeMap<u32, u64>| m.values().sum::<u64>();
     let mem = parse_meminfo(&read(root.join("proc/meminfo")));
-    let models = ours
+    let models = procs
         .iter()
-        .map(|h| ModelMem {
-            model: h.model.clone(),
-            ours: h.rss,
-            disk_tier_bytes: h.disk,
-            disk_resident: h.resident,
+        .map(|p| ModelMem {
+            model: p.model.clone(),
+            weights: sum(&p.tier_by_node),
+            kv: sum(&p.kv_by_node),
+            scratch: sum(&p.compute_by_node),
+            disk_tier_bytes: p.disk,
+            disk_resident: p.resident,
         })
         .collect();
     let system = BoxSample { mem, models };
@@ -393,22 +341,27 @@ fn read_sample(root: &Path, procs: &[Proc]) -> Sample {
             .into_iter()
             .map(|(n, mem)| {
                 let node_share = cache(&mem) as f64 / total_cache.max(1) as f64;
-                let models = ours
+                let models = procs
                     .iter()
-                    .map(|h| {
+                    .map(|p| {
                         // The worker measures which node holds the model file's
                         // pages; without that, spread by each node's page cache.
-                        let measured: u64 = h.file_by_node.values().sum();
+                        // This only says whose socket the resident share is
+                        // reported under: it is the kernel's cache either way.
+                        let measured: u64 = sum(&p.file_by_node);
                         let share = if measured > 0 {
-                            h.file_by_node.get(&n).copied().unwrap_or(0) as f64 / measured as f64
+                            p.file_by_node.get(&n).copied().unwrap_or(0) as f64 / measured as f64
                         } else {
                             node_share
                         };
+                        let at = |m: &BTreeMap<u32, u64>| m.get(&n).copied().unwrap_or(0);
                         ModelMem {
-                            model: h.model.clone(),
-                            ours: h.per_node.get(&n).copied().unwrap_or(0),
-                            disk_tier_bytes: (h.disk as f64 * share) as u64,
-                            disk_resident: (h.resident as f64 * share) as u64,
+                            model: p.model.clone(),
+                            weights: at(&p.tier_by_node),
+                            kv: at(&p.kv_by_node),
+                            scratch: at(&p.compute_by_node),
+                            disk_tier_bytes: (p.disk as f64 * share) as u64,
+                            disk_resident: (p.resident as f64 * share) as u64,
                         }
                     })
                     .collect();
@@ -444,28 +397,14 @@ mod tests {
     }
 
     #[test]
-    fn own_rss_leaves_out_file_pages() {
-        let s = "Name:\tx\nRssAnon:\t   100 kB\nRssFile:\t  900 kB\nRssShmem:\t 5 kB\n";
-        assert_eq!(parse_own_rss(s), 105 * 1024);
-    }
-
-    #[test]
-    fn numa_maps_counts_anonymous_mappings_only() {
-        let t = "55d0 default heap anon=10 dirty=10 N0=6 N1=4 kernelpagesize_kB=4\n\
-                 7f00 default file=/m.gguf mapped=100 mapmax=1 N0=100 kernelpagesize_kB=4\n\
-                 7f10 bind:1 anon=2 dirty=2 N1=2 kernelpagesize_kB=2048\n";
-        let m = parse_numa_maps_anon(t);
-        assert_eq!(m[&0], 6 * 4096);
-        assert_eq!(m[&1], 4 * 4096 + 2 * 2048 * 1024);
-    }
-
-    #[test]
     fn segments_add_up_and_edges_are_cumulative() {
         let b = BoxSample {
             mem: parse_meminfo(MEMINFO),
             models: vec![ModelMem {
                 model: "m".into(),
-                ours: 200 * 1024,
+                weights: 150 * 1024,
+                kv: 30 * 1024,
+                scratch: 20 * 1024,
                 disk_tier_bytes: 0,
                 disk_resident: 0,
             }],
@@ -510,10 +449,6 @@ mod tests {
             std::fs::write(f, c).unwrap();
         };
         w("proc/meminfo", MEMINFO);
-        w("proc/self/status", "RssAnon: 10 kB\n");
-        w("proc/self/numa_maps", "1 default anon=2 N0=2\n");
-        w("proc/7/status", "RssAnon: 100 kB\n");
-        w("proc/7/numa_maps", "1 default anon=25 N0=5 N1=20\n");
         w(
             "sys/devices/system/node/node0/meminfo",
             "Node 0 MemTotal: 500 kB\nNode 0 FilePages: 100 kB\n",
@@ -522,18 +457,34 @@ mod tests {
             "sys/devices/system/node/node1/meminfo",
             "Node 1 MemTotal: 500 kB\nNode 1 FilePages: 300 kB\n",
         );
-        let s = read_sample(&d, &[("m".into(), Some(7), 1000, 400, BTreeMap::new())]);
-        assert_eq!(s.system.models.len(), 2);
+        let mut p = Proc {
+            model: "m".into(),
+            disk: 1000,
+            resident: 400,
+            tier_by_node: [(1, 7000), (0, 5)].into(),
+            kv_by_node: [(1, 300)].into(),
+            compute_by_node: [(1, 200)].into(),
+            ..Default::default()
+        };
+        let s = read_sample(&d, std::slice::from_ref(&p));
+        // the system box sums the nodes; only the model's own memory is ours
+        assert_eq!(s.system.models.len(), 1);
+        assert_eq!(s.system.models[0].ours(), 7005 + 300 + 200);
         assert_eq!(s.nodes.len(), 2);
         let n1 = &s.nodes[1].1;
-        assert_eq!(n1.models[1].ours, 20 * 4096);
-        // disk tier spread by page cache: node 1 holds 3/4
-        assert_eq!(n1.models[1].disk_resident, 300);
+        assert_eq!(
+            (n1.models[0].weights, n1.models[0].kv, n1.models[0].scratch),
+            (7000, 300, 200)
+        );
+        assert_eq!(s.nodes[0].1.models[0].ours(), 5);
+        // the disk tier's resident share is the kernel's cache, spread by
+        // each node's page cache: node 1 holds 3/4
+        assert_eq!(n1.models[0].disk_resident, 300);
         // with the worker's measurement, the split follows where the pages are
-        let by = [(0u32, 3u64), (1, 1)].into();
-        let s = read_sample(&d, &[("m".into(), Some(7), 1000, 400, by)]);
-        assert_eq!(s.nodes[0].1.models[1].disk_resident, 300);
-        assert_eq!(s.nodes[1].1.models[1].disk_resident, 100);
+        p.file_by_node = [(0u32, 3u64), (1, 1)].into();
+        let s = read_sample(&d, &[p]);
+        assert_eq!(s.nodes[0].1.models[0].disk_resident, 300);
+        assert_eq!(s.nodes[1].1.models[0].disk_resident, 100);
         std::fs::remove_dir_all(d).ok();
     }
 }
