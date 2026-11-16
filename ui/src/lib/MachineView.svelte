@@ -23,7 +23,7 @@
     selected: { model: string; sub: string | null } | null
     /** boxes the pending plan doesn't fit on: what it would need */
     over: Record<string, string>
-    /** used memory under the pending plan, for GPUs and disks (empty when nothing is pending) */
+    /** used memory under the pending plan, for GPUs (empty when nothing is pending) */
     projected: Record<string, number>
     onselect: (model: string, sub: string | null) => void
     /** a chip or a model was dropped on a box */

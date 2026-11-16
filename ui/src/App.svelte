@@ -123,10 +123,11 @@
   const view = $derived(machine ? buildView({ machine, tags: models, placements, catalog, pending: pendingPlans }) : null)
 
   /**
-   * Each GPU's and disk's used memory under the pending plan: what it holds now, minus what the
+   * Each GPU's used memory under the pending plan: what it holds now, minus what the
    * edited models hold there now, plus what the plan puts there (the same chips the boxes draw,
    * so header, bar and chips agree; for GPUs this is the check's total - available + need).
-   * RAM boxes already add up their own chips.
+   * RAM boxes already add up their own chips. Disks are not here: a disk's used space is the
+   * filesystem's, and moving a piece off the model file doesn't change it.
    */
   const projected = $derived.by((): Record<string, number> => {
     const out: Record<string, number> = {}
@@ -135,7 +136,7 @@
     if (!bv || !v || !dirtyNames.length) return out
     const held = (vw: typeof v, box: string) => (vw.chips[box] ?? []).filter((c) => dirtyNames.includes(c.model) && c.kind !== 'runs').reduce((sum, c) => sum + c.bytes, 0)
     for (const [k, b] of Object.entries(v.boxes)) {
-      if (b.kind === 'gpu' || b.kind === 'disk') out[k] = Math.max(0, (b.deviceUsed ?? 0) - held(bv, k) + held(v, k))
+      if (b.kind === 'gpu') out[k] = Math.max(0, (b.deviceUsed ?? 0) - held(bv, k) + held(v, k))
     }
     return out
   })
