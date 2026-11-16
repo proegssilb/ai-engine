@@ -5,19 +5,37 @@
   // doubling of capacity; the usage bars inside stay linear.
   import RamBar from './RamBar.svelte'
   import type { Machine } from './api'
+  import { dnd } from './dnd.svelte'
+  import { dropReason, type Subject } from './pending'
   import { amount, bigsize, boxHeight, pair, type Chip, type HwBox, type ModelView, type View } from './view'
 
   let {
     view,
     machine,
     selected,
+    over,
     onselect,
+    onmove,
   }: {
     view: View
     machine: Machine
     selected: { model: string; sub: string | null } | null
+    /** boxes the pending plan doesn't fit on: what it would need */
+    over: Record<string, string>
     onselect: (model: string, sub: string | null) => void
+    /** a chip or a model was dropped on a box */
+    onmove: (subject: Subject, model: string, fromBox: string | null, toBox: string) => void
   } = $props()
+
+  const boxInfo = $derived(Object.fromEntries(Object.entries(view.boxes).map(([k, b]) => [k, { kind: b.kind }])))
+  /** why the thing being dragged can't go on this box, or null */
+  const reason = (box: string): string | null => {
+    const d = dnd.active
+    if (!d) return null
+    const store = view.models.find((m) => m.name === d.model)?.storeBox ?? null
+    return dropReason(d.subject, d.fromBox, box, boxInfo, { storeBox: store })
+  }
+  let hover = $state<string | null>(null)
 
   const byName = $derived(Object.fromEntries(view.models.map((m) => [m.name, m])) as Record<string, ModelView>)
   const chipsOf = (b: HwBox): Chip[] => (view.chips[b.key] ?? []).filter((c) => c.kind !== 'runs')
@@ -50,7 +68,28 @@
           <div class="row {group[0]}" style="--n: {boxes.length}">
             {#each boxes as b (b.key)}
               {@const s = b.kind === 'gpu' || b.kind === 'disk' ? segs(b) : null}
-              <div class="box {b.kind}" style="min-height: {boxHeight(b.kind === 'cpu' ? (view.boxes[`ram${b.node}`]?.total ?? 0) : b.total)}px" title={b.path ?? b.detail ?? ''}>
+              <div
+                class="box {b.kind}"
+                class:drop={!!dnd.active && b.kind !== 'cpu' && !reason(b.key)}
+                class:refuse={!!dnd.active && !!reason(b.key) && reason(b.key) !== 'It is already here.'}
+                class:hover={hover === b.key}
+                class:over={!!over[b.key]}
+                role="group"
+                ondragover={(e) => {
+                  if (dnd.active && !reason(b.key)) {
+                    e.preventDefault()
+                    hover = b.key
+                  }
+                }}
+                ondragleave={() => (hover = hover === b.key ? null : hover)}
+                ondrop={(e) => {
+                  e.preventDefault()
+                  hover = null
+                  const d = dnd.active
+                  if (d && !reason(b.key)) onmove(d.subject, d.model, d.fromBox, b.key)
+                  dnd.active = null
+                }}
+                style="min-height: {boxHeight(b.kind === 'cpu' ? (view.boxes[`ram${b.node}`]?.total ?? 0) : b.total)}px" title={b.path ?? b.detail ?? ''}>
                 <div class="bh">
                   <h4>{b.title}</h4>
                   {#if b.kind === 'cpu'}
@@ -59,6 +98,10 @@
                     <span class="muted mono">{headText(b)}</span>
                   {/if}
                 </div>
+                {#if dnd.active && reason(b.key) && reason(b.key) !== 'It is already here.'}
+                  <div class="why">{reason(b.key)}</div>
+                {/if}
+                {#if over[b.key]}<div class="why over">{over[b.key]}</div>{/if}
                 {#if b.kind === 'cpu'}
                   <p class="cpu-note muted">Compute only. Runs what sits in RAM {b.node}.</p>
                   {#each runsOf(b) as c (c.id)}
@@ -96,7 +139,20 @@
 
 {#snippet chip(c: Chip)}
   {@const m = byName[c.model]}
-  <button class="chip {c.kind}" class:piece={c.piece} class:sel={isSel(c)} class:wrong={!!c.problem} style="--c: {m?.color}" title={[c.problem ? `Not where planned: ${c.problem}` : '', c.title ?? `${m?.title}: ${c.label}`].filter(Boolean).join('\n')} onclick={() => onselect(c.model, c.sub || null)}>
+  <button
+    class="chip {c.kind}"
+    class:piece={c.piece}
+    class:sel={isSel(c)}
+    class:wrong={!!c.problem}
+    class:pending={!!c.pending}
+    draggable={c.kind === 'weights' && !!c.edit}
+    ondragstart={(e) => {
+      if (!(c.kind === 'weights' && c.edit)) return
+      e.dataTransfer?.setData('text/plain', `${c.model}: ${c.label}`)
+      dnd.active = { subject: c.edit, model: c.model, sub: c.sub, fromBox: c.box }
+    }}
+    ondragend={() => (dnd.active = null)}
+    style="--c: {m?.color}" title={[c.problem ? `Not where planned: ${c.problem}` : '', c.title ?? `${m?.title}: ${c.label}`].filter(Boolean).join('\n')} onclick={() => onselect(c.model, c.sub || null)}>
     <span class="badge">{m?.letter}</span>
     <span class="lbl">{c.problem ? '! ' : ''}{c.label}</span>
     {#if c.badge}<span class="held" class:no={!c.badge.ok}>{c.badge.label}</span>{/if}
@@ -220,6 +276,47 @@
   }
   .chip.runs .lbl {
     white-space: normal;
+  }
+  .chip[draggable='true'] {
+    cursor: grab;
+  }
+  .chip.pending {
+    background:
+      repeating-linear-gradient(135deg, color-mix(in srgb, var(--c) 35%, transparent) 0 3px, transparent 3px 7px),
+      color-mix(in srgb, var(--c) 10%, var(--bg));
+  }
+  .pend {
+    flex: none;
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 8px;
+    border: 1px dotted var(--c);
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .box.drop {
+    outline: 2px dashed #7bd88f;
+    outline-offset: -2px;
+  }
+  .box.hover {
+    outline-style: solid;
+    background: color-mix(in srgb, #7bd88f 10%, var(--panel-2));
+  }
+  .box.refuse {
+    outline: 2px dashed var(--bad);
+    outline-offset: -2px;
+    opacity: 0.8;
+  }
+  .box.over {
+    border-color: var(--bad);
+  }
+  .why {
+    font-size: 11.5px;
+    color: var(--bad);
+    line-height: 1.25;
+  }
+  .why.over {
+    font-weight: 600;
   }
   .chip.wrong {
     border-color: var(--bad);

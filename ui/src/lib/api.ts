@@ -1,24 +1,7 @@
 // Typed access to the daemon: ollama-compatible /api and placement /api/aie.
 
-export type Tier = { Gpu: number } | 'Ram' | 'Disk'
-export type Amount = { Fraction: number } | { Bytes: number } | 'Rest'
-export interface Share {
-  tier: Tier
-  amount: Amount
-}
-
-/** aie_plan::Intent (decision D6: shares per tier, by size). */
-export interface Intent {
-  n_ctx: number
-  layers: Share[]
-  subsystems: Record<string, Share[]>
-  embeddings: Tier | null
-  output: Tier | null
-  expert_cache_bytes: number
-  allow_repack: boolean
-  /** socket (NUMA node) for the host side; null/absent = next to its GPU */
-  host_node?: number | null
-}
+import type { Intent, Tier } from './pending'
+export type { Amount, Intent, Share, Tier } from './pending'
 
 export interface ModelTag {
   name: string
@@ -212,6 +195,37 @@ export interface RamTier {
   fixes: string[]
 }
 
+/** One model's pending placement: an intent, or null for automatic (llama.cpp's own fit). */
+export interface Edit {
+  model: string
+  intent: Intent | null
+}
+
+export interface DeviceCheck {
+  /** CUDA0, ... or RAM */
+  name: string
+  total: number
+  free: number
+  reclaimed: number
+  available: number
+  need: number
+  by_model: Record<string, number>
+  fits: boolean
+}
+
+export interface CheckResult {
+  fits: boolean
+  problems: string[]
+  devices: DeviceCheck[]
+  models: Record<string, { planned: Record<string, Record<string, number>>; need: Record<string, number> | null; error: string | null }>
+}
+
+export interface ApplyResult {
+  applied: boolean
+  check: CheckResult
+  results: { model: string; ok: boolean; error?: string; misplaced?: number; warnings?: string[]; restored?: boolean }[]
+}
+
 export class ApiError extends Error {}
 
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -234,6 +248,10 @@ export const api = {
   ps: () => call<{ models: Running[] }>('GET', '/api/ps').then((v) => v.models),
   machine: () => call<Machine>('GET', '/api/aie/machine'),
   placement: (model: string) => call<Placement>('GET', `/api/aie/placement?model=${encodeURIComponent(model)}`),
+  /** Check pending edits together without changing anything (a dry run per model). */
+  check: (edits: Edit[]) => call<CheckResult>('POST', '/api/aie/placement/check', { edits }),
+  /** Save, reload and verify every edited model, if the edits fit together. */
+  apply: (edits: Edit[]) => call<ApplyResult>('POST', '/api/aie/placement/apply', { edits }),
   savePlacement: (model: string, intent: Intent | null, reload: boolean) =>
     call<{ saved: boolean; unloaded: boolean }>('PUT', '/api/aie/placement', { model, intent, reload }),
   /** Load a model (an empty chat loads it, as in ollama). */

@@ -4,6 +4,8 @@
   // bank) opens into a bar with a segment per tier: this is where placement is
   // edited, by size or share per tier (D6).
   import SplitBar from './SplitBar.svelte'
+  import { dnd } from './dnd.svelte'
+  import type { Role, Target } from './pending'
   import { tierOfBox, type ModelEdit } from './edit.svelte'
   import { short, size, type ModelView, type SubView, type View } from './view'
 
@@ -20,6 +22,8 @@
     onselect,
     onunload,
     ondiscard,
+    onputall,
+    onmove,
   }: {
     mv: ModelView
     view: View
@@ -34,6 +38,10 @@
     onselect: (model: string, sub: string | null) => void
     onunload: () => void
     ondiscard: () => void
+    /** the "Put all on" menu: the whole model on one tier */
+    onputall: (model: string, target: Target) => void
+    /** a single piece (embeddings, output head) to a box */
+    onmove: (model: string, role: Role, fromBox: string | null, toBox: string) => void
   } = $props()
 
   const isSel = $derived(selected?.model === mv.name)
@@ -49,6 +57,10 @@
   }
 
   const gpuKeys = $derived(Array.from({ length: gpus }, (_, i) => `gpu${i}`))
+  const ramBoxes = $derived(Object.keys(view.boxes).filter((k) => view.boxes[k].kind === 'ram'))
+  /** free memory per GPU: how "All GPUs" shares the layers out */
+  const gpuFree = $derived(gpuKeys.map((k) => Math.max(1, (view.boxes[k]?.total ?? 1) - (view.boxes[k]?.deviceUsed ?? 0))))
+  const placeOptions = $derived([...gpuKeys, ...ramBoxes, ...(mv.storeBox ? [mv.storeBox] : [])])
   const tiersFor = (s: SubView) => (s.role === 'core' ? [...gpuKeys, 'ram'] : [...gpuKeys, 'ram', 'disk'])
   // the display name of a tier key on this machine: RAM on the socket the model's host side is on
   const ramBox = $derived(Object.keys(view.boxes).find((k) => view.boxes[k].kind === 'ram' && (view.chips[k] ?? []).some((c) => c.model === mv.name)) ?? Object.keys(view.boxes).find((k) => view.boxes[k].kind === 'ram') ?? 'ram0')
@@ -65,7 +77,17 @@
 
 <div class="card" class:sel={isSel} style="--c: {mv.color}">
   <button class="head" onclick={() => onselect(mv.name, null)}>
-    <span class="badge">{mv.letter}</span>
+    <span
+      class="badge"
+      role="img"
+      aria-label="Drag onto a box to put the whole model there"
+      title="Drag onto a GPU or a RAM box to put the whole model there"
+      draggable="true"
+      ondragstart={(e) => {
+        e.dataTransfer?.setData('text/plain', mv.title)
+        dnd.active = { subject: 'model', model: mv.name, sub: '', fromBox: null }
+      }}
+      ondragend={() => (dnd.active = null)}>{mv.letter}</span>
     <span class="who">
       <span class="name">{mv.title}</span>
       <span class="sub-line">{mv.desc}{#if running}<span class="ok" title="loaded"> ●</span>{/if}</span>
@@ -104,6 +126,23 @@
           </select>
         </label>
       {/if}
+      <label class="row">Put all on
+        <select
+          aria-label="Put the whole model on"
+          onchange={(e) => {
+            const v = e.currentTarget.value
+            e.currentTarget.value = ''
+            if (v === 'gpus') onputall(mv.name, { kind: 'gpus', weights: gpuFree })
+            else if (v.startsWith('gpu')) onputall(mv.name, { kind: 'gpu', index: Number(v.slice(3)) })
+            else if (v.startsWith('ram')) onputall(mv.name, { kind: 'ram', node: Number(v.slice(3)) })
+          }}
+        >
+          <option value="">choose…</option>
+          {#each gpuKeys as k (k)}<option value={k}>{view.name(k)}</option>{/each}
+          {#if gpus > 1}<option value="gpus">All GPUs</option>{/if}
+          {#each ramBoxes as k (k)}<option value={k}>{view.name(k)}</option>{/each}
+        </select>
+      </label>
       <div class="row">
         {#if mv.loaded}<button onclick={onunload} disabled={!!busy}>Unload</button>{/if}
         {#if edit.dirty}<button onclick={ondiscard} disabled={!!busy}>Discard edits</button>{/if}
@@ -118,6 +157,18 @@
         <span class="amt mono">{#if sel && s.split}{size(s.bytes) + " · split in " + s.dests.length}{:else}{short(s.bytes)}{#if where(s)}{" → " + where(s)}{/if}{/if}</span>
       </button>
       {#if isSel && s.desc}<p class="desc">{s.desc}</p>{/if}
+      {#if isSel && (s.edit === 'embeddings' || s.edit === 'output') && s.dests.length}
+        {@const role = s.edit}
+        <label class="where">Goes to
+          <select
+            value={s.dests[0].box}
+            onchange={(e) => onmove(mv.name, role, s.dests[0].box, e.currentTarget.value)}
+            aria-label="{s.label} destination"
+          >
+            {#each placeOptions as k (k)}<option value={k}>{view.name(k)}</option>{/each}
+          </select>
+        </label>
+      {/if}
       {#if sel && editable(s)}
         {#if s.role === 'core'}
           <SplitBar tiers={tiersFor(s)} total={s.bytes} bind:pct={edit.layerPct} color={mv.color} name={tierName} word={word(s)} onedit={touched} {openEdit} />
@@ -229,6 +280,21 @@
     color: var(--muted);
     font-size: 12.5px;
     line-height: 1.25;
+  }
+  .where {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-top: 4px;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .where select {
+    padding: 2px 4px;
+    font-size: 12.5px;
+  }
+  .badge {
+    cursor: grab;
   }
   .hint {
     margin: 8px 0 0;

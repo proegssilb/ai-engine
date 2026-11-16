@@ -4,6 +4,7 @@
 // Pure functions, so the real UI and the demo page share them.
 
 import { sockets, type Machine, type MachineModel, type ModelTag, type Placement } from './api'
+import type { Role } from './pending'
 
 export const GiB = 1 << 30
 export const MiB = 1 << 20
@@ -60,6 +61,10 @@ export interface Chip {
   problem?: string
   /** the RAM tier's state, on the RAM-tier chips */
   badge?: { label: string; ok: boolean }
+  /** a pending edit, not applied yet */
+  pending?: boolean
+  /** which part of an intent this piece is, when it can be moved */
+  edit?: Role
 }
 
 export interface SubDest {
@@ -80,6 +85,8 @@ export interface SubView {
   /** anatomy subsystems merged into this one */
   members: string[]
   order?: number
+  /** the part of an intent that places it, if the user can place it */
+  edit?: Role
 }
 
 export interface ModelView {
@@ -90,6 +97,10 @@ export interface ModelView {
   desc: string
   size: number
   loaded: boolean
+  /** has pending edits */
+  pending: boolean
+  /** the disk box its model file is on: where its disk tier can be */
+  storeBox: string | null
   moe: boolean
   subs: SubView[]
   /** verified placement: every weight where planned, N misplaced, or not loaded */
@@ -123,6 +134,8 @@ export interface CatalogEntry {
   role: SubView['role']
   /** position in the model's list (default: by role, then size) */
   order?: number
+  /** the part of an intent that places it, if the user can place it */
+  edit?: Role
 }
 /** The catalog entry for an anatomy subsystem label ('kv' asks for the KV cache entry) of a model. */
 export type Catalog = (label: string, model: string) => CatalogEntry
@@ -139,6 +152,7 @@ const CORE: CatalogEntry = {
   label: 'Core layers',
   desc: 'The always-on path: attention, norms, router and shared experts. Every token passes through it, so it wants the fastest memory.',
   role: 'core',
+  edit: 'layers',
 }
 
 /** The backend's subsystems (aie_anatomy) grouped like the mockup's. */
@@ -158,6 +172,7 @@ export const anatomyCatalog: Catalog = (label) => {
         short: 'Experts',
         desc: 'Thousands of specialists; only a handful fire per token. Keep the busy ones on a GPU and the rest somewhere cheaper.',
         role: 'bulk',
+        edit: 'bulk',
       }
     case 'dense ffn':
       return {
@@ -165,11 +180,12 @@ export const anatomyCatalog: Catalog = (label) => {
         label: 'Feed-forward',
         desc: 'The dense feed-forward blocks, the biggest part of every layer. Split them by share between GPUs, RAM and disk.',
         role: 'bulk',
+        edit: 'bulk',
       }
     case 'embeddings':
-      return { id: 'embeddings', label: 'Embeddings', desc: 'Turns tokens into vectors: a lookup, never computed.', role: 'other' }
+      return { id: 'embeddings', label: 'Embeddings', desc: 'Turns tokens into vectors: a lookup, never computed.', role: 'other', edit: 'embeddings' }
     case 'output head':
-      return { id: 'head', label: 'Output head', desc: 'Final norm and the projection to the vocabulary.', role: 'other' }
+      return { id: 'head', label: 'Output head', desc: 'Final norm and the projection to the vocabulary.', role: 'other', edit: 'output' }
     default:
       return { id: label, label: label.charAt(0).toUpperCase() + label.slice(1), desc: '', role: 'other' }
   }
@@ -249,11 +265,24 @@ export function scaleBarHeight(total: number): number {
   return 10 + 6 * Math.max(0, Math.log2(total / (BASE_GIB * GiB)))
 }
 
+/** A model's pending placement, as a check (or a local estimate) says it would be. */
+export interface PendingPlan {
+  /** subsystem label -> tier key -> bytes */
+  planned: Record<string, Record<string, number>>
+  /** KV cache and scratch per tier key (gpuN, ram) */
+  extra: Record<string, number>
+  hostNode?: number | null
+  /** subsystem label -> tier keys whose bytes differ from what is placed now: those chips are the pending ones */
+  changed: Record<string, string[]>
+}
+
 export interface ViewInput {
   machine: Machine
   tags: ModelTag[]
   placements: Record<string, Placement | undefined>
   catalog?: Catalog
+  /** models with pending edits: what they would look like */
+  pending?: Record<string, PendingPlan | undefined>
 }
 
 /** Temperature words for the pieces of a split expert bank: busy on the GPU, rest in RAM, cold on disk. */
@@ -346,10 +375,11 @@ export function buildView(input: ViewInput): View {
   tags.forEach((tag, mi) => {
     const p = placements[tag.name]
     const mm: MachineModel | undefined = machine.models.find((m) => m.model === tag.name)
-    const planned = mm?.planned ?? p?.loaded?.planned ?? p?.intended
+    const pend = input.pending?.[tag.name]
+    const planned = pend ? pend.planned : (mm?.planned ?? p?.loaded?.planned ?? p?.intended)
     const moe = !!p?.anatomy.moe
     const host = mm?.host ?? p?.loaded?.host ?? null
-    const hostNode = host && socks.some((s) => s.node === host.node) ? host.node : socks[0].node
+    const hostNode = pend?.hostNode !== undefined && pend.hostNode !== null && socks.some((s) => s.node === pend.hostNode) ? pend.hostNode : host && socks.some((s) => s.node === host.node) ? host.node : socks[0].node
 
     // which box a tier key means for this model
     const diskIndex = Math.max(0, disks.findIndex((d) => d.path === (mm?.store ?? disks[0]?.path)))
@@ -363,7 +393,7 @@ export function buildView(input: ViewInput): View {
       const e = catalog(label, tag.name)
       let sv = merged.get(e.id)
       if (!sv) {
-        sv = { id: e.id, label: e.label, short: e.short ?? e.label, desc: e.desc, bytes: 0, role: e.role, dests: [], split: false, members: [], order: e.order }
+        sv = { id: e.id, label: e.label, short: e.short ?? e.label, desc: e.desc, bytes: 0, role: e.role, dests: [], split: false, members: [], order: e.order, edit: e.edit }
         merged.set(e.id, sv)
       }
       sv.bytes += sizes[label] ?? Object.values(planned?.[label] ?? {}).reduce((a, b) => a + b, 0)
@@ -380,7 +410,7 @@ export function buildView(input: ViewInput): View {
     // The RAM tier's weights as the worker measured them: per node, they
     // replace the planned bytes of the RAM-tier subsystems (same total,
     // shared out in proportion), so chips, bar and table are one number.
-    const measuredTier = Object.entries(host?.ram_tier_by_node ?? {})
+    const measuredTier = Object.entries(pend ? {} : (host?.ram_tier_by_node ?? {}))
       .map(([n, b]) => [Number(n), b] as const)
       .filter(([, b]) => b > 0)
     const tierSubs = [...merged.values()].filter((s) => s.dests.some((d) => d.box === `ram${hostNode}`))
@@ -403,21 +433,26 @@ export function buildView(input: ViewInput): View {
     // KV cache and compute scratch, from the live breakdown (devices) and the host report (RAM)
     const kvDests: SubDest[] = []
     const scratch: SubDest[] = []
-    for (const r of mm?.memory ?? p?.loaded?.measured ?? []) {
-      if (r.kind === 'device') {
-        const m = /(\d+)$/.exec(r.name)
-        const box = m ? `gpu${m[1]}` : ''
-        if (!boxes[box]) continue
-        if (r.context > 0) kvDests.push({ box, bytes: r.context })
-        if (r.compute > 0) scratch.push({ box, bytes: r.compute })
+    if (pend) {
+      // a pending plan: what the dry run says the KV cache and scratch add up to, per device
+      for (const [t, b] of Object.entries(pend.extra)) if (b > 0) kvDests.push({ box: t === 'ram' ? `ram${hostNode}` : t, bytes: b })
+    } else {
+      for (const r of mm?.memory ?? p?.loaded?.measured ?? []) {
+        if (r.kind === 'device') {
+          const m = /(\d+)$/.exec(r.name)
+          const box = m ? `gpu${m[1]}` : ''
+          if (!boxes[box]) continue
+          if (r.context > 0) kvDests.push({ box, bytes: r.context })
+          if (r.compute > 0) scratch.push({ box, bytes: r.compute })
+        }
       }
+      // a stray page or two on another socket isn't a piece worth drawing
+      for (const [n, b] of Object.entries(host?.kv_cache_by_node ?? {})) if (b >= MiB) kvDests.push({ box: `ram${n}`, bytes: b })
+      for (const [n, b] of Object.entries(host?.compute_by_node ?? {})) if (b >= MiB) scratch.push({ box: `ram${n}`, bytes: b })
     }
-    // a stray page or two on another socket isn't a piece worth drawing
-    for (const [n, b] of Object.entries(host?.kv_cache_by_node ?? {})) if (b >= MiB) kvDests.push({ box: `ram${n}`, bytes: b })
-    for (const [n, b] of Object.entries(host?.compute_by_node ?? {})) if (b >= MiB) scratch.push({ box: `ram${n}`, bytes: b })
     if (kvDests.length) {
       const k = catalog('kv', tag.name)
-      merged.set('kv', { id: k.id, label: k.label, short: k.short ?? k.label, desc: k.desc, role: 'kv', order: k.order, bytes: kvDests.reduce((s, d) => s + d.bytes, 0), dests: kvDests, split: false, members: [] })
+      merged.set('kv', { id: k.id, label: k.label, short: pend ? 'KV + scratch' : (k.short ?? k.label), desc: k.desc, role: 'kv', order: k.order, bytes: kvDests.reduce((s, d) => s + d.bytes, 0), dests: kvDests, split: false, members: [] })
     }
 
     const subs = [...merged.values()].sort((a, b) => {
@@ -428,7 +463,7 @@ export function buildView(input: ViewInput): View {
     for (const sv of subs) sv.split = sv.dests.length > 1
 
     // chips: one per (subsystem, box) piece, for models that are loaded
-    const loaded = !!mm || !!p?.loaded
+    const loaded = !!mm || !!p?.loaded || !!pend
     const ld = p?.loaded ?? null
     const st = ld?.stats ?? null
     const rt = st?.ram_tier && st.ram_tier.bytes > 0 ? st.ram_tier : null
@@ -454,8 +489,12 @@ export function buildView(input: ViewInput): View {
             piece: sv.split,
             box: d.box,
             kind: sv.role === 'kv' ? 'kv' : 'weights',
+            pending: !!pend && (sv.role === 'kv' ? Object.values(pend.changed).some((t) => t.includes(d.box.startsWith('gpu') ? d.box : 'ram')) : sv.members.some((l) => pend.changed[l]?.includes(d.box.startsWith('gpu') ? d.box : d.box.startsWith('ram') ? 'ram' : 'disk'))),
+            edit: sv.role === 'kv' ? undefined : sv.edit,
             title: [
               sv.members.length > 1 ? `${sv.label}: ${sv.members.join(', ')}` : '',
+              sv.role === 'kv' ? 'The KV cache follows the layers: move the layers to move it.' : '',
+              pend ? 'Pending: not applied yet' : '',
               // the RAM tier: held or not, how, and how its size was found
               ...(rt && d.box.startsWith('ram') && sv.role !== 'kv'
                 ? [
@@ -473,29 +512,34 @@ export function buildView(input: ViewInput): View {
               .join('\n') || undefined,
             problem: bad.get(`${sv.id}/${d.box}`)?.join('; '),
             badge:
-              rt && d.box.startsWith('ram') && sv.role !== 'kv'
+              !pend && rt && d.box.startsWith('ram') && sv.role !== 'kv'
                 ? { label: rt.held_by_os ? 'held' : rt.held ? 'driver only' : 'not held', ok: rt.held_by_os }
                 : undefined,
           })
         })
       }
       for (const d of scratch) {
-        put({ id: `${tag.name}/scratch/${d.box}`, model: tag.name, sub: 'scratch', label: 'Compute scratch', bytes: d.bytes, piece: false, box: d.box, kind: 'scratch', title: d.box.startsWith('ram') && hostRow && hostRow.compute > d.bytes ? `llama.cpp reserves ${size(hostRow.compute)} on the host; ${size(d.bytes)} of it is in RAM so far. Pages are counted once first used, so this grows after the first requests.` : 'Temporary working memory for computing a batch' })
+        put({ id: `${tag.name}/scratch/${d.box}`, model: tag.name, sub: 'scratch', label: 'Compute scratch', bytes: d.bytes, piece: false, box: d.box, kind: 'scratch', pending: false, title: d.box.startsWith('ram') && hostRow && hostRow.compute > d.bytes ? `llama.cpp reserves ${size(hostRow.compute)} on the host; ${size(d.bytes)} of it is in RAM so far. Pages are counted once first used, so this grows after the first requests.` : 'Temporary working memory for computing a batch' })
       }
       // "runs" chips: the model's threads run on its socket
-      if (host && socks.some((s) => s.node === host.node)) {
-        const here = subs.filter((s) => s.role !== 'kv' && s.dests.some((d) => d.box === `ram${host.node}`))
+      const runNode = pend?.hostNode != null && socks.some((s) => s.node === pend.hostNode) ? pend.hostNode : host && socks.some((s) => s.node === host.node) ? host.node : null
+      if (runNode !== null) {
+        const here = subs.filter((s) => s.role !== 'kv' && s.dests.some((d) => d.box === `ram${runNode}`))
         const parts = subs.filter((s) => s.role !== 'kv')
         const short = tag.name.replace(/^.*\//, '').split(/[-:]/)[0]
         const label = here.length
           ? here.length === parts.length && here.length > 1
             ? `${short}, ${here.length === 2 ? 'both' : 'all'} parts`
-            : here.map((s) => (s.split ? chipLabel(s, moe, `ram${host.node}`) : s.short)).join(' + ')
+            : here.map((s) => (s.split ? chipLabel(s, moe, `ram${runNode}`) : s.short)).join(' + ')
           : 'Host side'
-        put({ id: `${tag.name}/runs`, model: tag.name, sub: here.length === 1 ? here[0].id : '', label, bytes: 0, piece: false, box: `cpu${host.node}`, kind: 'runs' })
+        put({ id: `${tag.name}/runs`, model: tag.name, sub: here.length === 1 ? here[0].id : '', label, bytes: 0, piece: false, box: `cpu${runNode}`, kind: 'runs', pending: false })
       }
-      // exact RAM-box numbers per node, for the bar
-      if (host) {
+      // exact RAM-box numbers per node, for the bar (a pending plan: what the check says)
+      if (pend) {
+        const w = Object.values(pend.planned).reduce((sum, t) => sum + (t.ram ?? 0), 0)
+        const kv = pend.extra.ram ?? 0
+        if (w + kv > 0) (ramExact[tag.name] ??= {})[hostNode] = { weights: w, kv, scratch: 0 }
+      } else if (host) {
         const nodes = new Set([...Object.keys(host.ram_tier_by_node ?? {}), ...Object.keys(host.kv_cache_by_node ?? {}), ...Object.keys(host.compute_by_node ?? {})])
         for (const n of nodes) {
           ;(ramExact[tag.name] ??= {})[Number(n)] = {
@@ -522,6 +566,8 @@ export function buildView(input: ViewInput): View {
       desc,
       size: p?.anatomy.bytes ?? tag.size,
       loaded,
+      pending: !!pend,
+      storeBox: disks.length ? `disk${diskIndex}` : null,
       moe,
       subs,
       status: !ld ? { kind: 'not loaded', text: 'not loaded' } : ld.misplaced === 0 ? { kind: 'verified', text: 'verified' } : { kind: 'misplaced', text: `${ld.misplaced} misplaced` },

@@ -5,6 +5,7 @@
 // Models and subsystem kinds the backend can't run (speech) exist only here.
 
 import type { Catalog, CatalogEntry } from './view'
+import type { CheckResult } from './api'
 import { anatomyCatalog, GiB } from './view'
 import type { HostReport, Machine, MachineModel, Measured, MemBox, ModelTag, Placement, RamTier, Spread, Stats } from './api'
 
@@ -30,11 +31,11 @@ export const demoTags: ModelTag[] = [
 ]
 
 const entries: Record<string, CatalogEntry> = {
-  'core layers': { id: 'core', label: 'Core layers', desc: 'The always-on path. Every token passes through it, so it wants the fastest memory.', role: 'core', order: 0 },
+  'core layers': { id: 'core', label: 'Core layers', desc: 'The always-on path. Every token passes through it, so it wants the fastest memory.', role: 'core', order: 0, edit: 'layers' },
   'lookup table': { id: 'lookup', label: 'Lookup table', desc: 'A phrase memory that is read, never computed. Fine on a fast SSD.', role: 'other', order: 2 },
   'draft head': { id: 'draft', label: 'Draft head', desc: 'Guesses a few tokens ahead so the core can check them in one pass.', role: 'other', order: 4 },
   'vision encoder': { id: 'vision', label: 'Vision encoder', desc: 'Turns images into tokens. Idle unless an image arrives.', role: 'other', order: 5 },
-  'transformer layers': { id: 'layers', label: 'Transformer layers', short: 'Layers', desc: '', role: 'core', order: 0 },
+  'transformer layers': { id: 'layers', label: 'Transformer layers', short: 'Layers', desc: '', role: 'core', order: 0, edit: 'layers' },
   'embeddings + output head': { id: 'embed', label: 'Embeddings + output head', short: 'Embed + head', desc: '', role: 'other', order: 2 },
   'audio encoder': { id: 'audio', label: 'Audio encoder', desc: '', role: 'other', order: 0 },
   'text decoder': { id: 'text', label: 'Text decoder', desc: '', role: 'other', order: 1 },
@@ -250,3 +251,46 @@ L(B).misplaced = 8
 L(B).misplaced_detail = [{ subsystem: 'transformer layers', planned: 'gpu3', actual: 'a CUDA_Host buffer', tensors: 8, bytes: g(8) }]
 L(C).stats = stats(0, 0, 0, null)
 L(D).stats = stats(31, 95, 61.5, looseTier)
+
+/** What a model would use per tier key (gpuN, ram) under a pending plan, and what it uses now. */
+export interface FakeModel {
+  name: string
+  planned: Record<string, Record<string, number>>
+  /** KV cache and scratch per tier key, kept where they are */
+  extra: Record<string, number>
+  /** its current use per tier key: freed when it is unloaded to apply the edit */
+  current: Record<string, number>
+}
+
+/**
+ * The demo has no daemon: this answers /api/aie/placement/check from the
+ * fixture. A model needs what its plan puts on a device plus its KV cache and
+ * scratch there; a device has what it has free plus what the edited models
+ * release.
+ */
+export function fakeCheck(machine: Machine, models: FakeModel[]): CheckResult {
+  const gpus = machine.devices.filter((d) => d.gpu)
+  const devs = [
+    ...gpus.map((d, i) => ({ name: d.name, tier: `gpu${i}`, total: d.total, free: d.free })),
+    { name: 'RAM', tier: 'ram', total: machine.ram.total, free: machine.ram.available },
+  ]
+  const label = (n: string) => (n.startsWith('CUDA') ? `GPU ${n.slice(4)}` : n)
+  const gib = (b: number) => `${(b / GiB).toFixed(1)} GiB`
+  const need = (m: FakeModel, tier: string) => Object.values(m.planned).reduce((s, t) => s + (t[tier] ?? 0), 0) + (m.extra[tier] ?? 0)
+  const problems: string[] = []
+  const devices = devs.map((d) => {
+    const by_model: Record<string, number> = Object.fromEntries(models.map((m) => [m.name, need(m, d.tier)] as [string, number]).filter(([, b]) => b > 0))
+    const reclaimed = models.reduce((s, m) => s + (m.current[d.tier] ?? 0), 0)
+    const available = Math.min(d.total, d.free + reclaimed)
+    const total = Object.values(by_model).reduce((a, b) => a + b, 0)
+    const fits = total <= available
+    if (!fits) problems.push(`${label(d.name)} would need ${gib(total)} but only ${gib(available)} will be free (${Object.entries(by_model).map(([m, b]) => `${m} ${gib(b)}`).join(', ')})`)
+    return { name: d.name, total: d.total, free: d.free, reclaimed, available, need: total, by_model, fits }
+  })
+  return {
+    fits: problems.length === 0,
+    problems,
+    devices,
+    models: Object.fromEntries(models.map((m) => [m.name, { planned: m.planned, need: {}, error: null }])),
+  }
+}
