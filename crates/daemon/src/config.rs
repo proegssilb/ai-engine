@@ -16,7 +16,8 @@ pub struct Config {
     /// Model store roots, one per disk (default `$AIE_HOME/store`). A model's
     /// store is its disk tier; pulls go to the first unless told otherwise.
     pub stores: Vec<PathBuf>,
-    /// How long an idle model stays loaded (ollama's keep_alive default).
+    /// How long an idle model stays loaded (30 minutes by default; ollama's
+    /// is 5). A request's own `keep_alive` overrides it.
     pub keep_alive: Duration,
     /// Context length when a request doesn't say.
     pub n_ctx: u32,
@@ -57,7 +58,7 @@ impl Config {
             listen: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             stores: vec![home.join("store")],
             home,
-            keep_alive: Duration::from_secs(300),
+            keep_alive: Duration::from_secs(30 * 60),
             n_ctx: 4096,
             n_batch: 512,
             threads: 0,
