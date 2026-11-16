@@ -176,16 +176,31 @@ export function gib(b: number, digits = 1): string {
   return (b / GiB).toFixed(digits)
 }
 
-/** GiB/MiB, as the placement amounts are shown. */
+/** Adaptive units everywhere: GiB with one decimal from 1 GiB, whole MiB below, KiB below 1 MiB. */
 export function size(b: number): string {
-  if (b >= GiB * 0.095) return `${gib(b)} GiB`
-  if (b >= MiB / 10) return `${(b / MiB).toFixed(b >= 10 * MiB ? 0 : 1)} MiB`
-  return `${(b / 1024).toFixed(0)} KiB`
+  if (b >= GiB) return `${gib(b)} GiB`
+  if (b >= MiB) return `${Math.round(b / MiB)} MiB`
+  return `${Math.round(b / 1024)} KiB`
 }
 
-/** A size without its unit, in the unit `whole` is shown in. */
-function num(b: number, unitOf: number): string {
-  return unitOf >= GiB * 0.095 ? gib(b) : (b / MiB).toFixed(b >= 10 * MiB ? 0 : 1)
+/** [`size`] without the unit when it is GiB (the box or card says GiB already, as in the mockup). */
+export function short(b: number): string {
+  return b >= GiB ? gib(b) : size(b)
+}
+
+/** Binary sizes up to TiB, for disk boxes (one unit family: GiB, TiB). */
+export function bigsize(b: number): string {
+  return b >= 2 ** 40 ? `${(b / 2 ** 40).toFixed(1)} TiB` : size(b)
+}
+
+/** "used / total" in one unit family, the unit written once when it is the same. */
+export function pair(used: number, total: number): string {
+  const trim = (x: string) => x.replace(/\.0 /, ' ')
+  const t = trim(bigsize(total))
+  const unit = t.split(' ')[1]
+  if (used === 0) return `0 / ${t}`
+  const u = bigsize(used)
+  return u.split(' ')[1] === unit ? `${u.split(' ')[0]} / ${t}` : `${u} / ${t}`
 }
 
 /** Decimal capacity, as drives and the mockup's header give it ("4 TB"). */
@@ -200,23 +215,23 @@ export function binCapacity(b: number): string {
   return b >= GiB ? `${+(b / GiB).toFixed(b >= 10 * GiB ? 0 : 1)} GiB` : `${(b / MiB).toFixed(0)} MiB`
 }
 
-/** The amount shown on a chip: "5.0 GiB", or "20.0 of 50.0 GiB" for a piece of a split. */
+/** The amount on a chip: "5.0" (GiB), "154 MiB", or "20 of 50" for a piece of a split. */
 export function amount(c: Pick<Chip, 'bytes' | 'whole' | 'piece'>): string {
+  const trim = (v: string) => (v.endsWith('.0') ? v.slice(0, -2) : v)
   if (c.piece && c.whole) {
-    const n = (b: number) => {
-      const v = num(b, c.whole!)
-      return v.endsWith('.0') ? v.slice(0, -2) : v
-    }
-    return `${n(c.bytes)} of ${size(c.whole).replace('.0 ', ' ')}`
+    if (c.whole >= GiB) return `${c.bytes >= GiB ? trim(gib(c.bytes)) : size(c.bytes)} of ${trim(gib(c.whole))}${c.bytes >= GiB ? '' : ' GiB'}`
+    // both in MiB: say the unit once
+    if (c.bytes >= MiB && c.whole >= MiB) return `${Math.round(c.bytes / MiB)} of ${size(c.whole)}`
+    return `${size(c.bytes)} of ${size(c.whole)}`
   }
-  return size(c.bytes)
+  return short(c.bytes)
 }
 
 /** Box height: one step per doubling of capacity (the "Box height scale" legend). */
 export const BASE_GIB = 16
-export const STEP_PX = 36
+export const STEP_PX = 40
 export function boxHeight(total: number): number {
-  return 96 + STEP_PX * Math.max(0, Math.log2(Math.max(total, 1) / (BASE_GIB * GiB)))
+  return 130 + STEP_PX * Math.max(0, Math.log2(Math.max(total, 1) / (BASE_GIB * GiB)))
 }
 export function scaleBarHeight(total: number): number {
   return 10 + 6 * Math.max(0, Math.log2(total / (BASE_GIB * GiB)))

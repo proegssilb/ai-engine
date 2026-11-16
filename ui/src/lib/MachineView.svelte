@@ -5,7 +5,7 @@
   // doubling of capacity; the usage bars inside stay linear.
   import RamBar from './RamBar.svelte'
   import type { Machine } from './api'
-  import { amount, binCapacity, boxHeight, capacity, gib, size, type Chip, type HwBox, type ModelView, type View } from './view'
+  import { amount, bigsize, boxHeight, pair, type Chip, type HwBox, type ModelView, type View } from './view'
 
   let {
     view,
@@ -24,11 +24,9 @@
   const runsOf = (b: HwBox): Chip[] => (view.chips[b.key] ?? []).filter((c) => c.kind === 'runs')
   const ours = (b: HwBox) => chipsOf(b).reduce((s, c) => s + c.bytes, 0)
   const isSel = (c: Chip) => !!selected && selected.model === c.model && selected.sub !== null && selected.sub === c.sub
-  const capText = (b: HwBox) => (b.kind === 'disk' ? capacity(b.total) : binCapacity(b.total))
-  const oursText = (b: HwBox) => {
-    const o = ours(b)
-    return o >= (1 << 30) / 10 || o === 0 ? gib(o) : size(o)
-  }
+  // header: used / capacity. Devices and disks: what the device reports (the same number
+  // their bar draws); RAM: our models' exact memory.
+  const headText = (b: HwBox) => (b.kind === 'ram' ? pair(ours(b), b.total) : pair(Math.max(b.deviceUsed ?? 0, ours(b)), b.total))
   // linear usage bar: our pieces in model colours, then whatever else the device reports used
   function segs(b: HwBox) {
     const T = Math.max(b.total, 1)
@@ -58,7 +56,7 @@
                   {#if b.kind === 'cpu'}
                     <span class="muted mono">{b.detail}</span>
                   {:else}
-                    <span class="muted mono">{oursText(b)} / {capText(b)}</span>
+                    <span class="muted mono">{headText(b)}</span>
                   {/if}
                 </div>
                 {#if b.kind === 'cpu'}
@@ -79,7 +77,7 @@
                     {@render chip(c)}
                   {/each}
                   {#if b.kind === 'disk'}
-                    <div class="free">{chipsOf(b).length ? '' : 'Empty. '}{capacity(Math.max(0, b.total - (b.deviceUsed ?? 0)))} free</div>
+                    <div class="free">{chipsOf(b).length ? '' : 'Empty. '}{bigsize(Math.max(0, b.total - (b.deviceUsed ?? 0)))} free</div>
                   {:else if !chipsOf(b).length}
                     <div class="empty">Empty.</div>
                   {/if}
@@ -100,7 +98,7 @@
   {@const m = byName[c.model]}
   <button class="chip {c.kind}" class:piece={c.piece} class:sel={isSel(c)} style="--c: {m?.color}" title={c.title ?? `${m?.title}: ${c.label}`} onclick={() => onselect(c.model, c.sub || null)}>
     <span class="badge">{m?.letter}</span>
-    <span class="lbl">{c.label}</span>
+    <span class="lbl" title={c.label}>{c.label}</span>
     <span class="amt mono">{c.kind === 'runs' ? 'runs' : amount(c)}</span>
   </button>
 {/snippet}
@@ -116,10 +114,10 @@
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 14px;
-    padding: 12px;
+    padding: 10px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
   }
   .socket.detached {
@@ -138,6 +136,7 @@
     display: grid;
     gap: 10px;
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr));
+    align-items: start;
   }
   .row.cpu {
     grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
@@ -146,7 +145,7 @@
     background: var(--panel-2);
     border: 1px solid var(--line);
     border-radius: 10px;
-    padding: 9px;
+    padding: 8px;
     display: flex;
     flex-direction: column;
     gap: 5px;
@@ -160,14 +159,17 @@
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    gap: 0 8px;
-    flex-wrap: wrap;
+    gap: 0 6px;
+    min-width: 0;
   }
   .bh .mono {
-    font-size: 11.5px;
+    font-size: 11px;
     white-space: nowrap;
+    flex: none;
   }
   h4 {
+    white-space: nowrap;
+    flex: none;
     margin: 0;
     font-size: 14.5px;
     font-weight: 600;
@@ -194,8 +196,7 @@
   .chip {
     display: flex;
     align-items: center;
-    gap: 2px 7px;
-    flex-wrap: wrap;
+    gap: 6px;
     text-align: left;
     padding: 3px 6px;
     border: 1.5px solid var(--c);
@@ -216,6 +217,9 @@
     border-style: solid;
     box-shadow: 0 0 0 1px #fff;
   }
+  .chip.runs .lbl {
+    white-space: normal;
+  }
   .chip.scratch .lbl {
     font-style: italic;
   }
@@ -233,13 +237,17 @@
   }
   .lbl {
     flex: 1 1 0;
-    min-width: 5em;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .amt {
     color: var(--muted);
     white-space: nowrap;
     font-size: 12px;
     margin-left: auto;
+    flex: none;
   }
   .free,
   .empty {

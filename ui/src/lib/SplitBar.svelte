@@ -4,7 +4,7 @@
   // colour, with the tier under each segment. Edit by dragging a divider, or
   // with the share or size fields: the last tier with a share takes the rest.
   import { type Pct } from './edit.svelte'
-  import { gib, size } from './view'
+  import { size } from './view'
 
   let {
     tiers,
@@ -34,7 +34,10 @@
   let added = $state<string[]>([])
   const fields = $derived(tiers.filter((k) => (pct[k] ?? 0) > 0 || added.includes(k)))
   const free = $derived(tiers.filter((k) => !fields.includes(k)))
-  const fmt = (b: number) => { const v = b / (1 << 30); return Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(v < 10 ? 1 : 0) }
+  const fmt = (b: number) => { if (b < (1 << 30)) return size(b); const v = b / (1 << 30); return Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(v < 10 ? 1 : 0) }
+  // the unit of the size fields: MiB for small subsystems
+  const unit = $derived(total >= (1 << 30) ? 'GiB' : 'MiB')
+  const div = $derived(unit === 'GiB' ? 1 << 30 : 1 << 20)
   const sum = $derived(tiers.reduce((s, k) => s + (pct[k] ?? 0), 0))
   const shade = (i: number) => `color-mix(in srgb, ${color} ${Math.max(35, 100 - 28 * i)}%, white)`
   const round1 = (v: number) => Math.round(v * 10) / 10
@@ -68,7 +71,7 @@
   }
 
   function setGiB(k: string, v: number) {
-    pct[k] = round1(Math.min(100, Math.max(0, (100 * v * (1 << 30)) / Math.max(total, 1))))
+    pct[k] = round1(Math.min(100, Math.max(0, (100 * v * div) / Math.max(total, 1))))
     onedit()
   }
 </script>
@@ -97,7 +100,7 @@
       <label>
         <span class="n">{name(k)}</span>
         <input type="number" min="0" max="100" step="1" value={pct[k] ?? 0} oninput={(e) => { pct[k] = Math.min(100, Math.max(0, +e.currentTarget.value || 0)); onedit() }} aria-label="{name(k)} share in percent" />%
-        <input type="number" min="0" step="0.5" value={+gib(((pct[k] ?? 0) / 100) * total)} oninput={(e) => setGiB(k, +e.currentTarget.value || 0)} aria-label="{name(k)} size in GiB" />GiB
+        <input type="number" min="0" step="0.5" value={+((((pct[k] ?? 0) / 100) * total) / div).toFixed(unit === 'GiB' ? 2 : 0)} oninput={(e) => setGiB(k, +e.currentTarget.value || 0)} aria-label="{name(k)} size in {unit}" />{unit}
       </label>
     {/each}
   </div>
@@ -136,6 +139,12 @@
     font-size: 12px;
     font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   }
+  .seg span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    max-width: 100%;
+  }
   .seg:first-child {
     border-radius: 5px 0 0 5px;
   }
@@ -169,11 +178,12 @@
   .labels {
     display: flex;
     flex-wrap: wrap;
-    gap: 2px 18px;
+    gap: 2px 10px;
     margin-top: 6px;
+    white-space: nowrap;
     color: var(--muted);
     font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
-    font-size: 12px;
+    font-size: 11px;
   }
   .fields {
     display: grid;

@@ -5,7 +5,7 @@
   // edited, by size or share per tier (D6).
   import SplitBar from './SplitBar.svelte'
   import { tierOfBox, type ModelEdit } from './edit.svelte'
-  import { size, type ModelView, type SubView, type View } from './view'
+  import { short, size, type ModelView, type SubView, type View } from './view'
 
   let {
     mv,
@@ -68,7 +68,7 @@
     <div class="sub" class:sel>
       <button class="row" onclick={() => onselect(mv.name, s.id)}>
         <span class="nm">{s.label}</span>
-        <span class="amt mono">{size(s.bytes)}{#if sel && s.split}{" · split in " + s.dests.length}{:else if where(s)}{" → " + where(s)}{/if}</span>
+        <span class="amt mono">{#if sel && s.split}{size(s.bytes) + " · split in " + s.dests.length}{:else}{short(s.bytes)}{#if where(s)}{" → " + where(s)}{/if}{/if}</span>
       </button>
       {#if isSel && s.desc}<p class="desc">{s.desc}</p>{/if}
       {#if sel && editable(s)}
@@ -164,10 +164,13 @@
   }
   .nm {
     font-weight: 500;
+    min-width: 0;
   }
   .amt {
     color: var(--muted);
     text-align: right;
+    white-space: nowrap;
+    flex: none;
   }
   .desc {
     margin: 4px 0 0;
