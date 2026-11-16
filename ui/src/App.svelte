@@ -6,7 +6,7 @@
   import { api, bytes, sockets, type ApplyResult, type CheckResult, type Edit, type Machine, type ModelTag, type Placement, type Running } from './lib/api'
   import { demoCatalog, demoMachine, demoPlacements, demoTags, fakeCheck } from './lib/demo'
   import { localPlan, movePiece, putAll, tierOfBox, type Ctx, type PlanLabel, type Role, type Subject, type Target } from './lib/pending'
-  import { anatomyCatalog, buildView, scaleBarHeight, size, type PendingPlan } from './lib/view'
+  import { anatomyCatalog, buildView, size, type PendingPlan } from './lib/view'
 
   // /ui/?demo renders the mockup's own example from fixtures; &pending preloads two pending edits
   const qs = new URLSearchParams(location.search)
@@ -366,16 +366,6 @@
   }
 
   const isRunning = (name: string) => running.some((r) => r.name === name)
-  // the legend of box heights: one step per doubling
-  const scale = [
-    ['16G', 16],
-    ['32G', 32],
-    ['64G', 64],
-    ['128G', 128],
-    ['1T', 1024],
-    ['2T', 2048],
-    ['4T', 4096],
-  ] as const
 </script>
 
 <div class="app">
@@ -384,20 +374,6 @@
       <h1>Placement</h1>
       {#if view}<div class="muted mono">{view.summary}</div>{/if}
       {#if demo}<div class="muted small">Demo: the mockup's own example, drawn from fixture data.</div>{/if}
-    </div>
-    <div class="scale" aria-label="Box height scale">
-      <div class="st">
-        <strong>Box height scale</strong>
-        <span class="muted">One step taller per doubling of capacity</span>
-      </div>
-      <div class="bars">
-        {#each scale as [label, gb] (label)}
-          <div class="b">
-            <span style="height: {scaleBarHeight(gb * (1 << 30))}px"></span>
-            <em class="muted mono">{label}</em>
-          </div>
-        {/each}
-      </div>
     </div>
     <div class="actions">
       {#if dirtyNames.length}<button onclick={discardAll} disabled={!!busy} title="Drop every pending edit">Discard edits</button>{/if}
@@ -505,46 +481,6 @@
     flex: 1 1 320px;
     padding-top: 8px;
   }
-  .scale {
-    display: flex;
-    gap: 16px;
-    align-items: flex-end;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 10px 14px;
-    flex: 0 1 auto;
-    max-width: 100%;
-  }
-  .st {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    font-size: 13px;
-    max-width: 190px;
-  }
-  .bars {
-    display: flex;
-    gap: 8px;
-    align-items: flex-end;
-  }
-  .b {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: flex-end;
-    gap: 3px;
-  }
-  .b span {
-    display: block;
-    width: 22px;
-    background: #3a4050;
-    border-radius: 3px 3px 0 0;
-  }
-  .b em {
-    font-style: normal;
-    font-size: 11px;
-  }
   .actions {
     display: flex;
     gap: 10px;
@@ -620,9 +556,6 @@
     .status {
       padding-left: 16px;
       padding-right: 16px;
-    }
-    .scale {
-      overflow-x: auto;
     }
   }
 </style>

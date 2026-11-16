@@ -255,14 +255,11 @@ export function amount(c: Pick<Chip, 'bytes' | 'whole' | 'piece'>): string {
   return short(c.bytes)
 }
 
-/** Box height: one step per doubling of capacity (the "Box height scale" legend). */
+/** Box height: one step per doubling of capacity. */
 export const BASE_GIB = 16
 export const STEP_PX = 40
 export function boxHeight(total: number): number {
   return 130 + STEP_PX * Math.max(0, Math.log2(Math.max(total, 1) / (BASE_GIB * GiB)))
-}
-export function scaleBarHeight(total: number): number {
-  return 10 + 6 * Math.max(0, Math.log2(total / (BASE_GIB * GiB)))
 }
 
 /** A model's pending placement, as a check (or a local estimate) says it would be. */
