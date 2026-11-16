@@ -134,7 +134,7 @@
     color: #10131a;
     font-weight: 600;
     font-size: 12px;
-    font-family: ui-monospace, 'JetBrains Mono', Menlo, monospace;
+    font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   }
   .seg:first-child {
     border-radius: 5px 0 0 5px;
@@ -172,7 +172,7 @@
     gap: 2px 18px;
     margin-top: 6px;
     color: var(--muted);
-    font-family: ui-monospace, 'JetBrains Mono', Menlo, monospace;
+    font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
     font-size: 12px;
   }
   .fields {

@@ -54,6 +54,7 @@
       Object.entries(loaded?.planned ?? {}).some(([sub, t]) => !['embeddings', 'output head', 'other'].includes(sub) && (t.ram ?? 0) + (t.disk ?? 0) > 0),
   )
   const host = $derived(loaded?.host ?? null)
+  const hostScratch = $derived(loaded?.measured?.find((r) => r.kind === 'host') ?? null)
 </script>
 
 <section class="details">
@@ -188,6 +189,11 @@
       </div>
       <ul class="effects">
         <li>The RAM rows are what the worker measured on that socket: the RAM tier's weights, the KV cache and the compute scratch. The disk tier is the kernel's page cache and is not counted here.</li>
+        {#if hostScratch && hostScratch.compute > (rows.find((r) => r.box.startsWith('ram'))?.scratch ?? 0) + (1 << 20)}
+          <li>
+            <strong>Compute scratch</strong>: llama.cpp reserves {size(hostScratch.compute)} on the host; {size(rows.filter((r) => r.box.startsWith('ram')).reduce((s, r) => s + r.scratch, 0))} of it is in RAM so far. The pages are counted once they are first used, so this grows after the first requests.
+          </li>
+        {/if}
         {#if offloadScratch}
           <li>
             <strong>GPU 0's compute scratch is larger than the others'</strong>: with weights in RAM or on disk, llama.cpp copies them to GPU 0 in pieces for big batches, and the staging space comes out of GPU 0.

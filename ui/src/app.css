@@ -13,7 +13,7 @@
   --bad: #ff6b6b;
   --radius: 10px;
   color-scheme: dark;
-  font-family: Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-family: Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, system-ui, -apple-system, sans-serif;
   font-size: 14px;
   background: var(--bg);
   color: var(--text);
@@ -85,7 +85,7 @@ select {
 }
 
 .mono {
-  font-family: ui-monospace, 'JetBrains Mono', Menlo, monospace;
+  font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
   font-size: 12.5px;
 }
 

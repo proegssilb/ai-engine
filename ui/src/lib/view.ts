@@ -385,8 +385,9 @@ export function buildView(input: ViewInput): View {
         if (r.compute > 0) scratch.push({ box, bytes: r.compute })
       }
     }
-    for (const [n, b] of Object.entries(host?.kv_cache_by_node ?? {})) if (b > 0) kvDests.push({ box: `ram${n}`, bytes: b })
-    for (const [n, b] of Object.entries(host?.compute_by_node ?? {})) if (b > 0) scratch.push({ box: `ram${n}`, bytes: b })
+    // a stray page or two on another socket isn't a piece worth drawing
+    for (const [n, b] of Object.entries(host?.kv_cache_by_node ?? {})) if (b >= MiB) kvDests.push({ box: `ram${n}`, bytes: b })
+    for (const [n, b] of Object.entries(host?.compute_by_node ?? {})) if (b >= MiB) scratch.push({ box: `ram${n}`, bytes: b })
     if (kvDests.length) {
       const k = catalog('kv', tag.name)
       merged.set('kv', { id: k.id, label: k.label, short: k.short ?? k.label, desc: k.desc, role: 'kv', order: k.order, bytes: kvDests.reduce((s, d) => s + d.bytes, 0), dests: kvDests, split: false, members: [] })
@@ -441,8 +442,8 @@ export function buildView(input: ViewInput): View {
         for (const n of nodes) {
           ;(ramExact[tag.name] ??= {})[Number(n)] = {
             weights: host.ram_tier_by_node?.[n] ?? 0,
-            kv: host.kv_cache_by_node?.[n] ?? 0,
-            scratch: host.compute_by_node?.[n] ?? 0,
+            kv: (host.kv_cache_by_node?.[n] ?? 0) >= MiB ? host.kv_cache_by_node![n] : 0,
+            scratch: (host.compute_by_node?.[n] ?? 0) >= MiB ? host.compute_by_node![n] : 0,
           }
         }
       }

@@ -719,28 +719,25 @@ pub struct HostAlloc {
 }
 
 /// Per node: the KV cache, the compute scratch and everything else, out of the
-/// measured host buffers. The chosen node is filled first (that is where they
-/// were allocated); a node never gets more than was measured on it.
+/// measured host buffers. They were allocated on the chosen node, so only that
+/// node's measurement is told apart (and never beyond what was measured there,
+/// pages count once touched); what other nodes hold is "other", not guessed.
 pub fn attribute(
     buffers: &BTreeMap<u32, u64>,
     node: u32,
     alloc: HostAlloc,
 ) -> [BTreeMap<u32, u64>; 3] {
     let (mut kv, mut cp, mut other) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
-    let (mut kv_left, mut cp_left) = (alloc.kv_cache, alloc.compute);
-    let mut order: Vec<u32> = buffers.keys().copied().collect();
-    order.sort_by_key(|n| (*n != node, *n));
-    for n in order {
-        let mut avail = buffers[&n];
-        let k = kv_left.min(avail);
-        avail -= k;
-        let c = cp_left.min(avail);
-        avail -= c;
-        kv_left -= k;
-        cp_left -= c;
+    for (&n, &measured) in buffers {
+        let (k, c) = if n == node {
+            let k = alloc.kv_cache.min(measured);
+            (k, alloc.compute.min(measured - k))
+        } else {
+            (0, 0)
+        };
         kv.insert(n, k);
         cp.insert(n, c);
-        other.insert(n, avail);
+        other.insert(n, measured - k - c);
     }
     [kv, cp, other]
 }
@@ -1169,7 +1166,7 @@ mod tests {
             kv_cache: 300,
             compute: 200,
         };
-        // chosen node 1 first: 300 + 200 fit there, the other 500 are "other"
+        // only the chosen node's buffers are told apart: 300 + 200 fit, 500 are "other"
         let [kv, cp, other] = attribute(&bufs, 1, alloc);
         assert_eq!((kv[&1], cp[&1], other[&1]), (300, 200, 500));
         assert_eq!((kv[&0], cp[&0], other[&0]), (0, 0, 100));
