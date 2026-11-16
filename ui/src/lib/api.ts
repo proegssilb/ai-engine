@@ -24,7 +24,7 @@ export interface ModelTag {
   name: string
   size: number
   modified_at: string
-  details: { family?: string; parameter_size?: string; quantization_level?: string }
+  details: { family?: string; parameter_size?: string; quantization_level?: string; /** replaces the generated one-line description (demo fixtures) */ summary?: string }
 }
 
 export interface Running {
@@ -41,6 +41,9 @@ export interface Device {
   total: number
   free: number
   gpu: boolean
+  pci_bus_id?: string | null
+  /** the PCI device's NUMA node; null/absent when the kernel doesn't say */
+  numa_node?: number | null
 }
 
 /** Latest value plus the min and max over the daemon's 60 s window (bytes). */
@@ -50,7 +53,7 @@ export interface Spread {
   max: number
 }
 
-/** One RAM box (all RAM, or one NUMA node) over the window. */
+/** One RAM box (all RAM, or one NUMA node) over the window. Our models' own memory is exact (from the workers); the rest is fuzzy. */
 export interface MemBox {
   node: number | null
   total: number
@@ -59,8 +62,16 @@ export interface MemBox {
   /** where the four borders between those segments sit, bytes from the left */
   edges: [Spread, Spread, Spread, Spread]
   meminfo: Record<'free' | 'cached' | 'buffers' | 'sreclaimable' | 'shmem', Spread>
-  /** our processes; model '' is the daemon itself */
-  models: { model: string; ours: Spread; disk_tier_bytes: number; disk_tier_resident: Spread }[]
+  /** loaded models: their disk tier's resident share is page cache (the kernel's) */
+  models: {
+    model: string
+    ours: Spread
+    weights: Spread
+    kv: Spread
+    scratch: Spread
+    disk_tier_bytes: number
+    disk_tier_resident: Spread
+  }[]
 }
 
 export interface MemoryWindow {
@@ -88,22 +99,49 @@ export interface HostReport {
   file_cache_by_node?: Record<string, number>
   /** KV cache, compute buffers and other host allocations per node */
   host_buffers_by_node?: Record<string, number>
+  /** host_buffers_by_node told apart (the KV cache and compute scratch as far as measured on that node) */
+  kv_cache_by_node?: Record<string, number>
+  compute_by_node?: Record<string, number>
+  other_buffers_by_node?: Record<string, number>
+  ram_tier_exact?: boolean
   problems: string[]
+}
+
+export interface DiskInfo {
+  path: string
+  total: number
+  free: number
+  /** NUMA node of the block device; null when unknown */
+  numa_node?: number | null
+  name?: string
 }
 
 export interface Machine {
   devices: Device[]
   ram: { total: number; available: number }
   numa: { node: number; total: number; free: number; cpus: string }[]
-  disk: { path: string; total: number; free: number }
-  disks: { path: string; total: number; free: number }[]
+  disk: DiskInfo
+  disks: DiskInfo[]
   cuda_build: boolean
   /** null until the daemon has taken its first sample */
   memory: MemoryWindow | null
-  models: { model: string; bytes_by_tier: Record<string, number>; misplaced: number; store: string | null; host?: HostReport | null }[]
+  models: MachineModel[]
 }
 
-/** One row of llama.cpp's dry-run memory breakdown (aie_llama::fit::Measured). */
+export interface MachineModel {
+  model: string
+  bytes_by_tier: Record<string, number>
+  /** subsystem label -> tier key (gpu0, ram, disk) -> bytes */
+  planned?: Record<string, Record<string, number>>
+  /** what the loaded context allocated, per device and on the host */
+  memory?: Measured[] | null
+  n_ctx?: number
+  misplaced: number
+  store: string | null
+  host?: HostReport | null
+}
+
+/** One row of llama.cpp's memory breakdown (aie_llama::fit::Measured). */
 export interface Measured {
   name: string
   kind: 'device' | 'host' | 'buffer_type'
@@ -128,6 +166,8 @@ export interface Placement {
     subsystems: Record<string, number>
   }
   intent: Intent | null
+  /** a saved placement that isn't loaded: subsystem -> tier key -> bytes it would use */
+  intended?: Record<string, Record<string, number>>
   loaded: null | {
     description: string
     n_ctx: number

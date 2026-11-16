@@ -1,173 +1,260 @@
 <script lang="ts">
-  // The machine as boxes: GPUs, RAM (per NUMA node when there are several),
-  // and the store's disk, each with what loaded models planned there.
+  // The machine as in the mockup: one panel per socket, each with that
+  // socket's CPU, RAM, GPUs and disks; every box holds one chip per
+  // (model, subsystem) piece placed there. Box height grows by one step per
+  // doubling of capacity; the usage bars inside stay linear.
   import RamBar from './RamBar.svelte'
-  import { bytes, sockets, type Machine, type MemBox } from './api'
+  import type { Machine } from './api'
+  import { amount, binCapacity, boxHeight, capacity, gib, size, type Chip, type HwBox, type ModelView, type View } from './view'
 
-  let { machine, colors }: { machine: Machine; colors: Record<string, string> } = $props()
+  let {
+    view,
+    machine,
+    selected,
+    onselect,
+  }: {
+    view: View
+    machine: Machine
+    selected: { model: string; sub: string | null } | null
+    onselect: (model: string, sub: string | null) => void
+  } = $props()
 
-  interface Box {
-    key: string
-    title: string
-    detail: string
-    total: number
-    used: number
-    models: { model: string; bytes: number }[]
-    /** shown as "runs" chips instead of byte chips (CPU boxes) */
-    runs?: boolean
-    /** the fuzzy RAM bar, for RAM boxes once the daemon has samples */
-    mem?: MemBox
+  const byName = $derived(Object.fromEntries(view.models.map((m) => [m.name, m])) as Record<string, ModelView>)
+  const chipsOf = (b: HwBox): Chip[] => (view.chips[b.key] ?? []).filter((c) => c.kind !== 'runs')
+  const runsOf = (b: HwBox): Chip[] => (view.chips[b.key] ?? []).filter((c) => c.kind === 'runs')
+  const ours = (b: HwBox) => chipsOf(b).reduce((s, c) => s + c.bytes, 0)
+  const isSel = (c: Chip) => !!selected && selected.model === c.model && selected.sub !== null && selected.sub === c.sub
+  const capText = (b: HwBox) => (b.kind === 'disk' ? capacity(b.total) : binCapacity(b.total))
+  const oursText = (b: HwBox) => {
+    const o = ours(b)
+    return o >= (1 << 30) / 10 || o === 0 ? gib(o) : size(o)
   }
-
-  let boxes = $derived.by((): Box[] => {
-    const usage = (key: string) =>
-      machine.models.map((m) => ({ model: m.model, bytes: m.bytes_by_tier[key] ?? 0 })).filter((m) => m.bytes > 0)
-    const out: Box[] = []
-    machine.devices
-      .filter((d) => d.gpu)
-      .forEach((d, i) =>
-        out.push({ key: `gpu${i}`, title: `GPU ${i}`, detail: d.description, total: d.total, used: d.total - d.free, models: usage(`gpu${i}`) }),
-      )
-    // One RAM box, or one per NUMA node when there are several.
-    const mem = machine.memory
-    const socks = sockets(machine.numa)
-    if (socks.length > 1) {
-      // Per socket, as in the mockup: a CPU box (models whose threads run
-      // there) and a RAM box (models' RAM tier, where it measurably is).
-      socks.forEach((n) => {
-        const mb = mem?.nodes.find((x) => x.node === n.node)
-        out.push({
-          key: `cpu${n.node}`,
-          title: `CPU ${n.node}`,
-          detail: `Compute only. Runs what sits in RAM ${n.node}. CPUs ${n.cpus}`,
-          total: 0,
-          used: 0,
-          runs: true,
-          models: machine.models
-            .filter((m) => m.host?.node === n.node)
-            .map((m) => ({ model: m.model, bytes: m.host?.affinity.cpus ?? 0 })),
-        })
-        out.push({
-          key: `ram${n.node}`,
-          title: `RAM ${n.node}`,
-          detail: `Socket ${n.node}`,
-          total: n.total,
-          used: n.total - n.free,
-          models: machine.models
-            .map((m) => ({ model: m.model, bytes: m.host?.ram_tier_by_node?.[String(n.node)] ?? 0 }))
-            .filter((m) => m.bytes > 0),
-          mem: mb,
-        })
-      })
-    } else {
-      out.push({
-        key: 'ram',
-        title: 'RAM',
-        detail: `${machine.numa.length} NUMA node${machine.numa.length === 1 ? '' : 's'}`,
-        total: machine.ram.total,
-        used: machine.ram.total - machine.ram.available,
-        models: usage('ram'),
-        mem: mem?.system,
-      })
-    }
-    // one box per store: a model's disk tier is on the disk its store is on
-    const disks = machine.disks?.length ? machine.disks : [machine.disk]
-    disks.forEach((d, i) =>
-      out.push({
-        key: `disk:${d.path}`,
-        title: disks.length > 1 ? `Disk ${i}` : 'Disk',
-        detail: d.path,
-        total: d.total,
-        used: d.total - d.free,
-        models: machine.models
-          .filter((m) => (m.store ?? disks[0].path) === d.path)
-          .map((m) => ({ model: m.model, bytes: m.bytes_by_tier['disk'] ?? 0 }))
-          .filter((m) => m.bytes > 0),
-      }),
-    )
-    return out
-  })
-
-  // Box height grows a step per doubling of capacity, as in the mockup.
-  const height = (total: number) => 90 + 18 * Math.max(0, Math.log2(Math.max(total, 1) / (8 << 30)))
+  // linear usage bar: our pieces in model colours, then whatever else the device reports used
+  function segs(b: HwBox) {
+    const T = Math.max(b.total, 1)
+    const out = chipsOf(b).map((c) => ({ w: (100 * c.bytes) / T, color: byName[c.model]?.color ?? '#888', kind: c.kind }))
+    const other = Math.max(0, (b.deviceUsed ?? 0) - ours(b))
+    return { out, other: (100 * other) / T }
+  }
+  const memBox = (node: number | null) => (node === null ? undefined : machine.memory ? (machine.memory.nodes.length ? machine.memory.nodes.find((n) => n.node === node) : machine.memory.system) : undefined)
 </script>
 
 <div class="machine">
-  {#each boxes as b (b.key)}
-    <div class="box panel" style="min-height: {height(b.total)}px">
-      <div class="head">
-        <h3>{b.title}</h3>
-        {#if !b.runs}<span class="muted mono">{bytes(b.used)} / {bytes(b.total)}</span>{/if}
-      </div>
-      <div class="muted detail" title={b.detail}>{b.detail}</div>
-      {#if b.runs}
-        <!-- CPU boxes have no bar: they run what sits in their RAM box -->
-      {:else if b.mem}
-        <RamBar box={b.mem} {colors} />
-      {:else}
-        <div class="bar"><span style="width: {(100 * b.used) / Math.max(b.total, 1)}%; background: var(--accent)"></span></div>
-      {/if}
-      {#each b.models as m (m.model)}
-        <div class="chip" style="border-color: {colors[m.model]}">
-          <span class="swatch" style="background: {colors[m.model]}"></span>
-          <span class="name" title={m.model}>{m.model.replace(/^hf\.co\//, '')}</span>
-          <span class="mono">{b.runs ? 'runs' : bytes(m.bytes)}</span>
-        </div>
+  {#each view.panels as p (p.key)}
+    <section class="socket" class:detached={p.node === null}>
+      <header>
+        <h3>{p.title}</h3>
+        <span class="muted mono">{p.tag}</span>
+      </header>
+      {#each [['cpu', 'ram'], ['gpu'], ['disk']] as group (group.join())}
+        {@const boxes = p.boxes.filter((b) => group.includes(b.kind))}
+        {#if boxes.length}
+          <div class="row {group[0]}" style="--n: {boxes.length}">
+            {#each boxes as b (b.key)}
+              {@const s = b.kind === 'gpu' || b.kind === 'disk' ? segs(b) : null}
+              <div class="box {b.kind}" style="min-height: {boxHeight(b.kind === 'cpu' ? (view.boxes[`ram${b.node}`]?.total ?? 0) : b.total)}px" title={b.path ?? b.detail ?? ''}>
+                <div class="bh">
+                  <h4>{b.title}</h4>
+                  {#if b.kind === 'cpu'}
+                    <span class="muted mono">{b.detail}</span>
+                  {:else}
+                    <span class="muted mono">{oursText(b)} / {capText(b)}</span>
+                  {/if}
+                </div>
+                {#if b.kind === 'cpu'}
+                  <p class="cpu-note muted">Compute only. Runs what sits in RAM {b.node}.</p>
+                  {#each runsOf(b) as c (c.id)}
+                    {@render chip(c)}
+                  {/each}
+                {:else}
+                  {#if b.kind === 'ram'}
+                    <RamBar mem={memBox(b.node)} total={b.total} node={b.node ?? 0} models={view.models} exact={view.ram} />
+                  {:else if s}
+                    <div class="bar">
+                      {#each s.out as x, i (i)}<span class={x.kind} style="width: {x.w}%; background: {x.color}"></span>{/each}
+                      {#if s.other > 0}<span style="width: {s.other}%; background: var(--seg-other, #7d8597)" title="used by other processes"></span>{/if}
+                    </div>
+                  {/if}
+                  {#each chipsOf(b) as c (c.id)}
+                    {@render chip(c)}
+                  {/each}
+                  {#if b.kind === 'disk'}
+                    <div class="free">{chipsOf(b).length ? '' : 'Empty. '}{capacity(Math.max(0, b.total - (b.deviceUsed ?? 0)))} free</div>
+                  {:else if !chipsOf(b).length}
+                    <div class="empty">Empty.</div>
+                  {/if}
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {/if}
       {/each}
-      {#if b.runs && !b.models.length}<div class="muted small">No model's threads run here.</div>{/if}
-      {#if b.key.startsWith('disk') && b.models.length}
-        <div class="muted small">Disk tier: may be dropped from RAM, never forced out.</div>
-      {/if}
-    </div>
+    </section>
   {/each}
   {#if !machine.cuda_build}
-    <div class="muted small">This build has no CUDA backend, so no GPUs are shown.</div>
+    <div class="muted small note">This build has no CUDA backend, so no GPUs are shown.</div>
   {/if}
 </div>
+
+{#snippet chip(c: Chip)}
+  {@const m = byName[c.model]}
+  <button class="chip {c.kind}" class:piece={c.piece} class:sel={isSel(c)} style="--c: {m?.color}" title={c.title ?? `${m?.title}: ${c.label}`} onclick={() => onselect(c.model, c.sub || null)}>
+    <span class="badge">{m?.letter}</span>
+    <span class="lbl">{c.label}</span>
+    <span class="amt mono">{c.kind === 'runs' ? 'runs' : amount(c)}</span>
+  </button>
+{/snippet}
 
 <style>
   .machine {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-    gap: 12px;
-    align-items: start;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr));
+    gap: 14px;
+    align-items: stretch;
   }
-  .head {
+  .socket {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+  }
+  .socket.detached {
+    border-style: dashed;
+  }
+  header {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
+    padding: 2px 4px;
   }
-  .detail {
-    font-size: 12px;
-    margin: 4px 0 8px;
+  header h3 {
+    font-size: 17px;
+  }
+  .row {
+    display: grid;
+    gap: 10px;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 135px), 1fr));
+  }
+  .row.cpu {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+  }
+  .box {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+  }
+  .box.cpu {
+    background: transparent;
+    border-style: dashed;
+  }
+  .bh {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0 8px;
+    flex-wrap: wrap;
+  }
+  .bh .mono {
+    font-size: 11.5px;
     white-space: nowrap;
+  }
+  h4 {
+    margin: 0;
+    font-size: 14.5px;
+    font-weight: 600;
+  }
+  .cpu-note {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.3;
+  }
+  .bar {
+    display: flex;
+    height: 6px;
+    background: var(--bg);
+    border-radius: 3px;
     overflow: hidden;
-    text-overflow: ellipsis;
+  }
+  .bar span {
+    display: block;
+    height: 100%;
+  }
+  .bar span.kv {
+    opacity: 0.6;
   }
   .chip {
     display: flex;
-    gap: 8px;
     align-items: center;
-    border: 1px solid;
+    gap: 2px 7px;
+    flex-wrap: wrap;
+    text-align: left;
+    padding: 3px 6px;
+    border: 1.5px solid var(--c);
     border-radius: 7px;
-    padding: 5px 8px;
-    margin-top: 8px;
-    background: var(--panel-2);
+    background: color-mix(in srgb, var(--c) 14%, var(--bg));
+    font-size: 12.5px;
+    width: 100%;
   }
-  .swatch {
-    width: 10px;
-    height: 10px;
-    border-radius: 3px;
+  .chip:hover:not(:disabled) {
+    border-color: var(--c);
+    filter: brightness(1.15);
+  }
+  .chip.piece {
+    border-style: dashed;
+  }
+  .chip.sel {
+    border-color: #fff;
+    border-style: solid;
+    box-shadow: 0 0 0 1px #fff;
+  }
+  .chip.scratch .lbl {
+    font-style: italic;
+  }
+  .badge {
+    width: 18px;
+    height: 18px;
+    border-radius: 5px;
+    background: var(--c);
+    color: #10131a;
+    font-weight: 700;
+    font-size: 11px;
+    display: grid;
+    place-items: center;
     flex: none;
   }
-  .name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  .lbl {
+    flex: 1 1 auto;
+    min-width: 5em;
   }
-  .small {
+  .amt {
+    color: var(--muted);
+    white-space: nowrap;
     font-size: 12px;
-    margin-top: 8px;
+    margin-left: auto;
+  }
+  .free,
+  .empty {
+    flex: 1;
+    display: grid;
+    place-items: center;
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 4px;
+    min-height: 40px;
+    text-align: center;
+  }
+  .note {
+    grid-column: 1 / -1;
   }
 </style>
