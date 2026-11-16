@@ -256,7 +256,11 @@ async fn serve_load_chat_place() {
     })
     .await
     .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!out.stdout.is_empty(), "no reply on stdout");
     assert!(String::from_utf8_lossy(&out.stderr).contains("tok/s"));
     // an unknown model is an error with the daemon's message and a non-zero exit

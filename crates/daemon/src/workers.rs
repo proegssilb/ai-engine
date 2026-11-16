@@ -241,15 +241,7 @@ impl Manager {
         let _ = tokio::fs::remove_file(&cfg_path).await;
         let out = out.map_err(|e| format!("starting {}: {e}", self.cfg.worker_exe.display()))?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let last = err
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            // The CLI prints the reason as "error: ..."; callers add the model's name.
-            return Err(last.strip_prefix("error: ").unwrap_or(last).to_string());
+            return Err(error_reason(&String::from_utf8_lossy(&out.stderr)));
         }
         serde_json::from_slice(&out.stdout).map_err(|e| format!("dry run output: {e}"))
     }
@@ -463,4 +455,41 @@ fn tail(path: &Path, n: usize) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The reason from a CLI's stderr, on one line: what follows its last
+/// `error: `, which may span lines (the fit report). For a fit report, only
+/// the devices that don't fit are kept. Callers add the model's name.
+fn error_reason(stderr: &str) -> String {
+    let start = stderr.rfind("error: ").map_or(0, |i| i + "error: ".len());
+    let lines: Vec<String> = stderr[start..]
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let short: Vec<String> = lines
+        .iter()
+        .filter(|l| l.ends_with("DOES NOT FIT"))
+        .map(|l| l.trim_end_matches("DOES NOT FIT").trim_end().to_string())
+        .collect();
+    match lines.first() {
+        Some(head) if !short.is_empty() => format!("{head} {}", short.join("; ")),
+        _ => lines.join("; "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn error_reasons_are_one_line_and_name_what_does_not_fit() {
+        let fit = "llama log noise\nerror: this placement doesn't fit:\nRAM          15000 MiB needed of      7000 free (weights 600, KV 14000, expert cache 0, overhead 256)  DOES NOT FIT\ndisk             0 MiB mapped (may be dropped from RAM)\n";
+        assert_eq!(
+            super::error_reason(fit),
+            "this placement doesn't fit: RAM 15000 MiB needed of 7000 free (weights 600, KV 14000, expert cache 0, overhead 256)"
+        );
+        assert_eq!(
+            super::error_reason("error: GPU 3 doesn't exist (this machine has 0)\n"),
+            "GPU 3 doesn't exist (this machine has 0)"
+        );
+    }
 }
