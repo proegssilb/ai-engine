@@ -57,6 +57,12 @@ enum Cmd {
     /// Internal: print the devices llama.cpp sees, as JSON (used by the daemon).
     #[command(hide = true)]
     Probe,
+    /// Internal: what a placement would need, without loading (used by the daemon).
+    #[command(hide = true)]
+    DryRun {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Internal: one model's worker process, started by the daemon.
     #[command(hide = true)]
     Worker {
@@ -91,6 +97,15 @@ fn main() {
             }
             Cmd::Probe => {
                 println!("{}", aie_worker::probe());
+                Ok(())
+            }
+            Cmd::DryRun { config } => {
+                let text = std::fs::read_to_string(&config)
+                    .map_err(|e| format!("{}: {e}", config.display()))?;
+                let cfg: aie_worker::Config = serde_json::from_str(&text)
+                    .map_err(|e| format!("{}: {e}", config.display()))?;
+                let d = aie_worker::dry_run(&cfg)?;
+                println!("{}", serde_json::to_string(&d).map_err(|e| e.to_string())?);
                 Ok(())
             }
             Cmd::Worker { config, socket } => {

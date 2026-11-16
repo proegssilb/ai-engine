@@ -103,12 +103,23 @@ fn planned_by_subsystem(a: &Anatomy, plan: &Plan) -> BTreeMap<String, BTreeMap<S
 
 /// How many GPUs an intent mentions (the daemon has no CUDA to ask).
 fn intent_gpus(i: &Intent) -> u32 {
-    let gpu = |t: &Tier| if let Tier::Gpu(g) = t { Some(g + 1) } else { None };
+    let gpu = |t: &Tier| {
+        if let Tier::Gpu(g) = t {
+            Some(g + 1)
+        } else {
+            None
+        }
+    };
     i.layers
         .iter()
         .chain(i.subsystems.values().flatten())
         .filter_map(|s| gpu(&s.tier))
-        .chain([i.embeddings, i.output].into_iter().flatten().filter_map(|t| gpu(&t)))
+        .chain(
+            [i.embeddings, i.output]
+                .into_iter()
+                .flatten()
+                .filter_map(|t| gpu(&t)),
+        )
         .max()
         .unwrap_or(0)
 }
@@ -143,11 +154,19 @@ fn misplaced_detail(a: &Anatomy, plan: &Plan, report: &Value) -> Vec<Value> {
         else {
             continue;
         };
-        if actual.get("Tier").and_then(|t| serde_json::from_value::<Tier>(t.clone()).ok()) == Some(*planned) {
+        if actual
+            .get("Tier")
+            .and_then(|t| serde_json::from_value::<Tier>(t.clone()).ok())
+            == Some(*planned)
+        {
             continue;
         }
         let e = groups
-            .entry((part.subsystem.label().into(), tier_key(planned), where_text(actual)))
+            .entry((
+                part.subsystem.label().into(),
+                tier_key(planned),
+                where_text(actual),
+            ))
             .or_default();
         e.0 += 1;
         e.1 += part.bytes;
@@ -264,6 +283,221 @@ pub async fn put_placement(st: State, Body(r): Body<PutReq>) -> Result<Json<Valu
     };
     Ok(Json(
         json!({ "model": res.name, "saved": r.intent.is_some(), "unloaded": unloaded }),
+    ))
+}
+
+/// One model's pending placement: an intent, or `null` for automatic
+/// (llama.cpp's own fit).
+#[derive(Deserialize)]
+pub struct Edit {
+    model: String,
+    #[serde(default)]
+    intent: Option<Intent>,
+}
+
+#[derive(Deserialize)]
+pub struct EditsReq {
+    edits: Vec<Edit>,
+}
+
+/// An edit made ready to check and apply.
+struct Prepared {
+    name: String,
+    intent: Option<Intent>,
+    spec: Option<crate::workers::LoadSpec>,
+    need: Result<crate::apply::Usage, String>,
+    planned: Value,
+    loaded: Option<crate::apply::Usage>,
+}
+
+async fn prepare(st: &State, edits: Vec<Edit>) -> Vec<Prepared> {
+    let one = |e: Edit| async move {
+        let mut p = Prepared {
+            name: e.model.clone(),
+            intent: e.intent.clone(),
+            spec: None,
+            need: Err(String::new()),
+            planned: Value::Null,
+            loaded: None,
+        };
+        let r = match st.0.resolve(&e.model) {
+            Ok(r) => r,
+            Err(err) => {
+                p.need = Err(err.1);
+                return p;
+            }
+        };
+        p.name = r.name.clone();
+        let a = match anatomy(&r.path) {
+            Ok(a) => a,
+            Err(err) => {
+                p.need = Err(err.1);
+                return p;
+            }
+        };
+        let w = st.0.workers.get(&r.name).await;
+        if let Some(w) = &w
+            && let Ok(plan) = serde_json::from_str::<Plan>(&w.status.plan_json)
+            && let Ok(m) = serde_json::from_str::<Vec<aie_worker::Measured>>(&w.status.memory_json)
+        {
+            p.loaded = Some(crate::apply::usage(&a, &plan, &m));
+        }
+        if let Some(i) = &e.intent {
+            if let Err(err) = aie_plan::plan(&a, i, intent_gpus(i)) {
+                p.need = Err(err.to_string());
+                return p;
+            }
+            let topo = aie_worker::numa::Topology::read(std::path::Path::new("/"));
+            if let Err(err) = aie_worker::numa::choose(&topo, i.host_node, &[], &[]) {
+                p.need = Err(err);
+                return p;
+            }
+        }
+        let n_ctx = match &e.intent {
+            Some(i) => u32::try_from(i.n_ctx).unwrap_or(u32::MAX),
+            None => w.as_ref().map_or(st.0.cfg.n_ctx, |w| w.n_ctx),
+        };
+        let placement = match &e.intent {
+            Some(i) => aie_worker::Placement::Intent { intent: i.clone() },
+            None => aie_worker::Placement::Auto {
+                n_ctx_min: 512.min(n_ctx),
+                margin: 512 << 20,
+            },
+        };
+        let spec = crate::workers::LoadSpec {
+            name: r.name.clone(),
+            path: r.path.clone(),
+            placement,
+            n_ctx,
+        };
+        match st.0.workers.dry_run(&spec).await {
+            Ok(d) => {
+                p.planned = json!(planned_by_subsystem(&a, &d.plan));
+                p.need = Ok(crate::apply::usage(&a, &d.plan, &d.measured));
+                p.spec = Some(spec);
+            }
+            Err(err) => p.need = Err(err),
+        }
+        p
+    };
+    futures_util::future::join_all(edits.into_iter().map(one)).await
+}
+
+async fn check_prepared(
+    st: &State,
+    prepared: &[Prepared],
+) -> Result<crate::apply::Check, ApiError> {
+    let probe = probe(&st.0.cfg.worker_exe).await?;
+    let mut devices: Vec<crate::apply::Device> = probe["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["gpu"].as_bool() == Some(true))
+        .map(|d| crate::apply::Device {
+            name: d["name"].as_str().unwrap_or_default().to_string(),
+            total: d["total"].as_u64().unwrap_or(0),
+            free: d["free"].as_u64().unwrap_or(0),
+        })
+        .collect();
+    devices.push(crate::apply::Device {
+        name: crate::apply::RAM.into(),
+        total: probe["ram"]["total"].as_u64().unwrap_or(0),
+        free: probe["ram"]["available"].as_u64().unwrap_or(0),
+    });
+    let edits: Vec<_> = prepared
+        .iter()
+        .map(|p| (p.name.clone(), p.need.clone()))
+        .collect();
+    let loaded: Vec<_> = prepared
+        .iter()
+        .filter_map(|p| Some((p.name.clone(), p.loaded.clone()?)))
+        .collect();
+    Ok(crate::apply::check(&devices, &edits, &loaded))
+}
+
+fn check_json(prepared: &[Prepared], c: &crate::apply::Check) -> Value {
+    let models: serde_json::Map<String, Value> = prepared
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                json!({
+                    "planned": p.planned,
+                    "need": p.need.as_ref().ok(),
+                    "error": p.need.as_ref().err(),
+                }),
+            )
+        })
+        .collect();
+    json!({ "fits": c.fits, "devices": c.devices, "problems": c.problems, "models": models })
+}
+
+/// Check pending placements for several models together, without changing
+/// anything: what each would put where, and whether they fit side by side.
+pub async fn check_edits(st: State, Body(r): Body<EditsReq>) -> Result<Json<Value>, ApiError> {
+    let prepared = prepare(&st, r.edits).await;
+    let c = check_prepared(&st, &prepared).await?;
+    Ok(Json(check_json(&prepared, &c)))
+}
+
+/// Apply pending placements for several models at once. They're checked
+/// together first; if they don't fit, nothing changes. Otherwise every edited
+/// model is saved, the loaded ones are unloaded, and each is loaded with its
+/// new placement and verified. A model that still fails to load goes back to
+/// its previous placement (and is loaded again if it was loaded).
+pub async fn apply_edits(st: State, Body(r): Body<EditsReq>) -> Result<Json<Value>, ApiError> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one = ONE.lock().await;
+    let prepared = prepare(&st, r.edits).await;
+    let c = check_prepared(&st, &prepared).await?;
+    let check = check_json(&prepared, &c);
+    if !c.fits {
+        return Ok(Json(
+            json!({ "applied": false, "check": check, "results": [] }),
+        ));
+    }
+    // Save all, then free everything the edits replace, then load each.
+    let mut previous = Vec::new();
+    for p in &prepared {
+        previous.push(st.0.saved_intent(&p.name)?);
+        st.0.save_intent(&p.name, p.intent.as_ref())?;
+    }
+    let mut was_loaded = Vec::new();
+    for p in &prepared {
+        was_loaded.push(st.0.workers.unload(&p.name).await);
+    }
+    let mut results = Vec::new();
+    for ((p, prev), loaded) in prepared.iter().zip(previous).zip(was_loaded) {
+        let spec = p.spec.as_ref().expect("checked edits have a spec");
+        let keep = Some(st.0.cfg.keep_alive);
+        match st.0.workers.lease(spec, keep).await {
+            Ok(lease) => {
+                results.push(json!({
+                    "model": p.name, "ok": true,
+                    "misplaced": lease.status.misplaced,
+                    "warnings": lease.status.warnings,
+                }));
+            }
+            Err(err) => {
+                // Back to what it was, so a failed apply doesn't strand the model.
+                st.0.save_intent(&p.name, prev.as_ref())?;
+                let restored = if loaded {
+                    let r = st.0.resolve(&p.name)?;
+                    let spec = st.0.load_spec(&r, Some(spec.n_ctx))?;
+                    st.0.workers.lease(&spec, keep).await.is_ok()
+                } else {
+                    false
+                };
+                results.push(json!({
+                    "model": p.name, "ok": false, "error": err,
+                    "restored": prev.is_some() || loaded,
+                    "reloaded_previous": restored,
+                }));
+            }
+        }
+    }
+    Ok(Json(
+        json!({ "applied": true, "check": check, "results": results }),
     ))
 }
 
@@ -413,7 +647,10 @@ mod tests {
         assert_eq!(d[0]["subsystem"], "attention");
         assert_eq!(d[0]["planned"], "gpu0");
         assert_eq!(d[0]["actual"], "a CUDA_Host buffer");
-        assert_eq!((d[0]["tensors"].as_u64(), d[0]["bytes"].as_u64()), (Some(1), Some(20)));
+        assert_eq!(
+            (d[0]["tensors"].as_u64(), d[0]["bytes"].as_u64()),
+            (Some(1), Some(20))
+        );
         assert_eq!(d[1]["subsystem"], "dense ffn");
         assert_eq!(d[1]["actual"], "host memory, seen only via copies");
         // all where planned: nothing to report

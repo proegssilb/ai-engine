@@ -133,7 +133,7 @@ fn convert(rows: &[MemRow]) -> Vec<Measured> {
 
 /// What a live context really allocated, per device and on the host: the
 /// same rows as [`measure`], but read from the allocated buffers.
-pub fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
+pub(crate) fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
     let mut rows = vec![
         MemRow {
             name: [0; 128],

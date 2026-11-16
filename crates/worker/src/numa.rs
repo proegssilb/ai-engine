@@ -1191,21 +1191,41 @@ mod tests {
             std::os::unix::fs::symlink(root.join(target), l).unwrap();
         };
         // sda1 -> sda, whose device/ has numa_node 1
-        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1")).unwrap();
-        w("sys/devices/pci0000:00/0000:00:1f.2/block/sda/device/numa_node", "1\n");
-        link("sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1", "sys/dev/block/8:1");
-        link("sys/devices/pci0000:00/0000:00:1f.2/block/sda", "sys/dev/block/8:0");
+        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1"))
+            .unwrap();
+        w(
+            "sys/devices/pci0000:00/0000:00:1f.2/block/sda/device/numa_node",
+            "1\n",
+        );
+        link(
+            "sys/devices/pci0000:00/0000:00:1f.2/block/sda/sda1",
+            "sys/dev/block/8:1",
+        );
+        link(
+            "sys/devices/pci0000:00/0000:00:1f.2/block/sda",
+            "sys/dev/block/8:0",
+        );
         assert_eq!(block_node(root, 8, 1), Some(1));
         assert_eq!(block_node(root, 8, 0), Some(1));
         // NVMe namespace: only the PCI device up the tree knows
-        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2")).unwrap();
+        fs::create_dir_all(
+            root.join("sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2"),
+        )
+        .unwrap();
         w("sys/devices/pci0000:00/0000:00:04.0/numa_node", "0\n");
-        link("sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2", "sys/dev/block/259:2");
+        link(
+            "sys/devices/pci0000:00/0000:00:04.0/nvme/nvme0/nvme0n1/nvme0n1p2",
+            "sys/dev/block/259:2",
+        );
         assert_eq!(block_node(root, 259, 2), Some(0));
         // unknown (-1) is unknown, not node 0
-        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda")).unwrap();
+        fs::create_dir_all(root.join("sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda"))
+            .unwrap();
         w("sys/devices/pci0000:00/0000:00:05.0/numa_node", "-1\n");
-        link("sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda", "sys/dev/block/252:0");
+        link(
+            "sys/devices/pci0000:00/0000:00:05.0/virtio2/block/vda",
+            "sys/dev/block/252:0",
+        );
         assert_eq!(block_node(root, 252, 0), None);
         // no such device
         assert_eq!(block_node(root, 1, 1), None);

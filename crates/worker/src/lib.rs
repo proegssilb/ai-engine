@@ -6,6 +6,8 @@
 //! the protocol already allows more in flight).
 
 pub mod numa;
+/// llama.cpp's dry-run memory row, for callers of [`dry_run`].
+pub use aie_llama::fit::Measured;
 pub mod ram_tier;
 pub mod stop;
 
@@ -204,6 +206,40 @@ fn load_warnings() -> Vec<String> {
     }
     out.dedup();
     out
+}
+
+/// What a placement would need, without loading the model: the plan, and
+/// llama.cpp's own dry-run breakdown per device (the same numbers the load
+/// checks against). Nothing is pinned or allocated, so the daemon can ask
+/// about several pending placements before applying any of them.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DryRun {
+    pub plan: Plan,
+    pub measured: Vec<aie_llama::fit::Measured>,
+}
+
+pub fn dry_run(cfg: &Config) -> Result<DryRun, String> {
+    let gguf = aie_gguf::Gguf::open(&cfg.model).map_err(|e| e.to_string())?;
+    let anatomy = aie_anatomy::Anatomy::from_gguf(&gguf).map_err(|e| e.to_string())?;
+    let topo = numa::Topology::read(Path::new("/"));
+    let requested = match &cfg.placement {
+        Placement::Intent { intent } => intent.host_node,
+        Placement::Planned { plan, .. } => plan.host_node,
+        Placement::Auto { .. } => None,
+    };
+    numa::choose(&topo, requested, &[], &[])?;
+    let (plan, settings) = decide(cfg, &anatomy)?;
+    // Same buffer types as a real load, minus anything with side effects.
+    let pin = aie_llama::pinned::PinOptions {
+        numa_node: None,
+        mlock: false,
+        cuda_register: false,
+        ..cfg.pin.clone()
+    };
+    let opts = LoadOptions { settings, pin };
+    let measured =
+        aie_llama::fit::measure(&cfg.model, &opts, &cfg.context).map_err(|e| e.to_string())?;
+    Ok(DryRun { plan, measured })
 }
 
 /// Load the model and check its placement. Blocking; run before serving.

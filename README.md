@@ -63,7 +63,12 @@ target/release/ai-engine place hf.co/Qwen/Qwen3-8B-GGUF   # where every weight r
 The API is ollama-compatible under `/api` and OpenAI-compatible under `/v1`,
 so existing clients work by pointing them at port 11435. Placement:
 `GET/PUT /api/aie/placement`, or `ai-engine place MODEL --set intent.json`
-(see [crates/plan](crates/plan/src/lib.rs) for the intent format).
+(see [crates/plan](crates/plan/src/lib.rs) for the intent format). To change
+several models at once, `POST /api/aie/placement/check` with
+`{"edits": [{"model": ..., "intent": ... or null for automatic}]}` says what each
+would put where and whether they fit together, without changing anything;
+`POST /api/aie/placement/apply` with the same body applies them all, or none
+if they don't fit.
 
 Settings go in `~/.ai-engine/config.toml` (`listen`, `stores` (one per disk), `keep_alive`,
 `n_ctx`, `n_batch`, `threads`, `load_timeout`) or `AIE_HOME` / `AIE_HOST`.

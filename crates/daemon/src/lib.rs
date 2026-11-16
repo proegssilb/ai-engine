@@ -4,6 +4,7 @@
 //! against devices and llama.cpp's fit run in the workers.
 
 pub mod api;
+pub mod apply;
 pub mod config;
 pub mod memory;
 pub mod stores;
@@ -206,8 +207,18 @@ impl Daemon {
 
     /// The load spec for a model: saved intent, else llama.cpp's own fit.
     pub fn load_spec(&self, r: &Resolved, n_ctx: Option<u32>) -> Result<LoadSpec, ApiError> {
-        let n_ctx = n_ctx.unwrap_or(self.cfg.n_ctx);
-        let placement = match self.saved_intent(&r.name)? {
+        // The request's context wins; else the one saved with the placement
+        // (set in the UI); else the config's default.
+        let saved = self.saved_intent(&r.name)?;
+        let n_ctx = n_ctx
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .and_then(|i| u32::try_from(i.n_ctx).ok())
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(self.cfg.n_ctx);
+        let placement = match saved {
             Some(mut intent) => {
                 intent.n_ctx = u64::from(n_ctx);
                 Placement::Intent { intent }

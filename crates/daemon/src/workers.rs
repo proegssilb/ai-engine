@@ -199,6 +199,61 @@ impl Manager {
         }
     }
 
+    fn worker_config(&self, spec: &LoadSpec) -> aie_worker::Config {
+        aie_worker::Config {
+            model: spec.path.clone(),
+            placement: spec.placement.clone(),
+            pin: aie_llama_pin_defaults(),
+            context: aie_worker::ContextParams {
+                n_ctx: spec.n_ctx,
+                n_batch: self.cfg.n_batch,
+                // 0 = the worker uses one thread per CPU of its socket.
+                threads: self.cfg.threads.max(0),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// What loading `spec` would need, from llama.cpp's dry run in a short-lived
+    /// process (the daemon doesn't link a GPU backend's state). Loads nothing.
+    pub async fn dry_run(&self, spec: &LoadSpec) -> Result<aie_worker::DryRun, String> {
+        let run = self.cfg.home.join("run");
+        tokio::fs::create_dir_all(&run)
+            .await
+            .map_err(|e| format!("{}: {e}", run.display()))?;
+        let id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let cfg_path = run.join(format!(
+            "{}-{}-dry{id}.json",
+            sanitize(&spec.name),
+            std::process::id()
+        ));
+        let json =
+            serde_json::to_vec_pretty(&self.worker_config(spec)).map_err(|e| e.to_string())?;
+        tokio::fs::write(&cfg_path, json)
+            .await
+            .map_err(|e| e.to_string())?;
+        let out = Command::new(&self.cfg.worker_exe)
+            .arg("dry-run")
+            .arg("--config")
+            .arg(&cfg_path)
+            .output()
+            .await;
+        let _ = tokio::fs::remove_file(&cfg_path).await;
+        let out = out.map_err(|e| format!("starting {}: {e}", self.cfg.worker_exe.display()))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let last = err
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            // The CLI prints the reason as "error: ..."; callers add the model's name.
+            return Err(last.strip_prefix("error: ").unwrap_or(last).to_string());
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("dry run output: {e}"))
+    }
+
     async fn spawn(&self, spec: &LoadSpec) -> Result<Arc<Worker>, String> {
         let run = self.cfg.home.join("run");
         let logs = self.cfg.home.join("logs");
@@ -224,18 +279,7 @@ impl Manager {
         }
         let cfg_path = run.join(format!("{}-{id}.json", sanitize(&spec.name)));
         let log_path = logs.join(format!("{}.log", sanitize(&spec.name)));
-        let wcfg = aie_worker::Config {
-            model: spec.path.clone(),
-            placement: spec.placement.clone(),
-            pin: aie_llama_pin_defaults(),
-            context: aie_worker::ContextParams {
-                n_ctx: spec.n_ctx,
-                n_batch: self.cfg.n_batch,
-                // 0 = the worker uses one thread per CPU of its socket.
-                threads: self.cfg.threads.max(0),
-                ..Default::default()
-            },
-        };
+        let wcfg = self.worker_config(spec);
         let json = serde_json::to_vec_pretty(&wcfg).map_err(|e| e.to_string())?;
         tokio::fs::write(&cfg_path, json)
             .await
