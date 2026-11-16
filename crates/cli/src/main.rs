@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -41,6 +42,13 @@ enum Cmd {
     Rm { model: String },
     /// Show loaded models.
     Ps,
+    /// Chat with a model: one reply to PROMPT, or a conversation when there is none.
+    /// The model is loaded with its saved placement, like any other request.
+    Run {
+        model: String,
+        /// What to say. Without it, read lines from stdin until Ctrl-D or /bye.
+        prompt: Option<String>,
+    },
     /// Show a model's anatomy and, if loaded, where its weights really are.
     Place {
         model: String,
@@ -129,6 +137,7 @@ fn main() {
                 Ok(())
             }
             Cmd::Ps => ps(&cli.host).await,
+            Cmd::Run { model, prompt } => run(&cli.host, &model, prompt).await,
             Cmd::Place {
                 model,
                 set,
@@ -228,6 +237,101 @@ async fn pull(host: &str, model: &str, store: Option<String>) -> Result<(), Stri
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// One streamed reply from /api/chat (ollama's NDJSON): the text goes to
+/// stdout as it arrives, and a dim line on stderr says how many tokens and how
+/// fast. Returns the reply, so a conversation can keep its history.
+async fn chat_turn(host: &str, model: &str, history: &[Value]) -> Result<String, String> {
+    let mut resp = reqwest::Client::new()
+        .post(url(host, "/api/chat"))
+        .json(&json!({ "model": model, "messages": history, "stream": true }))
+        .send()
+        .await
+        .map_err(|e| {
+            format!("can't reach the daemon at {host} ({e}); is `ai-engine serve` running?")
+        })?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        return Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| format!("HTTP {status}")));
+    }
+    let mut reply = String::new();
+    let mut buf = Vec::new();
+    let mut out = std::io::stdout();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        buf.extend_from_slice(&chunk);
+        while let Some(i) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=i).collect();
+            let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if let Some(e) = v.get("error") {
+                return Err(e.as_str().unwrap_or("chat failed").to_string());
+            }
+            if let Some(t) = v["message"]["content"].as_str() {
+                reply.push_str(t);
+                let _ = write!(out, "{t}");
+                let _ = out.flush();
+            }
+            if v["done"].as_bool() == Some(true) {
+                let _ = writeln!(out);
+                eprintln!("{}", stats_line(&v, std::io::stderr().is_terminal()));
+            }
+        }
+    }
+    Ok(reply)
+}
+
+/// "N tokens, X tok/s" from a final event's `eval_count` and `eval_duration` (ns), dim on a terminal.
+fn stats_line(done: &Value, dim: bool) -> String {
+    let n = done["eval_count"].as_u64().unwrap_or(0);
+    let ns = done["eval_duration"].as_u64().unwrap_or(0);
+    let line = if ns > 0 {
+        format!("{n} tokens, {:.1} tok/s", n as f64 / (ns as f64 / 1e9))
+    } else {
+        format!("{n} tokens")
+    };
+    if dim {
+        format!("\x1b[2m{line}\x1b[0m")
+    } else {
+        line
+    }
+}
+
+async fn run(host: &str, model: &str, prompt: Option<String>) -> Result<(), String> {
+    let mut history: Vec<Value> = Vec::new();
+    if let Some(p) = prompt {
+        history.push(json!({ "role": "user", "content": p }));
+        chat_turn(host, model, &history).await?;
+        return Ok(());
+    }
+    // The prompt marker only when a person is typing, so a pipe's output stays clean.
+    let tty = std::io::stdin().is_terminal();
+    let mut lines = std::io::stdin().lock().lines();
+    loop {
+        if tty {
+            print!(">>> ");
+            let _ = std::io::stdout().flush();
+        }
+        let Some(line) = lines.next() else { break };
+        let line = line.map_err(|e| e.to_string())?;
+        let line = line.trim();
+        if line == "/bye" {
+            break;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        history.push(json!({ "role": "user", "content": line }));
+        let reply = chat_turn(host, model, &history).await?;
+        history.push(json!({ "role": "assistant", "content": reply }));
     }
     Ok(())
 }
@@ -453,4 +557,17 @@ fn urlencode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stats_line_counts_tokens_per_second() {
+        let done = json!({ "done": true, "eval_count": 20, "eval_duration": 500_000_000u64 });
+        assert_eq!(stats_line(&done, false), "20 tokens, 40.0 tok/s");
+        assert!(stats_line(&done, true).starts_with("\x1b[2m"));
+        assert_eq!(stats_line(&json!({ "eval_count": 3 }), false), "3 tokens");
+    }
 }

@@ -242,6 +242,36 @@ async fn serve_load_chat_place() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 400);
 
+    // `ai-engine run MODEL PROMPT`: one streamed reply on stdout, token stats on stderr
+    let host = format!("127.0.0.1:{port}");
+    let out = tokio::task::spawn_blocking({
+        let host = host.clone();
+        move || {
+            Command::new(env!("CARGO_BIN_EXE_ai-engine"))
+                .args(["run", MODEL, "Say hi."])
+                .env("AIE_HOST", host)
+                .output()
+                .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out.stdout.is_empty(), "no reply on stdout");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("tok/s"));
+    // an unknown model is an error with the daemon's message and a non-zero exit
+    let bad = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_ai-engine"))
+            .args(["run", "hf.co/nobody/nothing-GGUF", "hi"])
+            .env("AIE_HOST", host)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("error:"));
+
     // keep_alive 0 unloads after the request
     post(&c, &base, "/api/generate", json!({ "model": MODEL, "prompt": "Hi", "stream": false, "keep_alive": 0, "options": { "num_predict": 1 } })).await;
     tokio::time::sleep(Duration::from_secs(2)).await;

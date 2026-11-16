@@ -93,9 +93,9 @@ Draft: stages marked **?** are open questions, not decisions.
 
 | Feature | Stage |
 |---|---|
-| CLI: `pull`, `run`, `list`, `rm`, `ps`, `place` | MVP |
+| CLI: `pull`, `list`, `rm`, `ps`, `place`, and a bare-bones `run` (one streamed reply to a prompt, or a line-by-line chat that keeps its history) | MVP |
 | Web UI: the placement view from the mockup, plus model list and status | MVP |
-| Interactive chat in the CLI (`run`) | v1 |
+| Interactive chat polish in the CLI (`run`): line editing and history, slash commands, system prompts, sampling options | v1 |
 | Chat in the web UI, for trying a model | v1 **?** |
 
 ## Decisions

@@ -57,6 +57,7 @@ target/release/ai-engine serve &                    # API on 127.0.0.1:11435, da
 target/release/ai-engine pull hf.co/Qwen/Qwen3-8B-GGUF:Q4_K_M
 target/release/ai-engine pull registry.example.com/team/model:q4   # or any OCI registry
 curl -s localhost:11435/api/chat -d '{"model":"hf.co/Qwen/Qwen3-8B-GGUF","messages":[{"role":"user","content":"Hi"}]}'
+target/release/ai-engine run hf.co/Qwen/Qwen3-8B-GGUF "Hi"   # one reply; without a prompt, a chat (Ctrl-D or /bye to leave)
 target/release/ai-engine place hf.co/Qwen/Qwen3-8B-GGUF   # where every weight really is
 ```
 
