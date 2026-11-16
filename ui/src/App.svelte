@@ -1,6 +1,5 @@
 <script lang="ts">
   import { untrack } from 'svelte'
-  import Details from './lib/Details.svelte'
   import MachineView from './lib/MachineView.svelte'
   import ModelCard from './lib/ModelCard.svelte'
   import { ModelEdit } from './lib/edit.svelte'
@@ -34,7 +33,6 @@
   const view = $derived(machine ? buildView({ machine, tags: models, placements, catalog: demo ? demoCatalog : undefined }) : null)
   const gpuCount = $derived(machine ? machine.devices.filter((d) => d.gpu).length : 0)
   const socketIds = $derived(machine ? sockets(machine.numa).map((n) => n.node) : [])
-  const selModel = $derived(view && selected ? (view.models.find((m) => m.name === selected!.model) ?? null) : null)
 
   async function refresh() {
     if (demo) return
@@ -224,7 +222,7 @@
       <h2>Models</h2>
       {#if view}
         {#each view.models as mv (mv.name)}
-          <ModelCard {mv} {view} gpus={gpuCount} {selected} edit={edit(mv.name)} running={isRunning(mv.name)} {openEdit} onselect={select} />
+          <ModelCard {mv} {view} gpus={gpuCount} {selected} edit={edit(mv.name)} running={isRunning(mv.name)} {openEdit} sockets={socketIds} {busy} onselect={select} onunload={() => unload(mv.name)} ondiscard={() => discard(mv.name)} />
         {/each}
       {/if}
       {#if !models.length}<div class="muted">No models yet. Pull one below.</div>{/if}
@@ -250,18 +248,6 @@
           <span>White outline = the subsystem selected on the left.</span>
           <span>Thin bar = how full, on a linear scale.</span>
         </p>
-        {#if selModel}
-          <Details
-            mv={selModel}
-            {view}
-            p={placements[selModel.name] ?? null}
-            edit={edit(selModel.name)}
-            sockets={socketIds}
-            {busy}
-            onunload={() => unload(selModel.name)}
-            ondiscard={() => discard(selModel.name)}
-          />
-        {/if}
       {/if}
     </section>
   </main>

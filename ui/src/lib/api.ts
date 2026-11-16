@@ -177,6 +177,8 @@ export interface Placement {
     planned: Record<string, Record<string, number>>
     /** llama.cpp's dry-run breakdown per device, before the load (null if not available) */
     measured: Measured[] | null
+    /** weights verify found elsewhere than planned, by subsystem and planned tier */
+    misplaced_detail?: { subsystem: string; planned: string; actual: string; tensors: number; bytes: number }[]
     /** how the expert cache is split over GPUs (empty when it isn't in use) */
     expert_cache: { gpu: number; bytes: number }[]
     stats: Stats | null

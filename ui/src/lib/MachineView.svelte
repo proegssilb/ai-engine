@@ -96,9 +96,10 @@
 
 {#snippet chip(c: Chip)}
   {@const m = byName[c.model]}
-  <button class="chip {c.kind}" class:piece={c.piece} class:sel={isSel(c)} style="--c: {m?.color}" title={c.title ?? `${m?.title}: ${c.label}`} onclick={() => onselect(c.model, c.sub || null)}>
+  <button class="chip {c.kind}" class:piece={c.piece} class:sel={isSel(c)} class:wrong={!!c.problem} style="--c: {m?.color}" title={[c.problem ? `Not where planned: ${c.problem}` : '', c.title ?? `${m?.title}: ${c.label}`].filter(Boolean).join('\n')} onclick={() => onselect(c.model, c.sub || null)}>
     <span class="badge">{m?.letter}</span>
-    <span class="lbl" title={c.label}>{c.label}</span>
+    <span class="lbl">{c.problem ? '! ' : ''}{c.label}</span>
+    {#if c.badge}<span class="held" class:no={!c.badge.ok}>{c.badge.label}</span>{/if}
     <span class="amt mono">{c.kind === 'runs' ? 'runs' : amount(c)}</span>
   </button>
 {/snippet}
@@ -219,6 +220,27 @@
   }
   .chip.runs .lbl {
     white-space: normal;
+  }
+  .chip.wrong {
+    border-color: var(--bad);
+    border-style: solid;
+    box-shadow: 0 0 0 1px var(--bad);
+  }
+  .chip.wrong .lbl {
+    color: var(--bad);
+  }
+  .held {
+    flex: none;
+    font-size: 10.5px;
+    padding: 0 5px;
+    border-radius: 8px;
+    border: 1px solid var(--ok);
+    color: var(--ok);
+    white-space: nowrap;
+  }
+  .held.no {
+    border-color: #f2c14a;
+    color: #f2c14a;
   }
   .chip.scratch .lbl {
     font-style: italic;

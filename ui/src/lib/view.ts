@@ -56,6 +56,10 @@ export interface Chip {
   kind: ChipKind
   /** extra tooltip text */
   title?: string
+  /** verify found weights of this piece somewhere other than planned (says where) */
+  problem?: string
+  /** the RAM tier's state, on the RAM-tier chips */
+  badge?: { label: string; ok: boolean }
 }
 
 export interface SubDest {
@@ -88,6 +92,14 @@ export interface ModelView {
   loaded: boolean
   moe: boolean
   subs: SubView[]
+  /** verified placement: every weight where planned, N misplaced, or not loaded */
+  status: { kind: 'verified' | 'misplaced' | 'not loaded'; text: string }
+  /** requests and speed, when loaded */
+  statsLine: string | null
+  /** shown on the card only when the RAM tier is not held by the OS */
+  fixes: string[]
+  /** load warnings and host socket problems, only when there are any */
+  warnings: string[]
 }
 
 export interface View {
@@ -417,6 +429,16 @@ export function buildView(input: ViewInput): View {
 
     // chips: one per (subsystem, box) piece, for models that are loaded
     const loaded = !!mm || !!p?.loaded
+    const ld = p?.loaded ?? null
+    const st = ld?.stats ?? null
+    const rt = st?.ram_tier && st.ram_tier.bytes > 0 ? st.ram_tier : null
+    // weights verify found elsewhere than planned, by (subsystem id, box)
+    const bad = new Map<string, string[]>()
+    for (const m of ld?.misplaced_detail ?? []) {
+      const k = `${catalog(m.subsystem, tag.name).id}/${boxOf(m.planned)}`
+      bad.set(k, [...(bad.get(k) ?? []), `${m.tensors} weight${m.tensors === 1 ? '' : 's'} (${size(m.bytes)}) planned here ${m.tensors === 1 ? 'is' : 'are'} in ${m.actual}`])
+    }
+    const hostRow = (mm?.memory ?? ld?.measured ?? []).find((r) => r.kind === 'host')
     if (loaded) {
       for (const sv of subs) {
         sv.dests.forEach((d) => {
@@ -432,12 +454,33 @@ export function buildView(input: ViewInput): View {
             piece: sv.split,
             box: d.box,
             kind: sv.role === 'kv' ? 'kv' : 'weights',
-            title: sv.members.length > 1 ? `${sv.label}: ${sv.members.join(', ')}` : undefined,
+            title: [
+              sv.members.length > 1 ? `${sv.label}: ${sv.members.join(', ')}` : '',
+              // the RAM tier: held or not, how, and how its size was found
+              ...(rt && d.box.startsWith('ram') && sv.role !== 'kv'
+                ? [
+                    `RAM tier: ${rt.held ? (rt.held_by_os ? 'held' : 'held only by the GPU driver, no OS backstop') : 'not held, may be swapped out'}`,
+                    ...rt.mechanisms.map((x) => `${x.ok ? '✓' : '·'} ${x.name}${x.layer !== 'os' ? ` (${x.layer})` : ''}`),
+                    ...(host?.ram_tier_exact === false ? ['Size estimated from a sample of its pages.'] : []),
+                  ]
+                : []),
+              // the disk tier: in the model file, the kernel's page cache
+              ...(d.box.startsWith('disk') && sv.role !== 'kv' && st && st.disk_tier_bytes > 0
+                ? [`In the model file; ${size(st.disk_tier_resident)} of the model's ${size(st.disk_tier_bytes)} disk tier is in RAM now, in the kernel's page cache: it may be dropped and read again.`]
+                : []),
+            ]
+              .filter(Boolean)
+              .join('\n') || undefined,
+            problem: bad.get(`${sv.id}/${d.box}`)?.join('; '),
+            badge:
+              rt && d.box.startsWith('ram') && sv.role !== 'kv'
+                ? { label: rt.held_by_os ? 'held' : rt.held ? 'driver only' : 'not held', ok: rt.held_by_os }
+                : undefined,
           })
         })
       }
       for (const d of scratch) {
-        put({ id: `${tag.name}/scratch/${d.box}`, model: tag.name, sub: 'scratch', label: 'Compute scratch', bytes: d.bytes, piece: false, box: d.box, kind: 'scratch', title: 'Temporary working memory for computing a batch' })
+        put({ id: `${tag.name}/scratch/${d.box}`, model: tag.name, sub: 'scratch', label: 'Compute scratch', bytes: d.bytes, piece: false, box: d.box, kind: 'scratch', title: d.box.startsWith('ram') && hostRow && hostRow.compute > d.bytes ? `llama.cpp reserves ${size(hostRow.compute)} on the host; ${size(d.bytes)} of it is in RAM so far. Pages are counted once first used, so this grows after the first requests.` : 'Temporary working memory for computing a batch' })
       }
       // "runs" chips: the model's threads run on its socket
       if (host && socks.some((s) => s.node === host.node)) {
@@ -481,6 +524,10 @@ export function buildView(input: ViewInput): View {
       loaded,
       moe,
       subs,
+      status: !ld ? { kind: 'not loaded', text: 'not loaded' } : ld.misplaced === 0 ? { kind: 'verified', text: 'verified' } : { kind: 'misplaced', text: `${ld.misplaced} misplaced` },
+      statsLine: st ? `${st.requests} request${st.requests === 1 ? '' : 's'}${st.requests > 0 ? ` · prompt ${st.prefill_tps.toFixed(0)} tok/s · generation ${st.decode_tps.toFixed(1)} tok/s` : ''}` : null,
+      fixes: rt && !rt.held_by_os ? rt.fixes : [],
+      warnings: [...new Set([...(host?.problems ?? []), ...(ld?.warnings ?? [])])],
     })
   })
 

@@ -108,7 +108,7 @@
     <div class="legend muted">
       <span>free {size(mem.segments.free.latest)}</span>
       <span>other {size(mem.segments.other.latest)}</span>
-      <span>disk cache {size(mem.segments.cache.latest)}{#if tierSum > 0}, {size(tierSum)} of it a disk tier: may be dropped{/if}</span>
+      <span title={tierSum > 0 ? `${size(tierSum)} of the cache is a model's disk tier: the kernel's page cache, in the hatched part. It may be dropped at any time and read again; it is not our memory and not placed on this socket.` : 'File pages the kernel can drop at any time'}>disk cache {size(mem.segments.cache.latest)}{#if tierSum > 0}, {size(tierSum)} may be dropped{/if}</span>
     </div>
   {/if}
 </div>

@@ -15,7 +15,11 @@
     edit,
     running,
     openEdit = false,
+    sockets,
+    busy,
     onselect,
+    onunload,
+    ondiscard,
   }: {
     mv: ModelView
     view: View
@@ -24,7 +28,12 @@
     edit: ModelEdit
     running: boolean
     openEdit?: boolean
+    /** NUMA nodes that can host a model; the socket choice only shows with several */
+    sockets: number[]
+    busy: string
     onselect: (model: string, sub: string | null) => void
+    onunload: () => void
+    ondiscard: () => void
   } = $props()
 
   const isSel = $derived(selected?.model === mv.name)
@@ -63,6 +72,44 @@
     </span>
     <span class="total mono">{size(mv.size)}</span>
   </button>
+  <div class="status">
+    <span class="mark {mv.status.kind}" title={mv.status.kind === 'verified' ? 'Every weight verified where planned' : mv.status.kind === 'misplaced' ? 'Some weights are not where planned; the chips say which' : 'Not loaded'}>{mv.status.kind === 'verified' ? '✓ ' : mv.status.kind === 'misplaced' ? '! ' : ''}{mv.status.text}</span>
+    {#if mv.statsLine}<span class="muted mono">{mv.statsLine}</span>{/if}
+  </div>
+  {#each mv.warnings as w (w)}<div class="warn bad">{w}</div>{/each}
+  {#if mv.fixes.length}
+    <div class="warn amber">
+      The RAM tier is not held by the OS and may be swapped out. To fix:
+      <ul>{#each mv.fixes as f (f)}<li>{f}</li>{/each}</ul>
+    </div>
+  {/if}
+  {#if isSel}
+    <details class="controls" open={openEdit || edit.dirty}>
+      <summary>Placement: {edit.mode === 'auto' ? 'automatic' : 'custom split'} · context {edit.nCtx}</summary>
+      <div class="modes">
+        <label><input type="radio" bind:group={edit.mode} value="auto" onchange={() => (edit.dirty = true)} /> Automatic</label>
+        <label><input type="radio" bind:group={edit.mode} value="custom" onchange={() => (edit.dirty = true)} /> Custom split</label>
+      </div>
+      <div class="row">
+        <label>Context <input type="number" min="512" step="512" bind:value={edit.nCtx} oninput={touched} /> tokens</label>
+        {#if mv.moe}
+          <label>Expert cache <input type="number" min="0" step="0.5" bind:value={edit.cacheGiB} oninput={touched} /> GiB</label>
+        {/if}
+      </div>
+      {#if sockets.length > 1}
+        <label class="row">Host socket
+          <select bind:value={edit.hostNode} onchange={touched}>
+            <option value={null}>Automatic: next to its GPU</option>
+            {#each sockets as n (n)}<option value={n}>Socket {n}</option>{/each}
+          </select>
+        </label>
+      {/if}
+      <div class="row">
+        {#if mv.loaded}<button onclick={onunload} disabled={!!busy}>Unload</button>{/if}
+        {#if edit.dirty}<button onclick={ondiscard} disabled={!!busy}>Discard edits</button>{/if}
+      </div>
+    </details>
+  {/if}
   {#each mv.subs as s (s.id)}
     {@const sel = selected?.model === mv.name && selected.sub === s.id}
     <div class="sub" class:sel>
@@ -185,5 +232,74 @@
   }
   .small {
     font-size: 12px;
+  }
+  .status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    padding: 0 4px;
+    font-size: 12px;
+  }
+  .mark.verified {
+    color: var(--ok);
+  }
+  .mark.misplaced {
+    color: var(--bad);
+    font-weight: 600;
+  }
+  .mark.not {
+    color: var(--muted);
+  }
+  .mark {
+    white-space: nowrap;
+  }
+  .warn {
+    font-size: 12.5px;
+    border: 1px solid;
+    border-radius: 7px;
+    padding: 5px 8px;
+    line-height: 1.3;
+  }
+  .warn.bad {
+    color: var(--bad);
+    border-color: var(--bad);
+  }
+  .warn.amber {
+    color: #f2c14a;
+    border-color: #f2c14a;
+  }
+  .warn ul {
+    margin: 4px 0 0;
+    padding-left: 16px;
+  }
+  .controls {
+    background: var(--panel-2);
+    border-radius: 7px;
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    font-size: 12.5px;
+  }
+  .controls > :not(summary) {
+    margin-top: 6px;
+  }
+  .controls summary {
+    cursor: pointer;
+    color: var(--muted);
+  }
+  .controls .modes,
+  .controls .row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    align-items: center;
+  }
+  .controls input[type='number'] {
+    width: 74px;
+    padding: 3px 5px;
+  }
+  .controls select {
+    padding: 3px 5px;
+    max-width: 100%;
   }
 </style>

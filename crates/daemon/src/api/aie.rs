@@ -113,6 +113,53 @@ fn intent_gpus(i: &Intent) -> u32 {
         .unwrap_or(0)
 }
 
+/// What a tier or location looks like in the verified report (`Where` as JSON).
+fn where_text(w: &Value) -> String {
+    if let Some(t) = w.get("Tier") {
+        return match serde_json::from_value::<Tier>(t.clone()) {
+            Ok(t) => match t {
+                Tier::Gpu(i) => format!("GPU {i}"),
+                Tier::Ram => "RAM".into(),
+                Tier::Disk => "the model file (disk tier)".into(),
+            },
+            Err(_) => t.to_string(),
+        };
+    }
+    if let Some(b) = w.get("Buffer").and_then(Value::as_str) {
+        return format!("a {b} buffer");
+    }
+    "host memory, seen only via copies".into()
+}
+
+/// The weights verify found somewhere other than planned, grouped by
+/// subsystem and planned tier: `{subsystem, planned, actual, tensors, bytes}`.
+fn misplaced_detail(a: &Anatomy, plan: &Plan, report: &Value) -> Vec<Value> {
+    let Some(weights) = report.get("weights").and_then(Value::as_object) else {
+        return vec![];
+    };
+    let mut groups: BTreeMap<(String, String, String), (u64, u64)> = BTreeMap::new();
+    for part in &a.parts {
+        let (Some(planned), Some(actual)) = (plan.tensors.get(&part.name), weights.get(&part.name))
+        else {
+            continue;
+        };
+        if actual.get("Tier").and_then(|t| serde_json::from_value::<Tier>(t.clone()).ok()) == Some(*planned) {
+            continue;
+        }
+        let e = groups
+            .entry((part.subsystem.label().into(), tier_key(planned), where_text(actual)))
+            .or_default();
+        e.0 += 1;
+        e.1 += part.bytes;
+    }
+    groups
+        .into_iter()
+        .map(|((sub, planned, actual), (n, b))| {
+            json!({ "subsystem": sub, "planned": planned, "actual": actual, "tensors": n, "bytes": b })
+        })
+        .collect()
+}
+
 pub async fn get_placement(
     st: State,
     Query(q): Query<ModelQuery>,
@@ -172,6 +219,11 @@ pub async fn get_placement(
             "warnings": w.status.warnings,
             "measured": serde_json::from_str::<Value>(&w.status.memory_json).unwrap_or(Value::Null),
             "planned": by_sub,
+            // weights verify found elsewhere than planned, by subsystem
+            "misplaced_detail": match (&plan, &report) {
+                (Some(p), Some(r)) => misplaced_detail(&a, p, r),
+                _ => vec![],
+            },
             "expert_cache": expert_cache,
             // which socket the host side is pinned to, and where it really is
             "host": stats["host"].clone(),
@@ -305,4 +357,67 @@ pub async fn machine(st: State) -> Result<Json<Value>, ApiError> {
     // RAM over the last minute (latest, min, max), for the fuzzy RAM bar.
     v["memory"] = st.0.memory.snapshot();
     Ok(Json(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aie_anatomy::{Part, Subsystem};
+
+    fn anatomy() -> Anatomy {
+        let part = |name: &str, subsystem, bytes| Part {
+            name: name.into(),
+            subsystem,
+            layer: None,
+            ty: aie_gguf::GgmlType::F32,
+            bytes,
+        };
+        Anatomy {
+            architecture: "t".into(),
+            layers: 1,
+            embedding_len: None,
+            context_train: None,
+            moe: None,
+            kv: None,
+            parts: vec![
+                part("a", Subsystem::Attention, 10),
+                part("b", Subsystem::Attention, 20),
+                part("c", Subsystem::DenseFfn, 40),
+            ],
+        }
+    }
+
+    #[test]
+    fn misplaced_weights_are_grouped_by_subsystem_and_where_they_are() {
+        let a = anatomy();
+        let plan = Plan {
+            layer_home: vec![Tier::Gpu(0)],
+            tensors: [
+                ("a".to_string(), Tier::Gpu(0)),
+                ("b".to_string(), Tier::Gpu(0)),
+                ("c".to_string(), Tier::Ram),
+            ]
+            .into(),
+            n_ctx: 1,
+            expert_cache_bytes: 0,
+            allow_repack: false,
+            host_node: None,
+        };
+        let report = json!({ "weights": {
+            "a": { "Tier": { "Gpu": 0 } },
+            "b": { "Buffer": "CUDA_Host" },
+            "c": "HostViaCopy",
+        }});
+        let d = misplaced_detail(&a, &plan, &report);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert_eq!(d[0]["subsystem"], "attention");
+        assert_eq!(d[0]["planned"], "gpu0");
+        assert_eq!(d[0]["actual"], "a CUDA_Host buffer");
+        assert_eq!((d[0]["tensors"].as_u64(), d[0]["bytes"].as_u64()), (Some(1), Some(20)));
+        assert_eq!(d[1]["subsystem"], "dense ffn");
+        assert_eq!(d[1]["actual"], "host memory, seen only via copies");
+        // all where planned: nothing to report
+        let ok = json!({ "weights": { "a": { "Tier": { "Gpu": 0 } }, "b": { "Tier": { "Gpu": 0 } }, "c": { "Tier": "Ram" } }});
+        assert!(misplaced_detail(&a, &plan, &ok).is_empty());
+    }
 }

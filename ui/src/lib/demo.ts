@@ -6,7 +6,7 @@
 
 import type { Catalog, CatalogEntry } from './view'
 import { anatomyCatalog, GiB } from './view'
-import type { HostReport, Machine, MachineModel, Measured, MemBox, ModelTag, Placement, Spread } from './api'
+import type { HostReport, Machine, MachineModel, Measured, MemBox, ModelTag, Placement, RamTier, Spread, Stats } from './api'
 
 const g = (n: number) => Math.round(n * GiB)
 
@@ -196,3 +196,53 @@ for (const m of demoMachine.models) {
     warnings: [],
   }
 }
+
+// What the demo shows besides placement: A is held and verified with a few
+// requests behind it, B has weights verify found elsewhere than planned, D's
+// RAM tier is not held (with the fixes), C is loaded but idle.
+const stats = (requests: number, pre: number, dec: number, tier: RamTier | null, diskBytes = 0, diskResident = 0): Stats => ({
+  requests,
+  prompt_tokens: requests * 120,
+  completion_tokens: requests * 80,
+  prefill_tps: pre,
+  decode_tps: dec,
+  last_prefill_tps: pre,
+  last_decode_tps: dec,
+  disk_tier_bytes: diskBytes,
+  disk_tier_resident: diskResident,
+  ram_tier: tier,
+})
+const heldTier: RamTier = {
+  bytes: g(20),
+  resident: g(20),
+  swapped: 0,
+  held: true,
+  held_by_os: true,
+  mechanisms: [
+    { layer: 'os', name: 'no swap', ok: true, detail: 'swap is off' },
+    { layer: 'os', name: 'swap forbidden', ok: true, detail: 'pages are locked' },
+  ],
+  environment: 'demo',
+  fixes: [],
+}
+const looseTier: RamTier = {
+  bytes: g(0.4),
+  resident: g(0.4),
+  swapped: 0,
+  held: false,
+  held_by_os: false,
+  mechanisms: [
+    { layer: 'os', name: 'no swap', ok: false, detail: 'swap is on' },
+    { layer: 'os', name: 'swap forbidden', ok: false, detail: 'the memlock limit is too low' },
+  ],
+  environment: 'demo',
+  fixes: ['Turn swap off (sudo swapoff -a), or', 'raise the memlock limit for the daemon (LimitMEMLOCK=infinity in its service file)'],
+}
+const L = (m: string) => demoPlacements[m].loaded!
+L(A).stats = stats(12, 450, 38.2, heldTier, g(35), g(3))
+L(B).stats = stats(4, 1210, 22.4, null)
+L(B).misplaced = 8
+L(B).misplaced_detail = [{ subsystem: 'transformer layers', planned: 'gpu3', actual: 'a CUDA_Host buffer', tensors: 8, bytes: g(8) }]
+L(C).stats = stats(0, 0, 0, null)
+L(D).stats = stats(31, 95, 61.5, looseTier)
+L(D).warnings = ['0.4 GiB of the RAM tier may be swapped out']
