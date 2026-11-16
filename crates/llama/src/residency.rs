@@ -81,20 +81,46 @@ pub struct Smaps {
     pub hugetlb: u64,
 }
 
+/// Give an anonymous mapping its own name (shown in smaps as
+/// `[anon:NAME]`). Differently named mappings are never merged by the
+/// kernel, so `smaps()` sees exactly this range. Needs Linux 5.17+ with
+/// CONFIG_ANON_VMA_NAME; returns false where it isn't available.
+pub fn keep_separate(base: usize, len: usize, name: &str) -> bool {
+    const PR_SET_VMA: libc::c_int = 0x53564d41;
+    const PR_SET_VMA_ANON_NAME: libc::c_ulong = 0;
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    unsafe {
+        libc::prctl(
+            PR_SET_VMA,
+            PR_SET_VMA_ANON_NAME,
+            base as libc::c_ulong,
+            len as libc::c_ulong,
+            name.as_ptr() as libc::c_ulong,
+        ) == 0
+    }
+}
+
 /// Sum smaps fields over the mappings that lie inside [base, base + len).
 pub fn smaps(base: usize, len: usize) -> Smaps {
     let text = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
-    let mut inside = false;
+    let mut cap: u64 = 0;
     let mut out = Smaps::default();
     for line in text.lines() {
         if let Some((range, _)) = line.split_once(' ')
             && let Some((s, e)) = range.split_once('-')
             && let (Ok(s), Ok(e)) = (usize::from_str_radix(s, 16), usize::from_str_radix(e, 16))
         {
-            inside = s >= base && e <= base + len;
+            // Bytes of this mapping that fall in the range. A mapping the
+            // kernel merged with a neighbour only partly overlaps; its
+            // counts are capped at the overlap (an upper bound) rather than
+            // dropped, which would read as "nothing resident, nothing
+            // swapped". keep_separate() prevents the merge in the first place.
+            cap = e.min(base + len).saturating_sub(s.max(base)) as u64;
             continue;
         }
-        if !inside {
+        if cap == 0 {
             continue;
         }
         let mut f = line.split_whitespace();
@@ -102,7 +128,7 @@ pub fn smaps(base: usize, len: usize) -> Smaps {
             continue;
         };
         let Ok(kib) = v.parse::<u64>() else { continue };
-        let b = kib * 1024;
+        let b = (kib * 1024).min(cap);
         match k {
             "Rss:" | "Private_Hugetlb:" | "Shared_Hugetlb:" => out.resident += b,
             "Swap:" => out.swapped += b,
@@ -135,10 +161,44 @@ mod tests {
             )
         };
         assert_ne!(p, libc::MAP_FAILED);
+        // Without a name the kernel may merge this mapping with a neighbour
+        // (another test thread's), and smaps would see a bigger area.
+        let named = keep_separate(p as usize, len, "aie-test");
         unsafe { std::ptr::write_bytes(p as *mut u8, 1, len) };
         let s = smaps(p as usize, len);
-        assert_eq!(s.resident, len as u64);
+        if named {
+            assert_eq!(s.resident, len as u64);
+        } else {
+            assert!(s.resident <= len as u64);
+        }
         assert_eq!(s.swapped, 0);
         unsafe { libc::munmap(p, len) };
+    }
+
+    #[test]
+    fn smaps_handles_a_merged_mapping() {
+        // One 16 MiB mapping stands in for our 8 MiB buffer merged with an
+        // 8 MiB neighbour: no mapping lies wholly inside the buffer.
+        let len = 8 << 20;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        unsafe { std::ptr::write_bytes(p as *mut u8, 1, 2 * len) };
+        // Merged: capped at the overlap, never silently zero.
+        let merged = smaps(p as usize, len);
+        assert!(merged.resident > 0 && merged.resident <= len as u64);
+        // Named: split off by the kernel, so exact.
+        if keep_separate(p as usize, len, "aie-test-merged") {
+            assert_eq!(smaps(p as usize, len).resident, len as u64);
+        }
+        unsafe { libc::munmap(p, 2 * len) };
     }
 }

@@ -169,6 +169,16 @@ unsafe extern "C" fn buft_alloc_buffer(
         }
     };
 
+    // Its own name, so the kernel never merges it with a neighbouring
+    // mapping (another RAM-tier buffer, say) and the RAM tier's residency
+    // and swap figures (from smaps) cover exactly this buffer.
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        crate::residency::keep_separate(base as usize, map_len, &format!("aie-ram-tier-{n}"));
+    }
+
     let mut rec = BufferRecord {
         base: base as usize,
         len: size,
