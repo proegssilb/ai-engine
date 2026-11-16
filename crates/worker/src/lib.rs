@@ -304,7 +304,7 @@ fn load(cfg: &Config) -> Result<Loaded, String> {
 
     let ctx = Context::new(model.clone(), context.clone()).map_err(|e| e.to_string())?;
     // Measure where things landed; on several sockets, say what isn't where promised.
-    let hr = numa::report(&topo, &host, threads);
+    let hr = numa::report(&topo, &host, threads, &cfg.model);
     for p in &hr.problems {
         if !warnings.contains(p) {
             warnings.push(p.clone());
@@ -370,7 +370,12 @@ impl Worker for Service {
             st.last_decode_tps = s.last_decode_tps;
         }
         st.ram_tier_json = serde_json::to_string(&ram_tier::status()).unwrap_or_default();
-        st.host_json = numa::report_json(&self.0.topo, &self.0.host, self.0.threads);
+        st.host_json = numa::report_json(
+            &self.0.topo,
+            &self.0.host,
+            self.0.threads,
+            self.0.model.path(),
+        );
         st.disk_tier_resident =
             aie_llama::residency::resident_file_bytes(self.0.model.path(), &self.0.disk_ranges);
         Ok(Response::new(st))

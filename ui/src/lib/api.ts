@@ -84,6 +84,10 @@ export interface HostReport {
   /** node -> bytes of the RAM tier (estimated from sampled pages) */
   ram_tier_by_node: Record<string, number>
   memory_by_node: Record<string, number>
+  /** the disk tier's cached pages (the mapped model file) per node */
+  disk_tier_by_node?: Record<string, number>
+  /** KV cache, compute buffers and other host allocations per node */
+  host_buffers_by_node?: Record<string, number>
   problems: string[]
 }
 

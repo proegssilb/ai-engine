@@ -47,7 +47,8 @@ pub fn parse_meminfo(text: &str) -> Meminfo {
         let slot = match key {
             "MemTotal:" => &mut m.total,
             "MemFree:" => &mut m.free,
-            "Cached:" => &mut m.cached,
+            // A node's meminfo has no Cached: its page cache is FilePages.
+            "Cached:" | "FilePages:" => &mut m.cached,
             "Buffers:" => &mut m.buffers,
             "SReclaimable:" => &mut m.sreclaimable,
             "Shmem:" => &mut m.shmem,
@@ -121,7 +122,13 @@ struct Held {
     per_node: BTreeMap<u32, u64>,
     disk: u64,
     resident: u64,
+    /// Where the model file's cached pages measurably are (the worker's report).
+    file_by_node: BTreeMap<u32, u64>,
 }
+
+/// A worker as the sampler sees it: model, pid, disk-tier bytes, how much of
+/// it is in RAM, and the model file's cached pages per node.
+type Proc = (String, Option<u32>, u64, u64, BTreeMap<u32, u64>);
 
 /// One box (all RAM, or one NUMA node) at one instant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,21 +209,33 @@ impl Sampler {
     /// Take one sample now: read the kernel's numbers and ask each worker for
     /// its disk-tier residency.
     pub async fn sample(&self, workers: &Manager) {
-        let mut procs: Vec<(String, Option<u32>, u64, u64)> = Vec::new();
+        let mut procs: Vec<Proc> = Vec::new();
         for w in workers.list().await {
             let st = tokio::time::timeout(
                 Duration::from_secs(1),
                 w.client().status(aie_proto::worker::StatusRequest {}),
             )
             .await;
-            let (bytes, resident) = match st {
+            let (bytes, resident, by_node) = match st {
                 Ok(Ok(r)) => {
                     let r = r.into_inner();
-                    (r.disk_tier_bytes, r.disk_tier_resident)
+                    let by_node = serde_json::from_str::<Value>(&r.host_json)
+                        .ok()
+                        .and_then(|h| {
+                            serde_json::from_value::<BTreeMap<String, u64>>(
+                                h.get("disk_tier_by_node")?.clone(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(k, v)| Some((k.parse().ok()?, v)))
+                        .collect();
+                    (r.disk_tier_bytes, r.disk_tier_resident, by_node)
                 }
-                _ => (0, 0),
+                _ => (0, 0, BTreeMap::new()),
             };
-            procs.push((w.name.clone(), w.pid().await, bytes, resident));
+            procs.push((w.name.clone(), w.pid().await, bytes, resident, by_node));
         }
         let sample = tokio::task::spawn_blocking(move || read_sample(Path::new("/"), &procs))
             .await
@@ -304,7 +323,7 @@ fn read(path: impl AsRef<Path>) -> String {
 
 /// Read one sample from `root` (`/`; a fake tree in tests). `procs` is each
 /// worker's model, pid, disk-tier bytes and how much of it is in RAM.
-fn read_sample(root: &Path, procs: &[(String, Option<u32>, u64, u64)]) -> Sample {
+fn read_sample(root: &Path, procs: &[Proc]) -> Sample {
     let node_dir = root.join("sys/devices/system/node");
     let mut node_ids: Vec<u32> = std::fs::read_dir(&node_dir)
         .into_iter()
@@ -316,7 +335,7 @@ fn read_sample(root: &Path, procs: &[(String, Option<u32>, u64, u64)]) -> Sample
     let multi = node_ids.len() > 1;
 
     let mut ours: Vec<Held> = Vec::new();
-    let mut add = |model: String, pid: String, disk: u64, resident: u64| {
+    let mut add = |model: String, pid: String, disk: u64, resident: u64, file_by_node| {
         let proc = root.join("proc").join(pid);
         let rss = parse_own_rss(&read(proc.join("status")));
         let per_node = if multi {
@@ -330,12 +349,19 @@ fn read_sample(root: &Path, procs: &[(String, Option<u32>, u64, u64)]) -> Sample
             per_node,
             disk,
             resident,
+            file_by_node,
         });
     };
-    add(String::new(), "self".into(), 0, 0);
-    for (model, pid, disk, resident) in procs {
+    add(String::new(), "self".into(), 0, 0, BTreeMap::new());
+    for (model, pid, disk, resident, by_node) in procs {
         if let Some(pid) = pid {
-            add(model.clone(), pid.to_string(), *disk, *resident);
+            add(
+                model.clone(),
+                pid.to_string(),
+                *disk,
+                *resident,
+                by_node.clone(),
+            );
         }
     }
 
@@ -366,17 +392,24 @@ fn read_sample(root: &Path, procs: &[(String, Option<u32>, u64, u64)]) -> Sample
         infos
             .into_iter()
             .map(|(n, mem)| {
-                // Which node holds a mapped file's pages isn't visible per
-                // file, so a model's resident disk tier is spread over the
-                // nodes in proportion to their page cache.
-                let share = cache(&mem) as f64 / total_cache.max(1) as f64;
+                let node_share = cache(&mem) as f64 / total_cache.max(1) as f64;
                 let models = ours
                     .iter()
-                    .map(|h| ModelMem {
-                        model: h.model.clone(),
-                        ours: h.per_node.get(&n).copied().unwrap_or(0),
-                        disk_tier_bytes: (h.disk as f64 * share) as u64,
-                        disk_resident: (h.resident as f64 * share) as u64,
+                    .map(|h| {
+                        // The worker measures which node holds the model file's
+                        // pages; without that, spread by each node's page cache.
+                        let measured: u64 = h.file_by_node.values().sum();
+                        let share = if measured > 0 {
+                            h.file_by_node.get(&n).copied().unwrap_or(0) as f64 / measured as f64
+                        } else {
+                            node_share
+                        };
+                        ModelMem {
+                            model: h.model.clone(),
+                            ours: h.per_node.get(&n).copied().unwrap_or(0),
+                            disk_tier_bytes: (h.disk as f64 * share) as u64,
+                            disk_resident: (h.resident as f64 * share) as u64,
+                        }
                     })
                     .collect();
                 (n, BoxSample { mem, models })
@@ -406,7 +439,7 @@ mod tests {
             (10 * 1024, 50 * 1024, 40 * 1024)
         );
         let node =
-            parse_meminfo("Node 1 MemTotal:  8 kB\nNode 1 MemFree: 2 kB\nNode 1 Cached: 3 kB\n");
+            parse_meminfo("Node 1 MemTotal:  8 kB\nNode 1 MemFree: 2 kB\nNode 1 FilePages: 3 kB\n");
         assert_eq!((node.total, node.free, node.cached), (8192, 2048, 3072));
     }
 
@@ -483,19 +516,24 @@ mod tests {
         w("proc/7/numa_maps", "1 default anon=25 N0=5 N1=20\n");
         w(
             "sys/devices/system/node/node0/meminfo",
-            "Node 0 MemTotal: 500 kB\nNode 0 Cached: 100 kB\n",
+            "Node 0 MemTotal: 500 kB\nNode 0 FilePages: 100 kB\n",
         );
         w(
             "sys/devices/system/node/node1/meminfo",
-            "Node 1 MemTotal: 500 kB\nNode 1 Cached: 300 kB\n",
+            "Node 1 MemTotal: 500 kB\nNode 1 FilePages: 300 kB\n",
         );
-        let s = read_sample(&d, &[("m".into(), Some(7), 1000, 400)]);
+        let s = read_sample(&d, &[("m".into(), Some(7), 1000, 400, BTreeMap::new())]);
         assert_eq!(s.system.models.len(), 2);
         assert_eq!(s.nodes.len(), 2);
         let n1 = &s.nodes[1].1;
         assert_eq!(n1.models[1].ours, 20 * 4096);
         // disk tier spread by page cache: node 1 holds 3/4
         assert_eq!(n1.models[1].disk_resident, 300);
+        // with the worker's measurement, the split follows where the pages are
+        let by = [(0u32, 3u64), (1, 1)].into();
+        let s = read_sample(&d, &[("m".into(), Some(7), 1000, 400, by)]);
+        assert_eq!(s.nodes[0].1.models[1].disk_resident, 300);
+        assert_eq!(s.nodes[1].1.models[1].disk_resident, 100);
         std::fs::remove_dir_all(d).ok();
     }
 }

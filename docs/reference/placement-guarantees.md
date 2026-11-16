@@ -103,15 +103,43 @@ Every status call (cached for two seconds) the worker reports:
 - the RAM tier's bytes per node, from `move_pages` (without a destination) on
   up to 8192 evenly spaced pages of each buffer (exact when the buffer has no
   more pages than that; an estimate otherwise);
+- the disk tier's cached pages per node (the mapped model file, `numa_maps`
+  `file=` lines), and the host buffers per node (anonymous memory that isn't
+  the RAM tier: KV cache, compute buffers);
 - all of the process's mapped memory per node, from `/proc/self/numa_maps`.
+
+### What is claimed for the socket
+
+The UI puts a model's RAM tier in the socket's RAM box and the help text says
+host-side buffers and page cache pages it reads are on the socket too. So the
+claim, and what is checked, is: the RAM tier, the host buffers, and the
+model file's cached pages (the disk tier's in-RAM share). Other memory of the
+process (libraries, other files) isn't claimed and isn't checked.
+
+Memory policy only decides where *new* pages go. A page cache page has one
+physical copy and stays on whichever node first read it, even for a different
+process earlier. So after loading, and on every status measurement that finds
+cached model-file pages on another node, the worker moves them: pages cached
+but not yet mapped are mapped (`MADV_POPULATE_READ`, only the resident runs,
+no I/O), then `mbind(MPOL_PREFERRED, MPOL_MF_MOVE)` over them; the mapping also
+keeps the preference for pages read later. Then it measures again.
+
+What can't be guaranteed: `MPOL_MF_MOVE` skips pages another process maps too
+(moving those needs `CAP_SYS_NICE`). Two workers on different sockets using the
+same model file can't both have it local; the one that doesn't hold the pages
+reports it, naming the other process as the likely cause. Pages read after the
+last measurement can also land elsewhere if another process cached them first;
+the next status measurement moves them again.
 
 ### When it isn't where promised
 
 On several sockets, the report turns into plain-language problems, shown in the
 placement panel and added to the load warnings, for example "4.1 GB of the RAM
 tier is on socket 1, not socket 0", "some threads of this model may run on
-socket 1", or that more than a tenth of the process's memory (and over 256 MiB)
-is on another socket. Failures of the syscalls themselves are reported the same
+socket 1", "0.6 GB of the disk tier's cached pages are on socket 1, not socket
+0" (with the reason and fix), or that more than a tenth of the host buffers
+(and over 256 MiB) are on another socket. Memory that isn't claimed (libraries,
+unrelated files) is never reported. Failures of the syscalls themselves are reported the same
 way. A load isn't refused for them, except for the cases above. On one socket,
 nothing is ever reported as a problem.
 
