@@ -80,7 +80,7 @@
   {#if mv.fixes.length}
     <div class="warn amber">
       The RAM tier is not held by the OS and may be swapped out. To fix:
-      <ul>{#each mv.fixes as f (f)}<li>{f}</li>{/each}</ul>
+      <ul>{#each mv.fixes as f (f)}<li>{#each f.split('`') as part, i (i)}{#if i % 2}<code>{part}</code>{:else}{part}{/if}{/each}</li>{/each}</ul>
     </div>
   {/if}
   {#if isSel}
@@ -132,6 +132,11 @@
 </div>
 
 <style>
+  .warn code {
+    font-family: var(--mono, ui-monospace, monospace);
+    font-size: 0.92em;
+    overflow-wrap: anywhere;
+  }
   .card {
     border: 1.5px solid color-mix(in srgb, var(--c) 70%, transparent);
     border-radius: 12px;

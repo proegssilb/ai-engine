@@ -232,11 +232,16 @@ const looseTier: RamTier = {
   held: false,
   held_by_os: false,
   mechanisms: [
-    { layer: 'os', name: 'no swap', ok: false, detail: 'swap is on' },
-    { layer: 'os', name: 'swap forbidden', ok: false, detail: 'the memlock limit is too low' },
+    { layer: 'os', name: 'no swap', ok: false, detail: '8192 MiB of swap is configured' },
+    { layer: 'os', name: 'swap forbidden', ok: false, detail: 'this process may be swapped' },
+    { layer: 'os', name: 'locked', ok: false, detail: 'mlock failed (errno 12); the lock limit is 8 MiB, the RAM tier needs 409 MiB' },
   ],
-  environment: 'demo',
-  fixes: ['Turn swap off (sudo swapoff -a), or', 'raise the memlock limit for the daemon (LimitMEMLOCK=infinity in its service file)'],
+  environment: 'systemd service',
+  // The worker's own wording for this environment (crates/worker/src/ram_tier.rs).
+  fixes: [
+    "add `LimitMEMLOCK=infinity` (or `MemorySwapMax=0`) to the service's [Service] section, then `systemctl daemon-reload` and restart",
+    'or give the binary the lock capability once: `sudo setcap cap_ipc_lock=ep $(which ai-engine)`',
+  ],
 }
 const L = (m: string) => demoPlacements[m].loaded!
 L(A).stats = stats(12, 450, 38.2, heldTier, g(35), g(3))
@@ -245,4 +250,3 @@ L(B).misplaced = 8
 L(B).misplaced_detail = [{ subsystem: 'transformer layers', planned: 'gpu3', actual: 'a CUDA_Host buffer', tensors: 8, bytes: g(8) }]
 L(C).stats = stats(0, 0, 0, null)
 L(D).stats = stats(31, 95, 61.5, looseTier)
-L(D).warnings = ['0.4 GiB of the RAM tier may be swapped out']
