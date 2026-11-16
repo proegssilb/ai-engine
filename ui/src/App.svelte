@@ -80,23 +80,31 @@
       if (!p) continue
       const e = edit(name)
       const srv = check.sig === sig && !check.error ? check.result?.models[name] : undefined
+      // what the model's KV cache and scratch hold now, per tier, as measured
+      const curExtra: Record<string, number> = {}
+      for (const [box, chips] of Object.entries(bv.chips))
+        for (const c of chips) if (c.model === name && (c.kind === 'kv' || c.kind === 'scratch')) curExtra[tierOfBox(box)] = (curExtra[tierOfBox(box)] ?? 0) + c.bytes
       if (srv && !srv.error && Object.keys(srv.planned).length) {
-        const extra: Record<string, number> = {}
-        for (const d of check.result!.devices) {
-          const by = d.by_model[name]
-          if (!by) continue
-          const tier = d.name === 'RAM' ? 'ram' : `gpu${d.name.replace(/^CUDA/, '')}`
-          const w = Object.values(srv.planned).reduce((s, t) => s + (t[tier] ?? 0), 0)
-          if (by > w) extra[tier] = by - w
+        const changed = changedOf(srv.planned, currentPlanned(name))
+        // the check's dry run says what the KV cache and scratch would add up to; when the layers
+        // don't move they stay as measured now (the dry run reserves more than is resident yet)
+        const layersMoved = Object.keys(changed).some((l) => catalog(l, name).edit === 'layers')
+        let extra: Record<string, number> = layersMoved || e.mode === 'auto' ? {} : curExtra
+        if (layersMoved || e.mode === 'auto') {
+          for (const d of check.result!.devices) {
+            const by = d.by_model[name]
+            if (!by) continue
+            const tier = d.name === 'RAM' ? 'ram' : `gpu${d.name.replace(/^CUDA/, '')}`
+            const w = Object.values(srv.planned).reduce((s, t) => s + (t[tier] ?? 0), 0)
+            if (by > w) extra[tier] = by - w
+          }
         }
-        out[name] = { planned: srv.planned, extra, hostNode: e.hostNode, changed: changedOf(srv.planned, currentPlanned(name)) }
+        out[name] = { planned: srv.planned, extra, hostNode: e.hostNode, changed }
         continue
       }
       const cur = currentPlanned(name)
       const labels: PlanLabel[] = Object.entries(p.anatomy.subsystems).map(([label, b]) => ({ label, bytes: b, edit: catalog(label, name).edit, current: cur[label] ?? {} }))
-      const extra: Record<string, number> = {}
-      for (const [box, chips] of Object.entries(bv.chips))
-        for (const c of chips) if (c.model === name && (c.kind === 'kv' || c.kind === 'scratch')) extra[tierOfBox(box)] = (extra[tierOfBox(box)] ?? 0) + c.bytes
+      const extra = curExtra
       const planned = localPlan(labels, e.plain())
       // the KV cache follows the layers: shared out over the tiers the layers go to
       const lay = labels.filter((l) => l.edit === 'layers')
@@ -113,6 +121,24 @@
   })
 
   const view = $derived(machine ? buildView({ machine, tags: models, placements, catalog, pending: pendingPlans }) : null)
+
+  /**
+   * Each GPU's and disk's used memory under the pending plan: what it holds now, minus what the
+   * edited models hold there now, plus what the plan puts there (the same chips the boxes draw,
+   * so header, bar and chips agree; for GPUs this is the check's total - available + need).
+   * RAM boxes already add up their own chips.
+   */
+  const projected = $derived.by((): Record<string, number> => {
+    const out: Record<string, number> = {}
+    const bv = baseView
+    const v = view
+    if (!bv || !v || !dirtyNames.length) return out
+    const held = (vw: typeof v, box: string) => (vw.chips[box] ?? []).filter((c) => dirtyNames.includes(c.model) && c.kind !== 'runs').reduce((sum, c) => sum + c.bytes, 0)
+    for (const [k, b] of Object.entries(v.boxes)) {
+      if (b.kind === 'gpu' || b.kind === 'disk') out[k] = Math.max(0, (b.deviceUsed ?? 0) - held(bv, k) + held(v, k))
+    }
+    return out
+  })
 
   function runCheck(forSig: string) {
     const seq = ++checkSeq
@@ -445,7 +471,7 @@
     <section class="content">
       <h2>Machine</h2>
       {#if view && machine}
-        <MachineView {view} {machine} {selected} {over} onselect={select} {onmove} />
+        <MachineView {view} {machine} {selected} {over} {projected} onselect={select} {onmove} />
         <p class="legend muted">
           <span>Letter and colour = which model.</span>
           <span>Dashed outline = one piece of a split subsystem.</span>

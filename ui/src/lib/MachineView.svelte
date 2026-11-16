@@ -14,6 +14,7 @@
     machine,
     selected,
     over,
+    projected,
     onselect,
     onmove,
   }: {
@@ -22,6 +23,8 @@
     selected: { model: string; sub: string | null } | null
     /** boxes the pending plan doesn't fit on: what it would need */
     over: Record<string, string>
+    /** used memory under the pending plan, for GPUs and disks (empty when nothing is pending) */
+    projected: Record<string, number>
     onselect: (model: string, sub: string | null) => void
     /** a chip or a model was dropped on a box */
     onmove: (subject: Subject, model: string, fromBox: string | null, toBox: string) => void
@@ -44,12 +47,13 @@
   const isSel = (c: Chip) => !!selected && selected.model === c.model && selected.sub !== null && selected.sub === c.sub
   // header: used / capacity. Devices and disks: what the device reports (the same number
   // their bar draws); RAM: our models' exact memory.
-  const headText = (b: HwBox) => (b.kind === 'ram' ? pair(ours(b), b.total) : pair(Math.max(b.deviceUsed ?? 0, ours(b)), b.total))
+  const used = (b: HwBox) => projected[b.key] ?? Math.max(b.deviceUsed ?? 0, ours(b))
+  const headText = (b: HwBox) => (b.kind === 'ram' ? pair(ours(b), b.total) : pair(used(b), b.total))
   // linear usage bar: our pieces in model colours, then whatever else the device reports used
   function segs(b: HwBox) {
     const T = Math.max(b.total, 1)
     const out = chipsOf(b).map((c) => ({ w: (100 * c.bytes) / T, color: byName[c.model]?.color ?? '#888', kind: c.kind }))
-    const other = Math.max(0, (b.deviceUsed ?? 0) - ours(b))
+    const other = Math.max(0, used(b) - ours(b))
     return { out, other: (100 * other) / T }
   }
   const memBox = (node: number | null) => (node === null ? undefined : machine.memory ? (machine.memory.nodes.length ? machine.memory.nodes.find((n) => n.node === node) : machine.memory.system) : undefined)
