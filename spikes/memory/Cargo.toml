@@ -1,0 +1,17 @@
+[package]
+name = "memory-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike: does locking and huge pages for the RAM tier work, cost, or matter?"
+
+[dependencies]
+aie-anatomy = { path = "../../crates/anatomy" }
+aie-gguf = { path = "../../crates/gguf" }
+aie-llama = { path = "../../crates/llama" }
+aie-plan = { path = "../../crates/plan" }
+libc = "0.2"
+serde_json = "1"
+
+[features]
+cuda = ["aie-llama/cuda"]

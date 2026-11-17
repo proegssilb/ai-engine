@@ -1,0 +1,59 @@
+# Publish release builds when a v* tag is pushed. One binary per x86-64 CPU
+# level (see tools/release.sh and install.sh for how they are named and picked).
+#
+# TODO: CUDA variants (tools/release.sh --cuda "v2 v3 v4"). Installing the 12.4
+# toolkit on a runner without a GPU works, but build.rs links against
+# /usr/local/cuda/lib64 and the driver stub (-lcuda), a layout that still has
+# to be confirmed on a runner; until then CUDA builds are made by hand.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [v2, v3, v4]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev protobuf-compiler
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.level }}
+      - run: tools/release.sh --levels ${{ matrix.level }} --version "${GITHUB_REF_NAME#v}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-engine-${{ matrix.level }}
+          path: dist/*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums for every asset, then the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes ./*.tar.gz SHA256SUMS

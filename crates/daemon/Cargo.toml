@@ -1,0 +1,30 @@
+[package]
+name = "aie-daemon"
+description = "The daemon: model store, worker lifecycle, OpenAI- and ollama-compatible APIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+aie-anatomy = { path = "../anatomy" }
+aie-gguf = { path = "../gguf" }
+aie-plan = { path = "../plan" }
+aie-proto = { path = "../proto" }
+aie-store = { path = "../store" }
+aie-worker = { path = "../worker" }
+axum = "0.8"
+futures-util = "0.3"
+aie-sys = { path = "../sys" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "process", "fs", "signal"] }
+tokio-stream = "0.1"
+toml = "1"
+tonic = "0.14"
+
+[dev-dependencies]
+reqwest = { version = "0.13", features = ["json"] }
+
+[lints]
+workspace = true

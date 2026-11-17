@@ -1,0 +1,18 @@
+[package]
+name = "placement-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Spike: drive llama.cpp tensor placement from Rust, including a Rust-implemented buffer type"
+
+[dependencies]
+libc = "0.2"
+regex = "1"
+
+[build-dependencies]
+bindgen = "0.72"
+cmake = "0.1"
+
+[features]
+# Build llama.cpp with the CUDA backend (needs nvcc). Arch via CUDA_ARCHITECTURES, default 70 (V100).
+cuda = []

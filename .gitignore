@@ -1,0 +1,48 @@
+# Rust build output (any crate or spike; target-*/ for side builds like target-cuda/)
+target/
+target-*/
+target-release/
+dist-release/
+**/*.rs.bk
+
+# Web UI (TypeScript)
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+
+# Model weights and other large local artefacts
+*.gguf
+*.safetensors
+# ...except small header-only test fixtures
+!/fixtures/*.gguf
+/spikes/*/models/
+
+# Local state, benchmark output and logs
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/spikes/*/results/
+*.log
+
+# Python helpers
+__pycache__/
+*.py[cod]
+.venv/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

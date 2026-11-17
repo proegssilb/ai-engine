@@ -1,0 +1,31 @@
+[package]
+name = "ai-engine"
+description = "ai-engine: a placement-aware inference control plane (daemon, worker and CLI in one binary)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ai-engine"
+path = "src/main.rs"
+
+[features]
+cuda = ["aie-worker/cuda"]
+
+[dependencies]
+aie-daemon = { path = "../daemon" }
+aie-worker = { path = "../worker" }
+clap = { version = "4", features = ["derive", "env"] }
+aie-sys = { path = "../sys" }
+reqwest = { version = "0.13", features = ["json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", features = ["json"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true
