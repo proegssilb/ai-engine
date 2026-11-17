@@ -55,8 +55,17 @@ pub struct BufferRecord {
 }
 
 /// Every buffer this process allocated, with the tensors placed in it, so
-/// placement can be verified and reported.
-pub static REGISTRY: Mutex<Vec<BufferRecord>> = Mutex::new(Vec::new());
+/// placement can be verified and reported. Private: the callbacks rely on its
+/// entries never being removed. Read it with [`buffers`].
+pub(crate) static REGISTRY: Mutex<Vec<BufferRecord>> = Mutex::new(Vec::new());
+
+/// A snapshot of every buffer this process allocated.
+pub fn buffers() -> Vec<BufferRecord> {
+    REGISTRY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
 
 struct BuftCtx {
     name: CString,
@@ -67,6 +76,9 @@ struct BufCtx {
     base: *mut u8,
     map_len: usize,
     idx: usize,
+    /// Registered with CUDA, so `buf_free` must unregister before unmapping.
+    /// Kept here, not only in REGISTRY, so nothing outside can change it.
+    registered: bool,
 }
 
 const ALIGNMENT: usize = 64;
@@ -134,17 +146,24 @@ unsafe extern "C" fn buft_alloc_buffer(
     // SAFETY: As above: `buft` is one of ours.
     let opts = unsafe { buft_ctx(buft).opts.clone() };
     // Reserved huge pages first, if asked; else (or on failure) normal pages.
-    // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
+    // ggml never calls us for size 0 (it hands out a dummy buffer itself), but
+    // a zero size still maps one page rather than failing.
     let mut hugetlb_result = None;
     let mut mapped = None;
     if let Some(hp) = opts.hugetlb.filter(|_| size > 0) {
-        let len = size.div_ceil(hp as usize) * hp as usize;
-        match aie_sys::AnonMap::new_hugetlb(len, hp) {
-            Ok(m) => {
+        // A page size of 0 (or one so big the length overflows) comes from a
+        // bad config: record EINVAL and use normal pages, never divide by it.
+        let len = usize::try_from(hp)
+            .ok()
+            .filter(|h| *h > 0)
+            .and_then(|h| size.checked_next_multiple_of(h));
+        match len.map(|len| aie_sys::AnonMap::new_hugetlb(len, hp)) {
+            Some(Ok(m)) => {
                 hugetlb_result = Some(Ok(hp));
                 mapped = Some(m);
             }
-            Err(e) => hugetlb_result = Some(Err(errno(&e))),
+            Some(Err(e)) => hugetlb_result = Some(Err(errno(&e))),
+            None => hugetlb_result = Some(Err(libc::EINVAL)),
         }
     }
     let map = match mapped {
@@ -210,14 +229,25 @@ unsafe extern "C" fn buft_alloc_buffer(
         });
     }
 
+    let registered = matches!(rec.cuda_register_result, Some(Ok(())));
     let idx = {
         let mut reg = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         reg.push(rec);
         reg.len() - 1
     };
+    if map.len() < size {
+        // Can't happen (both constructors round up), but ggml would write
+        // `size` bytes from the base, so never hand out less.
+        return ptr::null_mut();
+    }
     // From here llama.cpp owns the mapping; buf_free takes it back.
     let (base, map_len) = map.into_raw();
-    let ctx = Box::new(BufCtx { base, map_len, idx });
+    let ctx = Box::new(BufCtx {
+        base,
+        map_len,
+        idx,
+        registered,
+    });
     // SAFETY: `buft` is ours; `ctx` is a fresh Box whose ownership passes to the buffer and
     // comes back exactly once in `buf_free`; `size` <= `map_len`, so every offset ggml derives
     // from the base stays inside the mapping.
@@ -235,7 +265,8 @@ const BUFFER_IFACE: sys::ggml_backend_buffer_i = sys::ggml_backend_buffer_i {
     get_tensor: Some(buf_get_tensor),
     set_tensor_2d: None,
     get_tensor_2d: None,
-    cpy_tensor: Some(buf_cpy_tensor),
+    // Optional; ggml only calls it when neither buffer is host memory, and ours is.
+    cpy_tensor: None,
     clear: Some(buf_clear),
     reset: None,
     set_tensor_n: None,
@@ -256,18 +287,22 @@ unsafe extern "C" fn buf_free(buf: sys::ggml_backend_buffer_t) {
     // the memory is unmapped.
     unsafe {
         let ctx = Box::from_raw((*buf).context as *mut BufCtx);
-        let registered = matches!(
-            REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[ctx.idx].cuda_register_result,
-            Some(Ok(()))
-        );
-        if registered && let Some(c) = cudart() {
+        if ctx.registered
+            && let Some(c) = cudart()
+        {
             (c.unregister)(ctx.base as *mut c_void);
         }
         // Ownership returns from llama.cpp: (base, map_len) is the pair
         // into_raw gave up in buft_alloc_buffer, and this is the only place
         // it is taken back (buf_free runs once per buffer).
         drop(aie_sys::AnonMap::from_raw(ctx.base, ctx.map_len));
-        REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[ctx.idx].freed = true;
+        if let Some(r) = REGISTRY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(ctx.idx)
+        {
+            r.freed = true;
+        }
     }
 }
 
@@ -289,9 +324,13 @@ unsafe extern "C" fn buf_init_tensor(
                 .to_string_lossy()
                 .into_owned();
             let entry = (name, (*t).data as usize, sys::ggml_nbytes(t));
-            REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[buf_ctx(buf).idx]
-                .tensors
-                .push(entry);
+            if let Some(r) = REGISTRY
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_mut(buf_ctx(buf).idx)
+            {
+                r.tensors.push(entry);
+            }
         }
     }
     sys::ggml_status_GGML_STATUS_SUCCESS
@@ -319,8 +358,8 @@ unsafe extern "C" fn buf_set_tensor(
 ) {
     // SAFETY: ggml's set_tensor contract: `t` is a tensor in this buffer, offset + size <=
     // ggml_nbytes(t) (asserted by ggml_backend_tensor_set), and `data` is readable for `size`
-    // bytes; the source is caller memory, which can't overlap our mapping.
-    unsafe { ptr::copy_nonoverlapping(data as *const u8, ((*t).data as *mut u8).add(offset), size) }
+    // bytes. `ptr::copy` allows the ranges to overlap, so nothing depends on where `data` is.
+    unsafe { ptr::copy(data as *const u8, ((*t).data as *mut u8).add(offset), size) }
 }
 
 unsafe extern "C" fn buf_get_tensor(
@@ -332,30 +371,8 @@ unsafe extern "C" fn buf_get_tensor(
 ) {
     // SAFETY: ggml's get_tensor contract: `t` is a tensor in this buffer, offset + size <=
     // ggml_nbytes(t) (asserted by ggml_backend_tensor_get), and `data` is writable for `size`
-    // bytes and doesn't overlap our mapping.
-    unsafe { ptr::copy_nonoverlapping(((*t).data as *const u8).add(offset), data as *mut u8, size) }
-}
-
-unsafe extern "C" fn buf_cpy_tensor(
-    _: sys::ggml_backend_buffer_t,
-    src: *const sys::ggml_tensor,
-    dst: *mut sys::ggml_tensor,
-) -> bool {
-    // SAFETY: ggml's cpy_tensor contract: `dst` is a tensor in this buffer with the same layout
-    // as `src` (asserted by ggml_backend_tensor_copy), so both are ggml_nbytes(src) long. We
-    // only copy when `src` lives in host memory, where `data` is a plain pointer; two distinct
-    // tensors don't overlap.
-    unsafe {
-        if !(*src).buffer.is_null() && sys::ggml_backend_buffer_is_host((*src).buffer) {
-            ptr::copy_nonoverlapping(
-                (*src).data as *const u8,
-                (*dst).data as *mut u8,
-                sys::ggml_nbytes(src),
-            );
-            return true;
-        }
-    }
-    false
+    // bytes. `ptr::copy` allows the ranges to overlap.
+    unsafe { ptr::copy(((*t).data as *const u8).add(offset), data as *mut u8, size) }
 }
 
 unsafe extern "C" fn buf_clear(buf: sys::ggml_backend_buffer_t, value: u8) {
@@ -368,8 +385,9 @@ unsafe extern "C" fn buf_clear(buf: sys::ggml_backend_buffer_t, value: u8) {
 }
 
 /// cudaHostRegister / cudaHostUnregister, looked up at runtime so the crate
-/// builds and runs without CUDA. llama.cpp's CUDA backend already loaded
-/// libcudart if it's in use, so this finds the same copy.
+/// builds and runs without CUDA. First in what the process already has loaded
+/// (the runtime llama.cpp's CUDA backend uses); only if that has none, by
+/// loading a libcudart by name.
 struct Cudart {
     register: unsafe extern "C" fn(*mut c_void, usize, libc::c_uint) -> i32,
     unregister: unsafe extern "C" fn(*mut c_void) -> i32,
@@ -378,23 +396,24 @@ struct Cudart {
 fn cudart() -> Option<&'static Cudart> {
     static CUDART: std::sync::OnceLock<Option<Cudart>> = std::sync::OnceLock::new();
     CUDART
-        // SAFETY: dlopen/dlsym take NUL-terminated names (each CString lives until the end of
-        // its dlopen call). The CUDA runtime's symbols have exactly the signatures transmuted
+        // SAFETY: dlsym/dlopen take NUL-terminated static names (C string literals). The CUDA
+        // runtime's symbols have exactly the signatures transmuted
         // to, cudaError_t being a C int: cudaHostRegister(void*, size_t, unsigned) and
         // cudaHostUnregister(void*). The library is never closed, so the function pointers stay
         // valid.
         .get_or_init(|| unsafe {
-            let h = ["libcudart.so.12", "libcudart.so", "libcudart.so.13"]
-                .iter()
-                .map(|n| {
-                    libc::dlopen(
-                        CString::new(*n).unwrap().as_ptr(),
-                        libc::RTLD_NOW | libc::RTLD_GLOBAL,
-                    )
-                })
-                .find(|h| !h.is_null())?;
-            let reg = libc::dlsym(h, c"cudaHostRegister".as_ptr());
-            let unreg = libc::dlsym(h, c"cudaHostUnregister".as_ptr());
+            let (mut reg, mut unreg) = (
+                libc::dlsym(libc::RTLD_DEFAULT, c"cudaHostRegister".as_ptr()),
+                libc::dlsym(libc::RTLD_DEFAULT, c"cudaHostUnregister".as_ptr()),
+            );
+            if reg.is_null() || unreg.is_null() {
+                let h = [c"libcudart.so.12", c"libcudart.so", c"libcudart.so.13"]
+                    .iter()
+                    .map(|n| libc::dlopen(n.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL))
+                    .find(|h| !h.is_null())?;
+                reg = libc::dlsym(h, c"cudaHostRegister".as_ptr());
+                unreg = libc::dlsym(h, c"cudaHostUnregister".as_ptr());
+            }
             if reg.is_null() || unreg.is_null() {
                 return None;
             }

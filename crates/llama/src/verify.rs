@@ -169,10 +169,26 @@ unsafe fn observe_src(s: &mut State, mut t: *const sys::ggml_tensor) {
     }
 }
 
-unsafe extern "C" fn eval_cb(t: *mut sys::ggml_tensor, ask: bool, _: *mut c_void) -> bool {
+/// "C-unwind", as ggml's callback type is; a panic must not unwind into
+/// ggml's scheduler, so it is caught and ends the process.
+unsafe extern "C-unwind" fn eval_cb(t: *mut sys::ggml_tensor, ask: bool, _: *mut c_void) -> bool {
     if !ask {
         return true;
     }
+    let observed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: as for this function: `t` is a live tensor ggml passes us.
+        unsafe { observe(t) }
+    }));
+    if observed.is_err() {
+        std::process::abort();
+    }
+    false
+}
+
+/// # Safety
+///
+/// `t` must be a live, non-null tensor of the graph being evaluated.
+unsafe fn observe(t: *mut sys::ggml_tensor) {
     let mut g = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(s) = g.as_mut() {
         // SAFETY: ggml passes a live, non-null tensor; `src` is its fixed-size array of source
@@ -183,7 +199,6 @@ unsafe extern "C" fn eval_cb(t: *mut sys::ggml_tensor, ask: bool, _: *mut c_void
             unsafe { observe_src(s, *src) };
         }
     }
-    false
 }
 
 /// Address ranges where the model file is mapped in this process. Kept as
@@ -231,7 +246,10 @@ pub fn check(
         ..params.clone()
     };
     let run = (|| {
-        let mut ctx = Context::with_eval_callback(model.clone(), p.clone(), Some(eval_cb))?;
+        // SAFETY: `eval_cb` only reads the tensors ggml passes it (null-checked, under the
+        // STATE mutex) and ignores the user-data pointer; it stays valid for the process.
+        let mut ctx =
+            unsafe { Context::with_eval_callback(model.clone(), p.clone(), Some(eval_cb)) }?;
         let batch = &prompt[..prompt.len().min(p.n_batch as usize).max(1)];
         ctx.decode(batch)?;
         ctx.decode(&[batch[0]])?;

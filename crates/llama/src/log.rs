@@ -23,21 +23,35 @@ pub(crate) unsafe fn install() {
     unsafe { sys::llama_log_set(Some(callback), std::ptr::null_mut()) };
 }
 
-unsafe extern "C" fn callback(
+/// ggml's callback types are "C-unwind" (like all of llama.cpp's API here), so
+/// a panic must not leave: unwinding into ggml's C frames isn't allowed. Any
+/// panic is caught and ends the process instead.
+unsafe extern "C-unwind" fn callback(
     _level: sys::ggml_log_level,
     text: *const libc::c_char,
     _: *mut c_void,
 ) {
+    if text.is_null() {
+        return;
+    }
     // SAFETY: ggml passes a NUL-terminated message that is valid for the duration of the
-    // callback; it is copied before returning.
-    let s = unsafe { CStr::from_ptr(text) }.to_string_lossy();
+    // callback (non-null, checked); it is copied here, before returning.
+    let s = unsafe { CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned();
+    if std::panic::catch_unwind(|| record(&s)).is_err() {
+        std::process::abort();
+    }
+}
+
+fn record(s: &str) {
     if ECHO.load(Ordering::Relaxed) {
         // Not eprint!: it panics if stderr is closed, and a panic can't cross
         // back into C (it would abort the process).
         let _ = std::io::Write::write_all(&mut std::io::stderr(), s.as_bytes());
     }
     let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
-    pending.push_str(&s);
+    pending.push_str(s);
     while let Some(i) = pending.find('\n') {
         let line: String = pending.drain(..=i).collect();
         let mut lines = LINES.lock().unwrap_or_else(PoisonError::into_inner);

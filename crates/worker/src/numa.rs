@@ -697,12 +697,9 @@ pub fn report(
 
     let mut tier: BTreeMap<u32, u64> = BTreeMap::new();
     let mut exact = true;
-    let bufs: Vec<_> = aie_llama::pinned::REGISTRY
-        .lock()
-        .unwrap()
-        .iter()
+    let bufs: Vec<_> = aie_llama::pinned::buffers()
+        .into_iter()
         .filter(|b| !b.freed && b.len > 0)
-        .cloned()
         .collect();
     let small = aie_sys::page_size();
     for b in &bufs {

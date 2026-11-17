@@ -36,6 +36,8 @@ struct aie_mem_row {
     uint64_t context;
     uint64_t compute;
 };
+// Rust's `MemRow` (src/fit.rs) mirrors this layout and asserts the same size.
+static_assert(sizeof(aie_mem_row) == 176, "aie_mem_row layout changed: update MemRow in src/fit.rs");
 
 extern "C" int aie_measure(const char * model_path, const llama_model_params * mparams,
                            const llama_context_params * cparams, aie_mem_row * rows, int max_rows) {

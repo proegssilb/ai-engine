@@ -29,10 +29,8 @@ unsafe extern "C" {
     fn aie_ctx_breakdown(ctx: *const sys::llama_context, rows: *mut MemRow, max_rows: i32) -> i32;
 }
 
-/// llama.cpp's fit and dry run swap the global logger and restore whatever
-/// they found; two at once restore each other's temporary logger, which
-/// points into a finished stack frame. One at a time per process.
-static FIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Must match `aie_mem_row` in shim/fit.cpp, which asserts the same size.
+const _: () = assert!(std::mem::size_of::<MemRow>() == 176);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -91,11 +89,12 @@ pub fn measure(
         };
         64
     ];
-    let _one = FIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // The dry run swaps the global logger: nothing else may run llama.cpp meanwhile.
+    let _log = crate::log_write();
     // SAFETY: `c_path` is a NUL-terminated string and `params.mp`/`cp` live locals (whose
     // pointer fields point at vectors owned by `params`) that outlive the call; `rows` has
-    // `rows.len()` writable entries and the shim writes at most that many. FIT_LOCK is held:
-    // llama.cpp's fit swaps the global logger.
+    // `rows.len()` writable entries and the shim writes at most that many. LLAMA_LOG is held
+    // for writing, so no other llama.cpp call logs while the dry run swaps the logger.
     let n = unsafe {
         aie_measure(
             c_path.as_ptr(),
@@ -139,7 +138,11 @@ fn convert(rows: &[MemRow]) -> Vec<Measured> {
 
 /// What a live context really allocated, per device and on the host: the
 /// same rows as [`measure`], but read from the allocated buffers.
-pub(crate) fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
+///
+/// # Safety
+///
+/// `ctx` must be a live llama_context for the duration of the call.
+pub(crate) unsafe fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
     let mut rows = vec![
         MemRow {
             name: [0; 128],
@@ -152,8 +155,8 @@ pub(crate) fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
         };
         64
     ];
-    // SAFETY: The caller passes a live llama_context (see `breakdown`'s callers); `rows` has
-    // `rows.len()` writable entries and the shim writes at most that many.
+    // SAFETY: `ctx` is live (this function's contract); `rows` has `rows.len()` writable
+    // entries and the shim writes at most that many.
     let n = unsafe { aie_ctx_breakdown(ctx, rows.as_mut_ptr(), rows.len() as i32) };
     if n < 0 {
         return Vec::new();
@@ -190,17 +193,20 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
         max_tbo
     ];
     let mut margins = vec![margin as usize; max_dev];
+    // The fit writes `split` and reads `margins` by the real GPU count.
+    crate::check_device_count()?;
     // SAFETY: Returns a struct by value; no pointers or preconditions.
     let mut mp = unsafe { sys::llama_model_default_params() };
     // SAFETY: Returns a struct by value; no pointers or preconditions.
     let mut cp = unsafe { sys::llama_context_default_params() };
     cp.n_ctx = n_ctx;
 
-    let _one = FIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: `c_path` is NUL-terminated; `mp`, `cp` are live locals; `split` has max_dev
-    // floats, `tbo` max_tbo override slots and `margins` max_dev entries, the sizes llama.cpp's
-    // fit writes up to. FIT_LOCK is held until the end of this function, because the fit swaps
-    // the global logger and keeps its patterns in static storage that the next fit overwrites.
+    // The fit swaps the global logger: nothing else may run llama.cpp meanwhile.
+    let _log = crate::log_write();
+    // SAFETY: `c_path` is NUL-terminated; `mp`, `cp` are live locals. `split` and `margins`
+    // have max_dev entries and the GPU count was checked to be at most max_dev above, which
+    // is what the fit indexes them by; `tbo` has max_tbo slots and the fit guards every write
+    // with `itbo + 1 >= ntbo`. LLAMA_LOG is held for writing (the fit swaps the logger).
     let status = unsafe {
         aie_fit(
             c_path.as_ptr(),
@@ -265,8 +271,8 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
         };
         overrides.push(Override {
             // SAFETY: `o.pattern` is non-null (checked above) and points at a NUL-terminated
-            // string in the fit's static storage, which isn't overwritten while FIT_LOCK is
-            // held.
+            // string in the fit's function-static storage, written once per layer and never
+            // changed or freed afterwards (common/fit.cpp: `if (patterns[il].empty())`).
             pattern: unsafe { CStr::from_ptr(o.pattern) }
                 .to_string_lossy()
                 .into_owned(),

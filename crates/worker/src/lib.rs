@@ -189,12 +189,7 @@ struct Stats {
 /// Problems with the RAM tier's buffers that don't stop the load.
 fn load_warnings() -> Vec<String> {
     let mut out = Vec::new();
-    for b in aie_llama::pinned::REGISTRY
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|b| !b.freed)
-    {
+    for b in aie_llama::pinned::buffers().iter().filter(|b| !b.freed) {
         if let Some(Err(e)) = b.hugetlb_result {
             out.push(format!(
                 "the RAM tier asked for reserved huge pages but got normal ones (mmap errno {e}); reserve more (vm.nr_hugepages / /sys/kernel/mm/hugepages)"

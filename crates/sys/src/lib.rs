@@ -12,6 +12,7 @@
 //!
 //! Errors are `std::io::Error`; `raw_os_error()` gives the errno.
 
+#![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 

@@ -7,6 +7,7 @@
 //!
 //! llama.cpp's logging is process-global; [`log`] captures it.
 
+#![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
@@ -66,6 +67,41 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// llama.cpp's fit and dry run (in `common`) swap the process-global logger
+/// with two unsynchronised writes and restore it afterwards. Any llama.cpp
+/// call that logs on another thread meanwhile could read a half-written
+/// logger and call the fit's callback with the wrong user data. So the fit
+/// and dry run hold this for writing, and loads, context creation and
+/// decoding (the calls that log) hold it for reading.
+pub(crate) static LLAMA_LOG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+pub(crate) fn log_read() -> std::sync::RwLockReadGuard<'static, ()> {
+    LLAMA_LOG
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+pub(crate) fn log_write() -> std::sync::RwLockWriteGuard<'static, ()> {
+    LLAMA_LOG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// llama.cpp sizes its per-device arrays (tensor split, fit margins) by
+/// `llama_max_devices()` but indexes them by the real number of GPUs, so
+/// past that number it reads and writes out of bounds. Refuse instead.
+pub(crate) fn check_device_count() -> Result<(), Error> {
+    // SAFETY: Returns a constant; no preconditions.
+    let max = unsafe { sys::llama_max_devices() };
+    let gpus = devices().iter().filter(|d| d.is_gpu).count();
+    if gpus > max {
+        return Err(Error::Device(format!(
+            "this machine has {gpus} GPUs; llama.cpp supports at most {max}"
+        )));
+    }
+    Ok(())
+}
 
 /// Initialise llama.cpp once per process (backends, logging capture).
 pub fn init() {

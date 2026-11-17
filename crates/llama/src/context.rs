@@ -166,7 +166,6 @@ impl Generation {
 pub struct Context {
     ptr: NonNull<sys::llama_context>,
     model: Arc<Model>,
-    params: ContextParams,
 }
 
 // A context may move between threads but isn't shared.
@@ -177,28 +176,31 @@ unsafe impl Send for Context {}
 
 impl Context {
     pub fn new(model: Arc<Model>, p: ContextParams) -> Result<Context, Error> {
-        Self::with_eval_callback(model, p, None)
+        // SAFETY: no callback.
+        unsafe { Self::with_eval_callback(model, p, None) }
     }
 
-    pub(crate) fn with_eval_callback(
+    /// # Safety
+    ///
+    /// `cb`, if given, must be sound to call from ggml's scheduler with any
+    /// tensor of the graph and a null user-data pointer, for as long as the
+    /// context lives.
+    pub(crate) unsafe fn with_eval_callback(
         model: Arc<Model>,
         p: ContextParams,
         cb: sys::ggml_backend_sched_eval_callback,
     ) -> Result<Context, Error> {
+        let _log = crate::log_read();
         // SAFETY: `model.raw()` is a live model (held by the Arc we store in the Context, so it
-        // outlives the context); `cp` is passed by value; `cb` is either None or an `extern
-        // "C"` function with the signature ggml expects.
+        // outlives the context); `cp` is passed by value; `cb` is None or sound to call (this
+        // function's contract).
         let ptr = unsafe {
             let mut cp = p.raw();
             cp.cb_eval = cb;
             sys::llama_init_from_model(model.raw(), cp)
         };
         let ptr = NonNull::new(ptr).ok_or_else(|| Error::Context(crate::log::tail(8)))?;
-        Ok(Context {
-            ptr,
-            model,
-            params: p,
-        })
+        Ok(Context { ptr, model })
     }
 
     pub fn model(&self) -> &Arc<Model> {
@@ -207,7 +209,8 @@ impl Context {
 
     /// What this context really allocated, per device and on the host.
     pub fn memory_breakdown(&self) -> Vec<crate::fit::Measured> {
-        crate::fit::breakdown(self.ptr.as_ptr())
+        // SAFETY: `self.ptr` is the live context this value owns, kept alive by `&self`.
+        unsafe { crate::fit::breakdown(self.ptr.as_ptr()) }
     }
 
     pub fn n_ctx(&self) -> u32 {
@@ -223,10 +226,15 @@ impl Context {
         unsafe { sys::llama_memory_clear(sys::llama_get_memory(self.ptr.as_ptr()), true) }
     }
 
-    /// Feed tokens, in batches of `n_batch`.
+    /// Feed tokens, in batches of the context's batch size.
     pub fn decode(&mut self, tokens: &[Token]) -> Result<(), Error> {
+        let _log = crate::log_read();
+        // llama.cpp clamps n_batch to n_ctx and asserts each batch fits, so
+        // chunk by its effective value, not the one we asked for.
+        // SAFETY: `self.ptr` is the llama_context this value owns (freed only in Drop).
+        let n_batch = unsafe { sys::llama_n_batch(self.ptr.as_ptr()) }.max(1);
         let mut buf = tokens.to_vec();
-        for chunk in buf.chunks_mut(self.params.n_batch.max(1) as usize) {
+        for chunk in buf.chunks_mut(n_batch as usize) {
             // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in
             // `new` and freed only in Drop. `chunk` is a live, mutable slice of `chunk.len()`
             // tokens (at most n_batch, so i32 can't overflow); llama_batch_get_one only borrows
@@ -271,6 +279,9 @@ impl Context {
         let sampler = Sampler::new(sampling);
         let t0 = Instant::now();
         self.decode(prompt)?;
+        // After decode returns: it takes the same lock, and a thread mustn't
+        // hold a read lock twice (a waiting writer would deadlock it).
+        let _log = crate::log_read();
         // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
         // and freed only in Drop.
         unsafe { sys::llama_synchronize(self.ptr.as_ptr()) };

@@ -184,6 +184,10 @@ fn chat_template_and_tokens() {
     let round: String = toks.iter().map(|&t| u.push(&m.piece(t))).collect();
     assert!(round.contains("hi"));
     assert!(m.description().contains("qwen3"));
+    // Ids outside the vocabulary: llama.cpp would throw; we return nothing.
+    assert!(m.piece(-1).is_empty());
+    assert!(m.piece(m.n_vocab() as i32).is_empty());
+    assert!(m.piece(i32::MAX).is_empty());
 }
 
 #[test]

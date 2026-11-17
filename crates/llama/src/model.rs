@@ -134,6 +134,8 @@ impl ModelParams {
             buft: std::ptr::null_mut(),
         });
 
+        // llama.cpp reads the split by the real GPU count (see check_device_count).
+        crate::check_device_count()?;
         // SAFETY: Returns a constant; no preconditions.
         let max_dev = unsafe { sys::llama_max_devices() };
         if s.tensor_split.len() > max_dev {
@@ -173,6 +175,7 @@ impl Model {
         init();
         let c_path = c_path(path)?;
         let params = ModelParams::new(opts)?;
+        let _log = crate::log_read();
         // SAFETY: `c_path` is NUL-terminated. `params.mp` points at the split array and
         // override list owned by `params`, alive for this call. llama.cpp copies the split into
         // the model, and reads the override list (whose patterns are kept in the Model) only
@@ -215,11 +218,13 @@ impl Model {
     /// e.g. `qwen3moe 30B.A3B Q4_K - Medium`
     pub fn description(&self) -> String {
         let mut buf = vec![0u8; 256];
+        let cap = buf.len() - 1;
         // SAFETY: `self.raw()` is the llama_model this value owns (non-null, freed only in
         // Drop). `buf` has `buf.len()` writable bytes, and llama_model_desc (snprintf) writes
         // at most that many.
         let n = unsafe { sys::llama_model_desc(self.raw(), buf.as_mut_ptr() as *mut _, buf.len()) };
-        buf.truncate(n.max(0) as usize);
+        // snprintf returns the untruncated length; keep what fit (without the NUL).
+        buf.truncate((n.max(0) as usize).min(cap));
         String::from_utf8_lossy(&buf).into_owned()
     }
 
@@ -268,7 +273,7 @@ impl Model {
         };
         if n < 0 {
             // buffer too small: -n is the size needed
-            toks.resize((-n) as usize, 0);
+            toks.resize(n.unsigned_abs() as usize, 0);
             // SAFETY: `self.vocab()` points into the model this value owns, which outlives the
             // call. As above, with `toks` resized to the size llama_tokenize asked for.
             n = unsafe {
@@ -292,6 +297,11 @@ impl Model {
 
     /// One token's bytes. May be part of a UTF-8 character; see [`crate::context::Utf8Stream`].
     pub fn piece(&self, t: Token) -> Vec<u8> {
+        // llama.cpp looks the token up with `.at()`, which throws for an id
+        // outside the vocabulary; that exception would end the process.
+        if t < 0 || t as usize >= self.n_vocab() {
+            return Vec::new();
+        }
         let mut buf = vec![0u8; 64];
         // SAFETY: `self.vocab()` points into the model this value owns, which outlives the
         // call. `buf` has `buf.len()` writable bytes, and llama_token_to_piece writes at most
@@ -307,7 +317,7 @@ impl Model {
             )
         };
         if n < 0 {
-            buf.resize((-n) as usize, 0);
+            buf.resize(n.unsigned_abs() as usize, 0);
             // SAFETY: `self.vocab()` points into the model this value owns, which outlives the
             // call. As above, with `buf` resized to the size it asked for.
             n = unsafe {
@@ -353,8 +363,8 @@ impl Model {
         let mut buf = vec![0u8; total * 2 + 256];
         // SAFETY: `tmpl` and every role/content pointer in `msgs` are NUL-terminated strings
         // owned by `tmpl` and `owned`, alive for the call; `msgs` has `msgs.len()` entries;
-        // `buf` has `buf.len()` writable bytes and the function copies only when the result
-        // fits (a negative or too-small length makes it copy nothing).
+        // `buf` has `buf.len()` writable bytes, and the function copies at most `length`
+        // (= buf.len()) bytes with strncpy, and nothing when the length is negative.
         let mut n = unsafe {
             sys::llama_chat_apply_template(
                 tmpl.as_ptr(),

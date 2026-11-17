@@ -12,6 +12,10 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# Only aie-sys (OS calls) and aie-llama (the llama.cpp boundary) may use
+# unsafe; they allow it at their crate roots. This covers every other target
+# too: build scripts, examples, tests. See docs/architecture.md.
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

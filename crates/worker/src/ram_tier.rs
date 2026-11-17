@@ -11,7 +11,6 @@
 //! When nothing holds it, the status says so and how to fix it for the way
 //! the engine is running (systemd service, user session, container, shell).
 
-use aie_llama::pinned::REGISTRY;
 use aie_llama::residency;
 use serde::Serialize;
 
@@ -114,12 +113,9 @@ fn mib(b: u64) -> String {
 
 /// The RAM tier's status right now.
 pub fn status() -> RamTier {
-    let bufs: Vec<_> = REGISTRY
-        .lock()
-        .unwrap()
-        .iter()
+    let bufs: Vec<_> = aie_llama::pinned::buffers()
+        .into_iter()
         .filter(|b| !b.freed && b.len > 0)
-        .cloned()
         .collect();
     let bytes: u64 = bufs.iter().map(|b| b.len as u64).sum();
     let mut resident = 0;

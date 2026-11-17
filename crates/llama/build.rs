@@ -17,10 +17,12 @@ fn main() {
     for f in ["wrapper.h", "shim/fit.cpp"] {
         println!("cargo:rerun-if-changed={f}");
     }
-    println!(
-        "cargo:rerun-if-changed={}",
-        root.join("include/llama.h").display()
-    );
+    // Rebuild when the vendored sources change at all (a submodule bump), not
+    // only llama.h: the bindings and the callback signatures in pinned.rs
+    // depend on ggml's internal headers too. Directories are scanned recursively.
+    for d in ["include", "src", "common", "ggml/include", "ggml/src"] {
+        println!("cargo:rerun-if-changed={}", root.join(d).display());
+    }
     println!("cargo:rerun-if-env-changed=CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=AIE_CPU_TARGET");
     let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
@@ -132,6 +134,11 @@ fn main() {
         .allowlist_type("ggml_.*")
         .allowlist_type("gguf_.*")
         .derive_default(true)
+        // llama.cpp is C++ behind a C API, and several of its functions can
+        // throw (std::bad_alloc, std::out_of_range). Unwinding out of an
+        // `extern "C"` import is undefined behaviour in Rust; with "C-unwind"
+        // it is defined: the exception propagates and ends the process.
+        .override_abi(bindgen::Abi::CUnwind, "(llama|ggml|gguf)_.*")
         .generate()
         .expect("bindgen failed");
     bindings
