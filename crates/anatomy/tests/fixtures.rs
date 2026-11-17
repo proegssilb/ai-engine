@@ -2,6 +2,8 @@
 //! Qwen3-30B-A3B come from the GPU placement spike, where llama.cpp reported
 //! the same totals per buffer (spikes/placement/README.md).
 
+#![forbid(unsafe_code)]
+
 use aie_anatomy::{Anatomy, Error, KvShape, MoeShape, Subsystem};
 use aie_gguf::write::Writer;
 use aie_gguf::{GgmlType, Gguf};

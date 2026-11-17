@@ -2,7 +2,6 @@
 //! disk tier: weights left in the mapped model file may be dropped from RAM
 //! and re-read at any time. Ported from the placement spike.
 
-use std::ffi::c_void;
 use std::path::Path;
 
 /// Mappings of `path` in this process: (address start, end, file offset).
@@ -31,23 +30,18 @@ pub fn mappings(path: &Path) -> Vec<(usize, usize, u64)> {
         .collect()
 }
 
-fn page_size() -> usize {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
 /// Resident bytes of an address range.
 fn resident(addr: usize, len: usize) -> u64 {
     if len == 0 {
         return 0;
     }
-    let ps = page_size();
+    let ps = aie_sys::page_size();
     let start = addr / ps * ps;
     let pages = (addr + len).div_ceil(ps) * ps / ps - start / ps;
-    let mut vec = vec![0u8; pages];
-    if unsafe { libc::mincore(start as *mut c_void, pages * ps, vec.as_mut_ptr()) } != 0 {
+    let Ok(vec) = aie_sys::mincore(start, pages * ps) else {
         return 0;
-    }
-    let n = vec.iter().filter(|b| **b & 1 == 1).count() as u64;
+    };
+    let n = vec.iter().filter(|r| **r).count() as u64;
     (n * ps as u64).min(len as u64)
 }
 
@@ -85,21 +79,8 @@ pub struct Smaps {
 /// `[anon:NAME]`). Differently named mappings are never merged by the
 /// kernel, so `smaps()` sees exactly this range. Needs Linux 5.17+ with
 /// CONFIG_ANON_VMA_NAME; returns false where it isn't available.
-pub fn keep_separate(base: usize, len: usize, name: &str) -> bool {
-    const PR_SET_VMA: libc::c_int = 0x53564d41;
-    const PR_SET_VMA_ANON_NAME: libc::c_ulong = 0;
-    let Ok(name) = std::ffi::CString::new(name) else {
-        return false;
-    };
-    unsafe {
-        libc::prctl(
-            PR_SET_VMA,
-            PR_SET_VMA_ANON_NAME,
-            base as libc::c_ulong,
-            len as libc::c_ulong,
-            name.as_ptr() as libc::c_ulong,
-        ) == 0
-    }
+pub fn keep_separate(map: &aie_sys::AnonMap, name: &str) -> bool {
+    map.set_name(name).is_ok()
 }
 
 /// Sum smaps fields over the mappings that lie inside [base, base + len).
@@ -150,29 +131,18 @@ mod tests {
     #[test]
     fn smaps_sees_a_fresh_mapping() {
         let len = 8 << 20;
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(p, libc::MAP_FAILED);
+        let mut m = aie_sys::AnonMap::new(len).unwrap();
         // Without a name the kernel may merge this mapping with a neighbour
         // (another test thread's), and smaps would see a bigger area.
-        let named = keep_separate(p as usize, len, "aie-test");
-        unsafe { std::ptr::write_bytes(p as *mut u8, 1, len) };
-        let s = smaps(p as usize, len);
+        let named = keep_separate(&m, "aie-test");
+        m.as_mut_slice().fill(1);
+        let s = smaps(m.addr(), len);
         if named {
             assert_eq!(s.resident, len as u64);
         } else {
             assert!(s.resident <= len as u64);
         }
         assert_eq!(s.swapped, 0);
-        unsafe { libc::munmap(p, len) };
     }
 
     #[test]
@@ -180,25 +150,14 @@ mod tests {
         // One 16 MiB mapping stands in for our 8 MiB buffer merged with an
         // 8 MiB neighbour: no mapping lies wholly inside the buffer.
         let len = 8 << 20;
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                2 * len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(p, libc::MAP_FAILED);
-        unsafe { std::ptr::write_bytes(p as *mut u8, 1, 2 * len) };
+        let mut m = aie_sys::AnonMap::new(2 * len).unwrap();
+        m.as_mut_slice().fill(1);
         // Merged: capped at the overlap, never silently zero.
-        let merged = smaps(p as usize, len);
+        let merged = smaps(m.addr(), len);
         assert!(merged.resident > 0 && merged.resident <= len as u64);
         // Named: split off by the kernel, so exact.
-        if keep_separate(p as usize, len, "aie-test-merged") {
-            assert_eq!(smaps(p as usize, len).resident, len as u64);
+        if m.set_name_range(0, len, "aie-test-merged").is_ok() {
+            assert_eq!(smaps(m.addr(), len).resident, len as u64);
         }
-        unsafe { libc::munmap(p, 2 * len) };
     }
 }

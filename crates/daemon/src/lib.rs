@@ -3,6 +3,8 @@
 //! placement under `/api/aie`). It never initialises CUDA itself: planning
 //! against devices and llama.cpp's fit run in the workers.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
 pub mod apply;
 pub mod config;

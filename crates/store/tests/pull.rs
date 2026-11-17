@@ -1,5 +1,7 @@
 //! Pulls against a local mock of the Hugging Face Hub API.
 
+#![forbid(unsafe_code)]
+
 use aie_store::hf::Hub;
 use aie_store::{Error, HfRef, ModelRef, Progress, Store};
 use axum::Router;

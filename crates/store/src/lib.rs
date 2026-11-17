@@ -15,6 +15,8 @@
 //!
 //! One pull of a given blob at a time: the daemon serialises pulls.
 
+#![forbid(unsafe_code)]
+
 pub mod hf;
 pub mod oci;
 mod reference;

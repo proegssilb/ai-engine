@@ -15,6 +15,7 @@ cuda = []
 serde = { version = "1", features = ["derive"] }
 aie-plan = { path = "../plan" }
 libc = "0.2"
+aie-sys = { path = "../sys" }
 
 [build-dependencies]
 bindgen = "0.72"

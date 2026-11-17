@@ -503,14 +503,8 @@ pub async fn apply_edits(st: State, Body(r): Body<EditsReq>) -> Result<Json<Valu
 
 /// Free bytes and size of the filesystem holding `path`.
 fn disk(path: &std::path::Path) -> Option<(u64, u64)> {
-    let c = std::ffi::CString::new(path.to_str()?).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| {
-        (
-            st.f_bavail as u64 * st.f_frsize as u64,
-            st.f_blocks as u64 * st.f_frsize as u64,
-        )
-    })
+    let d = aie_sys::disk_space(path).ok()?;
+    Some((d.free, d.total))
 }
 
 async fn probe(exe: &std::path::Path) -> Result<Value, ApiError> {

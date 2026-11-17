@@ -5,6 +5,8 @@
 //! service on a Unix socket. Requests run one at a time (an MVP-only limit;
 //! the protocol already allows more in flight).
 
+#![forbid(unsafe_code)]
+
 pub mod numa;
 /// llama.cpp's dry-run memory row, for callers of [`dry_run`].
 pub use aie_llama::fit::Measured;

@@ -1,5 +1,7 @@
 //! `ai-engine`: daemon, worker and CLI in one binary.
 
+#![forbid(unsafe_code)]
+
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{BufRead, IsTerminal, Write};
@@ -84,7 +86,7 @@ enum Cmd {
 fn main() {
     // Exit quietly when a pipe closes (`ai-engine list | head`) instead of
     // panicking on the failed write, as command-line tools do.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let _ = aie_sys::sigpipe_default();
     let cli = Cli::parse();
     // Threads the runtime starts later (the blocking pool runs the model) get
     // the worker's socket pinning; before a worker applies one this does nothing.

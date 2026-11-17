@@ -3,6 +3,8 @@
 //! Needs Qwen3-0.6B Q8_0 pulled into ~/aie-store (or AIE_TEST_STORE); skips
 //! otherwise.
 
+#![forbid(unsafe_code)]
+
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -14,15 +16,10 @@ struct Daemon(Child, PathBuf);
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        unsafe { libc_kill(self.0.id() as i32, 15) };
+        let _ = aie_sys::terminate(self.0.id());
         let _ = self.0.wait();
         let _ = std::fs::remove_dir_all(&self.1);
     }
-}
-
-unsafe extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
 fn store() -> Option<PathBuf> {

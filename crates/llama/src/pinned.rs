@@ -71,12 +71,8 @@ struct BufCtx {
 
 const ALIGNMENT: usize = 64;
 
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
-}
-
-fn page_size() -> usize {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+fn errno(e: &std::io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(-1)
 }
 
 /// Create a buffer type usable in `llama_model_tensor_buft_override`.
@@ -130,44 +126,29 @@ unsafe extern "C" fn buft_alloc_buffer(
     size: usize,
 ) -> sys::ggml_backend_buffer_t {
     let opts = unsafe { buft_ctx(buft).opts.clone() };
-    let anon = |len: usize, extra: libc::c_int| unsafe {
-        libc::mmap(
-            ptr::null_mut(),
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra,
-            -1,
-            0,
-        )
-    };
     // Reserved huge pages first, if asked; else (or on failure) normal pages.
     // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
     let mut hugetlb_result = None;
     let mut mapped = None;
     if let Some(hp) = opts.hugetlb.filter(|_| size > 0) {
         let len = size.div_ceil(hp as usize) * hp as usize;
-        const MAP_HUGE_SHIFT: libc::c_int = 26;
-        let flags = libc::MAP_HUGETLB | ((hp.trailing_zeros() as libc::c_int) << MAP_HUGE_SHIFT);
-        let b = anon(len, flags);
-        if b == libc::MAP_FAILED {
-            hugetlb_result = Some(Err(errno()));
-        } else {
-            hugetlb_result = Some(Ok(hp));
-            mapped = Some((b, len));
+        match aie_sys::AnonMap::new_hugetlb(len, hp) {
+            Ok(m) => {
+                hugetlb_result = Some(Ok(hp));
+                mapped = Some(m);
+            }
+            Err(e) => hugetlb_result = Some(Err(errno(&e))),
         }
     }
-    let (base, map_len) = match mapped {
+    let map = match mapped {
         Some(m) => m,
-        None => {
-            let ps = page_size();
-            let len = size.max(1).div_ceil(ps) * ps;
-            let b = anon(len, 0);
-            if b == libc::MAP_FAILED {
-                return ptr::null_mut();
-            }
-            (b, len)
-        }
+        // AnonMap rounds the length up to whole pages.
+        None => match aie_sys::AnonMap::new(size.max(1)) {
+            Ok(m) => m,
+            Err(_) => return ptr::null_mut(),
+        },
     };
+    let (base, map_len) = (map.as_ptr(), map.len());
 
     // Its own name, so the kernel never merges it with a neighbouring
     // mapping (another RAM-tier buffer, say) and the RAM tier's residency
@@ -176,11 +157,11 @@ unsafe extern "C" fn buft_alloc_buffer(
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
-        crate::residency::keep_separate(base as usize, map_len, &format!("aie-ram-tier-{n}"));
+        crate::residency::keep_separate(&map, &format!("aie-ram-tier-{n}"));
     }
 
     let mut rec = BufferRecord {
-        base: base as usize,
+        base: map.addr(),
         len: size,
         tensors: vec![],
         mbind_result: None,
@@ -193,44 +174,25 @@ unsafe extern "C" fn buft_alloc_buffer(
 
     if !matches!(rec.hugetlb_result, Some(Ok(_))) {
         let advice = if opts.hugepages {
-            libc::MADV_HUGEPAGE
+            aie_sys::Advice::HugePage
         } else {
-            libc::MADV_NOHUGEPAGE
+            aie_sys::Advice::NoHugePage
         };
-        unsafe { libc::madvise(base, map_len, advice) };
+        let _ = map.advise(advice);
     }
     if let Some(node) = opts.numa_node {
         // Must happen before first touch: the policy applies to pages as they fault in.
-        let mask: [libc::c_ulong; 16] = {
-            let mut m = [0; 16];
-            m[(node / 64) as usize] = 1 << (node % 64);
-            m
-        };
-        const MPOL_BIND: libc::c_long = 2;
-        const MPOL_MF_STRICT: libc::c_ulong = 1;
-        let r = unsafe {
-            libc::syscall(
-                libc::SYS_mbind,
-                base,
-                map_len,
-                MPOL_BIND,
-                mask.as_ptr(),
-                (mask.len() * 64) as libc::c_ulong,
-                MPOL_MF_STRICT,
-            )
-        };
-        rec.mbind_result = Some(if r == 0 { Ok(()) } else { Err(errno()) });
+        rec.mbind_result = Some(map.mbind_node(node).map_err(|e| errno(&e)));
     }
     if opts.mlock {
         // mlock also faults every page in now, under the NUMA policy above.
-        let r = unsafe { libc::mlock(base, map_len) };
-        rec.mlock_result = Some(if r == 0 { Ok(()) } else { Err(errno()) });
+        rec.mlock_result = Some(map.mlock().map_err(|e| errno(&e)));
     }
     if opts.cuda_register {
         rec.cuda_register_result = Some(match cudart() {
             // cudaHostRegisterPortable: page-locked for every CUDA context, so
             // all GPUs (not only the current one) copy from it at full speed.
-            Some(c) => match unsafe { (c.register)(base, map_len, 1) } {
+            Some(c) => match unsafe { (c.register)(base as *mut c_void, map_len, 1) } {
                 0 => Ok(()),
                 e => Err(e),
             },
@@ -243,11 +205,9 @@ unsafe extern "C" fn buft_alloc_buffer(
         reg.push(rec);
         reg.len() - 1
     };
-    let ctx = Box::new(BufCtx {
-        base: base as *mut u8,
-        map_len,
-        idx,
-    });
+    // From here llama.cpp owns the mapping; buf_free takes it back.
+    let (base, map_len) = map.into_raw();
+    let ctx = Box::new(BufCtx { base, map_len, idx });
     unsafe {
         sys::ggml_backend_buffer_init(buft, BUFFER_IFACE, Box::into_raw(ctx) as *mut c_void, size)
     }
@@ -284,7 +244,10 @@ unsafe extern "C" fn buf_free(buf: sys::ggml_backend_buffer_t) {
         if registered && let Some(c) = cudart() {
             (c.unregister)(ctx.base as *mut c_void);
         }
-        libc::munmap(ctx.base as *mut c_void, ctx.map_len);
+        // Ownership returns from llama.cpp: (base, map_len) is the pair
+        // into_raw gave up in buft_alloc_buffer, and this is the only place
+        // it is taken back (buf_free runs once per buffer).
+        drop(aie_sys::AnonMap::from_raw(ctx.base, ctx.map_len));
         REGISTRY.lock().unwrap()[ctx.idx].freed = true;
     }
 }

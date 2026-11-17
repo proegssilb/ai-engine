@@ -304,39 +304,19 @@ pub struct Applied {
 
 static APPLIED: Mutex<Option<Applied>> = Mutex::new(None);
 
-fn errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+fn errno(e: std::io::Error) -> i32 {
+    e.raw_os_error().unwrap_or(-1)
 }
 
-fn set_of(cpus: &[u32]) -> libc::cpu_set_t {
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    for c in cpus {
-        if (*c as usize) < libc::CPU_SETSIZE as usize {
-            unsafe { libc::CPU_SET(*c as usize, &mut set) };
-        }
-    }
-    set
+fn affinity_of(tid: u32) -> Vec<u32> {
+    aie_sys::get_affinity(tid).unwrap_or_default()
 }
 
-fn affinity_of(tid: libc::pid_t) -> Vec<u32> {
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::sched_getaffinity(tid, std::mem::size_of_val(&set), &mut set) };
-    if r != 0 {
-        return vec![];
-    }
-    (0..libc::CPU_SETSIZE as usize)
-        .filter(|c| unsafe { libc::CPU_ISSET(*c, &set) })
-        .map(|c| c as u32)
-        .collect()
+fn set_affinity(tid: u32, cpus: &[u32]) -> Result<(), i32> {
+    aie_sys::set_affinity(tid, cpus).map_err(errno)
 }
 
-fn set_affinity(tid: libc::pid_t, cpus: &[u32]) -> Result<(), i32> {
-    let set = set_of(cpus);
-    let r = unsafe { libc::sched_setaffinity(tid, std::mem::size_of_val(&set), &set) };
-    if r == 0 { Ok(()) } else { Err(errno()) }
-}
-
-fn thread_ids() -> Vec<libc::pid_t> {
+fn thread_ids() -> Vec<u32> {
     std::fs::read_dir("/proc/self/task")
         .into_iter()
         .flatten()
@@ -345,47 +325,17 @@ fn thread_ids() -> Vec<libc::pid_t> {
         .collect()
 }
 
-const MPOL_PREFERRED: libc::c_long = 1;
-
-fn node_mask(node: u32) -> [libc::c_ulong; 16] {
-    let mut m = [0; 16];
-    m[(node / 64) as usize % 16] = 1 << (node % 64);
-    m
-}
+/// The kernel's MPOL_PREFERRED, as reported by `get_mempolicy`.
+const MPOL_PREFERRED: i32 = 1;
 
 /// MPOL_PREFERRED for the calling thread (new threads inherit it).
 fn set_policy(node: u32) -> Result<(), i32> {
-    let mask = node_mask(node);
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_set_mempolicy,
-            MPOL_PREFERRED,
-            mask.as_ptr(),
-            (mask.len() * 64) as libc::c_ulong,
-        )
-    };
-    if r == 0 { Ok(()) } else { Err(errno()) }
+    aie_sys::set_mempolicy_preferred(node).map_err(errno)
 }
 
 /// The calling thread's policy as (mode, first node of the mask).
 fn get_policy() -> Option<(i32, Option<u32>)> {
-    let mut mode: libc::c_int = -1;
-    let mut mask = [0 as libc::c_ulong; 16];
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_get_mempolicy,
-            &mut mode,
-            mask.as_mut_ptr(),
-            (mask.len() * 64) as libc::c_ulong,
-            0usize,
-            0usize,
-        )
-    };
-    if r != 0 {
-        return None;
-    }
-    let node = (0..1024u32).find(|n| mask[(*n / 64) as usize] >> (n % 64) & 1 == 1);
-    Some((mode, node))
+    aie_sys::get_mempolicy().ok()
 }
 
 /// Pin this process to the choice: affinity for every existing thread, a
@@ -428,7 +378,7 @@ pub fn apply(topo: &Topology, choice: &Choice) -> Result<Applied, String> {
     let (policy, policy_verified, policy_error) = match set_policy(node.id) {
         Ok(()) => (
             "preferred".to_string(),
-            get_policy() == Some((MPOL_PREFERRED as i32, Some(node.id))),
+            get_policy() == Some((MPOL_PREFERRED, Some(node.id))),
             None,
         ),
         Err(e) => (
@@ -572,25 +522,11 @@ pub fn sample_pages(
     }
     let n = total.min(samples.max(1));
     let exact = n == total;
-    let mut pages: Vec<*mut libc::c_void> = (0..n)
-        .map(|i| (base + (i * total / n) * page) as *mut libc::c_void)
-        .collect();
-    let mut status = vec![0 as libc::c_int; n];
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_move_pages,
-            0,
-            n as libc::c_ulong,
-            pages.as_mut_ptr(),
-            std::ptr::null::<libc::c_int>(),
-            status.as_mut_ptr(),
-            0,
-        )
+    let pages: Vec<usize> = (0..n).map(|i| base + (i * total / n) * page).collect();
+    let Ok(status) = aie_sys::move_pages_status(&pages) else {
+        return (BTreeMap::new(), false);
     };
     let mut out = BTreeMap::new();
-    if r != 0 {
-        return (out, false);
-    }
     let per_sample = (total as u64 * page as u64) / n as u64;
     for s in status.into_iter().filter(|s| *s >= 0) {
         *out.entry(s as u32).or_insert(0) += per_sample;
@@ -768,7 +704,7 @@ pub fn report(
         .filter(|b| !b.freed && b.len > 0)
         .cloned()
         .collect();
-    let small = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let small = aie_sys::page_size();
     for b in &bufs {
         let page = match b.hugetlb_result {
             Some(Ok(hp)) => hp as usize,
@@ -1100,31 +1036,21 @@ mod tests {
 
     #[test]
     fn samples_pages_of_a_real_mapping() {
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let page = aie_sys::page_size();
         let len = 64 * page;
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED);
+        let mut map = aie_sys::AnonMap::new(len).unwrap();
+        let base = map.addr();
         // untouched: nothing resident yet
-        let (m, exact) = sample_pages(base as usize, len, page, 8192);
+        let (m, exact) = sample_pages(base, len, page, 8192);
         assert!(exact && m.is_empty(), "{m:?}");
-        unsafe { std::ptr::write_bytes(base as *mut u8, 1, len) };
-        let (m, exact) = sample_pages(base as usize, len, page, 8192);
+        map.as_mut_slice().fill(1);
+        let (m, exact) = sample_pages(base, len, page, 8192);
         assert!(exact);
         assert_eq!(m.values().sum::<u64>(), len as u64, "{m:?}");
         // a sparse sample estimates the same total
-        let (m, exact) = sample_pages(base as usize, len, page, 8);
+        let (m, exact) = sample_pages(base, len, page, 8);
         assert!(!exact);
         assert_eq!(m.values().sum::<u64>(), len as u64);
-        unsafe { libc::munmap(base, len) };
     }
 
     /// Runs in its own thread so the affinity/policy changes can't leak into
@@ -1132,7 +1058,7 @@ mod tests {
     #[test]
     fn applies_and_measures_on_this_machine() {
         let real = Topology::read(Path::new("/"));
-        let before: Vec<(libc::pid_t, Vec<u32>)> = thread_ids()
+        let before: Vec<(u32, Vec<u32>)> = thread_ids()
             .into_iter()
             .map(|t| (t, affinity_of(t)))
             .collect();

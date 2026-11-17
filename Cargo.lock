@@ -16,9 +16,9 @@ name = "ai-engine"
 version = "0.0.0"
 dependencies = [
  "aie-daemon",
+ "aie-sys",
  "aie-worker",
  "clap",
- "libc",
  "reqwest",
  "serde_json",
  "tokio",
@@ -41,10 +41,10 @@ dependencies = [
  "aie-plan",
  "aie-proto",
  "aie-store",
+ "aie-sys",
  "aie-worker",
  "axum",
  "futures-util",
- "libc",
  "reqwest",
  "serde",
  "serde_json",
@@ -65,6 +65,7 @@ dependencies = [
  "aie-anatomy",
  "aie-gguf",
  "aie-plan",
+ "aie-sys",
  "bindgen",
  "cc",
  "cmake",
@@ -106,6 +107,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aie-sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "aie-worker"
 version = "0.0.0"
 dependencies = [
@@ -114,6 +123,7 @@ dependencies = [
  "aie-llama",
  "aie-plan",
  "aie-proto",
+ "aie-sys",
  "hyper-util",
  "libc",
  "serde",

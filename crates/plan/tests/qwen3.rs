@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use aie_anatomy::{Anatomy, Subsystem};
 use aie_gguf::Gguf;
 use aie_plan::fit::{self, Capacity, Machine, Overheads};

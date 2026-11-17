@@ -17,6 +17,7 @@ aie-plan = { path = "../plan" }
 aie-proto = { path = "../proto" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+aie-sys = { path = "../sys" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "fs"] }

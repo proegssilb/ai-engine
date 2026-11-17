@@ -186,3 +186,14 @@ Where the first implementation refined the design above:
   llama.cpp's `common` library.
 
 How each placement promise in the UI is held and checked (weights, RAM tier, disk tier, host socket): [reference/placement-guarantees.md](reference/placement-guarantees.md).
+
+## Unsafe code
+
+`unsafe` is allowed in two crates only:
+
+- **`aie-sys`** wraps the raw Linux calls the workspace needs (`statvfs`, `kill`, `getuid`, `getrlimit`, `sched_setaffinity`, `mbind`, `mincore`, `mmap`, `mlock`, and the like) behind safe functions. Mappings are an owned `AnonMap` that unmaps on drop; the only `unsafe fn` is `AnonMap::from_raw`, for taking back a mapping handed to llama.cpp. It denies `unsafe_op_in_unsafe_fn` and `clippy::undocumented_unsafe_blocks`.
+- **`aie-llama`** is the llama.cpp boundary: the bindgen bindings, the C++ shim, and the ggml buffer type implemented in Rust.
+
+Every `unsafe` block states in a `// SAFETY:` comment why it is sound: which invariant holds and what guarantees it. "Calls a C function" is not a reason. (`aie-llama` is being brought up to this standard; `aie-sys` already meets it.)
+
+Every other crate has `#![forbid(unsafe_code)]`. A new need for a raw OS call goes into `aie-sys` as a safe wrapper rather than an `unsafe` block elsewhere.

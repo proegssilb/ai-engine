@@ -100,16 +100,12 @@ pub fn environment(cg: &str) -> &'static str {
 }
 
 fn memlock_limit() -> (u64, u64) {
-    let mut r = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut r) };
-    (r.rlim_cur, r.rlim_max)
+    let l = aie_sys::memlock_limit();
+    (l.soft, l.hard)
 }
 
 fn mib(b: u64) -> String {
-    if b == libc::RLIM_INFINITY {
+    if b == aie_sys::UNLIMITED {
         "unlimited".into()
     } else {
         format!("{} MiB", b >> 20)

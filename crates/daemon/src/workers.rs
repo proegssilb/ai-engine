@@ -430,7 +430,7 @@ async fn stop(w: &Worker) {
     let mut child = w.child.lock().await;
     if let Some(pid) = child.id() {
         // SIGTERM first, then SIGKILL if it lingers.
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        let _ = aie_sys::terminate(pid);
         if tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .is_err()
@@ -447,7 +447,7 @@ fn socket_dir() -> PathBuf {
         Some(d) if !d.is_empty() && PathBuf::from(&d).is_dir() => {
             PathBuf::from(d).join("ai-engine")
         }
-        _ => PathBuf::from(format!("/tmp/aie-{}", unsafe { libc::getuid() })),
+        _ => PathBuf::from(format!("/tmp/aie-{}", aie_sys::uid())),
     }
 }
 

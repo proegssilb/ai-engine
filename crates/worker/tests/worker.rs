@@ -1,6 +1,8 @@
 //! A real worker on a Unix socket, with a real model (CPU). Uses
 //! `AIE_TEST_MODEL`, defaulting to Qwen3-0.6B in ~/aie-store; skips if missing.
 
+#![forbid(unsafe_code)]
+
 use aie_anatomy::Anatomy;
 use aie_llama::{ContextParams, LoadOptions};
 use aie_plan::{Intent, Tier, llama::compile, plan};

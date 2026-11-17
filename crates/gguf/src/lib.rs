@@ -9,6 +9,8 @@
 //!
 //! [`write`] produces GGUF files, mainly for tests.
 
+#![forbid(unsafe_code)]
+
 mod read;
 mod types;
 pub mod write;

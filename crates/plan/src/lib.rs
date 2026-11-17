@@ -11,6 +11,8 @@
 //!    [`llama::resolve`] predicts what llama.cpp will do with those settings,
 //!    so the compiler can be checked without loading a model.
 
+#![forbid(unsafe_code)]
+
 pub mod fit;
 pub mod llama;
 mod planner;

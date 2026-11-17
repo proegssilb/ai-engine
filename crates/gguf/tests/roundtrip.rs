@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use aie_gguf::write::Writer;
 use aie_gguf::{Error, GgmlType, Gguf, Value};
 

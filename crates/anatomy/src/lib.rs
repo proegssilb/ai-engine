@@ -7,6 +7,8 @@
 //! works beyond the MVP's Qwen3 families. [`Anatomy::is_supported`] says
 //! whether the architecture is one we've checked.
 
+#![forbid(unsafe_code)]
+
 use aie_gguf::{GgmlType, Gguf};
 use std::collections::BTreeMap;
 use std::fmt;
