@@ -209,6 +209,7 @@ impl Context {
 
     /// What this context really allocated, per device and on the host.
     pub fn memory_breakdown(&self) -> Vec<crate::fit::Measured> {
+        let _log = crate::log_read();
         // SAFETY: `self.ptr` is the live context this value owns, kept alive by `&self`.
         unsafe { crate::fit::breakdown(self.ptr.as_ptr()) }
     }
@@ -221,6 +222,7 @@ impl Context {
 
     /// Forget the conversation (clear the KV cache).
     pub fn clear(&mut self) {
+        let _log = crate::log_read();
         // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
         // and freed only in Drop. The memory handle belongs to the context.
         unsafe { sys::llama_memory_clear(sys::llama_get_memory(self.ptr.as_ptr()), true) }
@@ -337,6 +339,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
+        let _log = crate::log_read();
         // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
         // and freed only in Drop. This is the only place it is freed; the Arc<Model> field is
         // dropped after, so the model outlives the context.

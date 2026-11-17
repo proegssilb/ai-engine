@@ -256,6 +256,8 @@ impl Model {
     pub fn tokenize(&self, text: &str, special: bool) -> Result<Vec<Token>, Error> {
         let len = i32::try_from(text.len()).map_err(|_| Error::Tokenize("text too long".into()))?;
         let mut toks = vec![0 as Token; text.len() + 8];
+        // The tokenizer can log warnings.
+        let _log = crate::log_read();
         // SAFETY: `self.vocab()` points into the model this value owns, which outlives the
         // call. `text` is valid for `len` bytes (len = text.len(), checked to fit i32); `toks`
         // has `toks.len()` writable slots, and llama_tokenize writes at most n_tokens_max (a
@@ -402,6 +404,7 @@ impl Model {
 
 impl Drop for Model {
     fn drop(&mut self) {
+        let _log = crate::log_read();
         // SAFETY: `self.raw()` is the llama_model this value owns (non-null, freed only in
         // Drop). This is the only place it is freed.
         unsafe { sys::llama_model_free(self.raw()) }

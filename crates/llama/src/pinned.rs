@@ -174,6 +174,12 @@ unsafe extern "C" fn buft_alloc_buffer(
             Err(_) => return ptr::null_mut(),
         },
     };
+    if map.len() < size {
+        // Can't happen (both constructors round up), but ggml would write
+        // `size` bytes from the base, so never hand out less. Checked before
+        // anything registers or records the mapping; dropping `map` unmaps it.
+        return ptr::null_mut();
+    }
     let (base, map_len) = (map.as_ptr(), map.len());
 
     // Its own name, so the kernel never merges it with a neighbouring
@@ -235,11 +241,6 @@ unsafe extern "C" fn buft_alloc_buffer(
         reg.push(rec);
         reg.len() - 1
     };
-    if map.len() < size {
-        // Can't happen (both constructors round up), but ggml would write
-        // `size` bytes from the base, so never hand out less.
-        return ptr::null_mut();
-    }
     // From here llama.cpp owns the mapping; buf_free takes it back.
     let (base, map_len) = map.into_raw();
     let ctx = Box::new(BufCtx {

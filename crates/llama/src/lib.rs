@@ -94,7 +94,17 @@ pub(crate) fn log_write() -> std::sync::RwLockWriteGuard<'static, ()> {
 pub(crate) fn check_device_count() -> Result<(), Error> {
     // SAFETY: Returns a constant; no preconditions.
     let max = unsafe { sys::llama_max_devices() };
-    let gpus = devices().iter().filter(|d| d.is_gpu).count();
+    // Discrete and integrated GPUs (llama.cpp uses integrated ones when there
+    // are no discrete ones); RPC devices report as GPUs too. Over-counting is
+    // the safe direction.
+    let gpus = (0..dev_count())
+        .filter(|&i| {
+            // SAFETY: `i` is below ggml_backend_dev_count(), so it names a registered device.
+            let t = unsafe { sys::ggml_backend_dev_type(sys::ggml_backend_dev_get(i)) };
+            t == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
+                || t == sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU
+        })
+        .count();
     if gpus > max {
         return Err(Error::Device(format!(
             "this machine has {gpus} GPUs; llama.cpp supports at most {max}"
@@ -107,8 +117,8 @@ pub(crate) fn check_device_count() -> Result<(), Error> {
 pub fn init() {
     static INIT: Once = Once::new();
     // SAFETY: Runs once per process (Once). Installing the log callback and initialising
-    // backends have no preconditions; the callback is an `extern "C"` function with the
-    // signature ggml expects.
+    // backends have no preconditions; the callback is an `extern "C-unwind"` function with
+    // the signature ggml expects, and it never unwinds (it catches panics and aborts).
     INIT.call_once(|| unsafe {
         log::install();
         sys::llama_backend_init();
@@ -128,9 +138,17 @@ pub struct Device {
     pub pci_bus_id: Option<String>,
 }
 
+fn dev_count() -> usize {
+    init();
+    // SAFETY: `init()` ran, so the device registry is set up; returns a count.
+    unsafe { sys::ggml_backend_dev_count() }
+}
+
 /// Devices llama.cpp can use, in its order (GPU index = position among GPUs).
 pub fn devices() -> Vec<Device> {
     init();
+    // Backends can log while reporting memory.
+    let _log = log_read();
     // SAFETY: `init()` ran above, so the device registry is set up; every index is below
     // ggml_backend_dev_count(), so each `d` is a registered device. `props` is zeroed first,
     // which is a valid value for this plain struct of pointers, sizes and flags, and ggml fills
