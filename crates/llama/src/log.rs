@@ -7,8 +7,8 @@
 use crate::sys;
 use std::collections::VecDeque;
 use std::ffi::{CStr, c_void};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 const KEEP: usize = 4096;
 
@@ -18,6 +18,8 @@ static ECHO: AtomicBool = AtomicBool::new(false);
 static PENDING: Mutex<String> = Mutex::new(String::new());
 
 pub(crate) unsafe fn install() {
+    // SAFETY: The callback is an `extern "C"` function with the signature ggml expects and no
+    // user data; it stays valid for the whole process.
     unsafe { sys::llama_log_set(Some(callback), std::ptr::null_mut()) };
 }
 
@@ -26,15 +28,19 @@ unsafe extern "C" fn callback(
     text: *const libc::c_char,
     _: *mut c_void,
 ) {
+    // SAFETY: ggml passes a NUL-terminated message that is valid for the duration of the
+    // callback; it is copied before returning.
     let s = unsafe { CStr::from_ptr(text) }.to_string_lossy();
     if ECHO.load(Ordering::Relaxed) {
-        eprint!("{s}");
+        // Not eprint!: it panics if stderr is closed, and a panic can't cross
+        // back into C (it would abort the process).
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), s.as_bytes());
     }
-    let mut pending = PENDING.lock().unwrap();
+    let mut pending = PENDING.lock().unwrap_or_else(PoisonError::into_inner);
     pending.push_str(&s);
     while let Some(i) = pending.find('\n') {
         let line: String = pending.drain(..=i).collect();
-        let mut lines = LINES.lock().unwrap();
+        let mut lines = LINES.lock().unwrap_or_else(PoisonError::into_inner);
         if lines.len() == KEEP {
             lines.pop_front();
         }
@@ -49,7 +55,12 @@ pub fn set_echo(on: bool) {
 
 /// The most recent captured lines (up to 4096).
 pub fn recent() -> Vec<String> {
-    LINES.lock().unwrap().iter().cloned().collect()
+    LINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Recent lines containing `needle`, newest last.
@@ -65,7 +76,7 @@ pub fn grep(needle: &str) -> Vec<String> {
 
 /// Last few lines, for error messages.
 pub fn tail(n: usize) -> String {
-    let lines = LINES.lock().unwrap();
+    let lines = LINES.lock().unwrap_or_else(PoisonError::into_inner);
     let skip = lines.len().saturating_sub(n);
     lines
         .iter()

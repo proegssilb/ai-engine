@@ -35,9 +35,10 @@ pub struct AnonMap {
 // SAFETY: AnonMap owns plain memory with no thread affinity. Moving it to
 // another thread moves only the right to access and unmap it.
 unsafe impl Send for AnonMap {}
-// SAFETY: through `&AnonMap` the memory itself is never read or written (only
-// `&mut self` gives access to the bytes); the shared methods act on the
-// mapping through system calls, which are safe to issue from any thread.
+// SAFETY: through `&AnonMap` the bytes are only read (`as_slice`), which is
+// fine from several threads at once, as for `&[u8]`; writing needs `&mut self`
+// (`as_mut_slice`). The other shared methods act on the mapping through system
+// calls that never change its contents, and are safe from any thread.
 unsafe impl Sync for AnonMap {}
 
 impl AnonMap {

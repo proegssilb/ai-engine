@@ -14,7 +14,7 @@
 use crate::sys;
 use std::ffi::{CStr, CString, c_void};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PinOptions {
@@ -82,6 +82,7 @@ pub(crate) fn new_buffer_type(name: &str, opts: PinOptions) -> sys::ggml_backend
         name: CString::new(name).unwrap(),
         opts,
     });
+    // SAFETY: Looks up a registered device; returns null if none (checked below).
     let cpu_dev = unsafe {
         sys::ggml_backend_dev_by_type(sys::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_CPU)
     };
@@ -106,10 +107,15 @@ pub(crate) fn new_buffer_type(name: &str, opts: PinOptions) -> sys::ggml_backend
 }
 
 unsafe fn buft_ctx<'a>(buft: sys::ggml_backend_buffer_type_t) -> &'a BuftCtx {
+    // SAFETY: Only called with buffer types created by `new_buffer_type`, whose `context` is a
+    // leaked Box<BuftCtx> that is never freed, so the reference is valid for any lifetime.
     unsafe { &*((*buft).context as *const BuftCtx) }
 }
 
 unsafe extern "C" fn buft_get_name(buft: sys::ggml_backend_buffer_type_t) -> *const libc::c_char {
+    // SAFETY: ggml calls this with our buffer type (the iface is only installed on types from
+    // `new_buffer_type`); the name is a CString inside the leaked BuftCtx, so the pointer stays
+    // valid.
     unsafe { buft_ctx(buft).name.as_ptr() }
 }
 
@@ -125,6 +131,7 @@ unsafe extern "C" fn buft_alloc_buffer(
     buft: sys::ggml_backend_buffer_type_t,
     size: usize,
 ) -> sys::ggml_backend_buffer_t {
+    // SAFETY: As above: `buft` is one of ours.
     let opts = unsafe { buft_ctx(buft).opts.clone() };
     // Reserved huge pages first, if asked; else (or on failure) normal pages.
     // size can be 0 (llama.cpp's no_alloc dummy buffers); still map one page.
@@ -192,6 +199,9 @@ unsafe extern "C" fn buft_alloc_buffer(
         rec.cuda_register_result = Some(match cudart() {
             // cudaHostRegisterPortable: page-locked for every CUDA context, so
             // all GPUs (not only the current one) copy from it at full speed.
+            // SAFETY: `base` is the start of a live mapping of `map_len` bytes that `map` still
+            // owns; cudaHostRegister only pins it. The function pointer was resolved by dlsym
+            // with the right signature (see `cudart`).
             Some(c) => match unsafe { (c.register)(base as *mut c_void, map_len, 1) } {
                 0 => Ok(()),
                 e => Err(e),
@@ -201,13 +211,16 @@ unsafe extern "C" fn buft_alloc_buffer(
     }
 
     let idx = {
-        let mut reg = REGISTRY.lock().unwrap();
+        let mut reg = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         reg.push(rec);
         reg.len() - 1
     };
     // From here llama.cpp owns the mapping; buf_free takes it back.
     let (base, map_len) = map.into_raw();
     let ctx = Box::new(BufCtx { base, map_len, idx });
+    // SAFETY: `buft` is ours; `ctx` is a fresh Box whose ownership passes to the buffer and
+    // comes back exactly once in `buf_free`; `size` <= `map_len`, so every offset ggml derives
+    // from the base stays inside the mapping.
     unsafe {
         sys::ggml_backend_buffer_init(buft, BUFFER_IFACE, Box::into_raw(ctx) as *mut c_void, size)
     }
@@ -231,14 +244,20 @@ const BUFFER_IFACE: sys::ggml_backend_buffer_i = sys::ggml_backend_buffer_i {
 };
 
 unsafe fn buf_ctx<'a>(buf: sys::ggml_backend_buffer_t) -> &'a BufCtx {
+    // SAFETY: Only called with buffers created by `buft_alloc_buffer`, whose `context` is a
+    // Box<BufCtx> that stays alive until `buf_free`, which ggml calls last.
     unsafe { &*((*buf).context as *const BufCtx) }
 }
 
 unsafe extern "C" fn buf_free(buf: sys::ggml_backend_buffer_t) {
+    // SAFETY: ggml calls free_buffer exactly once per buffer, last. `context` is the
+    // Box<BufCtx> made in `buft_alloc_buffer`; (base, map_len) is the pair AnonMap::into_raw
+    // gave up there, and this is the only place it is taken back. CUDA is unregistered before
+    // the memory is unmapped.
     unsafe {
         let ctx = Box::from_raw((*buf).context as *mut BufCtx);
         let registered = matches!(
-            REGISTRY.lock().unwrap()[ctx.idx].cuda_register_result,
+            REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[ctx.idx].cuda_register_result,
             Some(Ok(()))
         );
         if registered && let Some(c) = cudart() {
@@ -248,11 +267,12 @@ unsafe extern "C" fn buf_free(buf: sys::ggml_backend_buffer_t) {
         // into_raw gave up in buft_alloc_buffer, and this is the only place
         // it is taken back (buf_free runs once per buffer).
         drop(aie_sys::AnonMap::from_raw(ctx.base, ctx.map_len));
-        REGISTRY.lock().unwrap()[ctx.idx].freed = true;
+        REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[ctx.idx].freed = true;
     }
 }
 
 unsafe extern "C" fn buf_get_base(buf: sys::ggml_backend_buffer_t) -> *mut c_void {
+    // SAFETY: `buf` is one of ours (see `buf_ctx`).
     unsafe { buf_ctx(buf).base as *mut c_void }
 }
 
@@ -260,6 +280,8 @@ unsafe extern "C" fn buf_init_tensor(
     buf: sys::ggml_backend_buffer_t,
     t: *mut sys::ggml_tensor,
 ) -> sys::ggml_status {
+    // SAFETY: `buf` is one of ours and `t` a tensor ggml is placing in it; its name is a NUL-
+    // terminated array inside the tensor; ggml_nbytes only reads the tensor's shape.
     unsafe {
         // Views share their parent's storage; only record real allocations.
         if (*t).view_src.is_null() {
@@ -267,7 +289,7 @@ unsafe extern "C" fn buf_init_tensor(
                 .to_string_lossy()
                 .into_owned();
             let entry = (name, (*t).data as usize, sys::ggml_nbytes(t));
-            REGISTRY.lock().unwrap()[buf_ctx(buf).idx]
+            REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)[buf_ctx(buf).idx]
                 .tensors
                 .push(entry);
         }
@@ -282,6 +304,9 @@ unsafe extern "C" fn buf_memset_tensor(
     offset: usize,
     size: usize,
 ) {
+    // SAFETY: ggml's memset_tensor contract: `t` is a tensor in this buffer and offset + size
+    // <= ggml_nbytes(t) (asserted by ggml_backend_tensor_memset), so the range lies inside our
+    // mapping.
     unsafe { ptr::write_bytes(((*t).data as *mut u8).add(offset), value, size) }
 }
 
@@ -292,6 +317,9 @@ unsafe extern "C" fn buf_set_tensor(
     offset: usize,
     size: usize,
 ) {
+    // SAFETY: ggml's set_tensor contract: `t` is a tensor in this buffer, offset + size <=
+    // ggml_nbytes(t) (asserted by ggml_backend_tensor_set), and `data` is readable for `size`
+    // bytes; the source is caller memory, which can't overlap our mapping.
     unsafe { ptr::copy_nonoverlapping(data as *const u8, ((*t).data as *mut u8).add(offset), size) }
 }
 
@@ -302,6 +330,9 @@ unsafe extern "C" fn buf_get_tensor(
     offset: usize,
     size: usize,
 ) {
+    // SAFETY: ggml's get_tensor contract: `t` is a tensor in this buffer, offset + size <=
+    // ggml_nbytes(t) (asserted by ggml_backend_tensor_get), and `data` is writable for `size`
+    // bytes and doesn't overlap our mapping.
     unsafe { ptr::copy_nonoverlapping(((*t).data as *const u8).add(offset), data as *mut u8, size) }
 }
 
@@ -310,6 +341,10 @@ unsafe extern "C" fn buf_cpy_tensor(
     src: *const sys::ggml_tensor,
     dst: *mut sys::ggml_tensor,
 ) -> bool {
+    // SAFETY: ggml's cpy_tensor contract: `dst` is a tensor in this buffer with the same layout
+    // as `src` (asserted by ggml_backend_tensor_copy), so both are ggml_nbytes(src) long. We
+    // only copy when `src` lives in host memory, where `data` is a plain pointer; two distinct
+    // tensors don't overlap.
     unsafe {
         if !(*src).buffer.is_null() && sys::ggml_backend_buffer_is_host((*src).buffer) {
             ptr::copy_nonoverlapping(
@@ -324,6 +359,8 @@ unsafe extern "C" fn buf_cpy_tensor(
 }
 
 unsafe extern "C" fn buf_clear(buf: sys::ggml_backend_buffer_t, value: u8) {
+    // SAFETY: `buf` is one of ours; ggml's `size` is the size we passed to
+    // ggml_backend_buffer_init, at most `map_len`, so the whole range is inside our mapping.
     unsafe {
         let ctx = buf_ctx(buf);
         ptr::write_bytes(ctx.base, value, (*buf).size);
@@ -341,6 +378,11 @@ struct Cudart {
 fn cudart() -> Option<&'static Cudart> {
     static CUDART: std::sync::OnceLock<Option<Cudart>> = std::sync::OnceLock::new();
     CUDART
+        // SAFETY: dlopen/dlsym take NUL-terminated names (each CString lives until the end of
+        // its dlopen call). The CUDA runtime's symbols have exactly the signatures transmuted
+        // to, cudaError_t being a C int: cudaHostRegister(void*, size_t, unsigned) and
+        // cudaHostUnregister(void*). The library is never closed, so the function pointers stay
+        // valid.
         .get_or_init(|| unsafe {
             let h = ["libcudart.so.12", "libcudart.so", "libcudart.so.13"]
                 .iter()
@@ -368,4 +410,80 @@ fn cudart() -> Option<&'static Cudart> {
             })
         })
         .as_ref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Our buffer type through ggml's own API, as llama.cpp uses it: allocate,
+    /// clear, place a tensor, write and read it back, free; many times over,
+    /// at sizes including zero. Each buffer must be recorded as freed.
+    #[test]
+    fn buffers_allocate_use_and_free_repeatedly() {
+        crate::init();
+        let buft = new_buffer_type("RustPinnedTest", PinOptions::default());
+        let mut bases = Vec::new();
+        for _round in 0..100 {
+            for size in [0usize, 1, 4096, 1 << 20] {
+                // SAFETY: `buft` is a buffer type from `new_buffer_type`, alive
+                // for the process; ggml returns null on failure, checked next.
+                let buf = unsafe { sys::ggml_backend_buft_alloc_buffer(buft, size) };
+                assert!(!buf.is_null());
+                if size == 0 {
+                    // ggml hands out a dummy buffer without calling us.
+                    // SAFETY: `buf` is a live buffer, freed exactly once here.
+                    unsafe { sys::ggml_backend_buffer_free(buf) };
+                    continue;
+                }
+                // SAFETY: `buf` is a live buffer from our type.
+                let base = unsafe { sys::ggml_backend_buffer_get_base(buf) } as usize;
+                assert_eq!(base % ALIGNMENT, 0);
+                bases.push(base);
+                // SAFETY: `buf` is live; clear writes its `size` bytes.
+                unsafe { sys::ggml_backend_buffer_clear(buf, 0xAB) };
+                // SAFETY: the buffer's memory is `size` readable bytes at `base`.
+                let bytes = unsafe { std::slice::from_raw_parts(base as *const u8, size) };
+                assert!(bytes.iter().all(|b| *b == 0xAB));
+
+                if size >= 4096 {
+                    let params = sys::ggml_init_params {
+                        // SAFETY: returns a constant; no preconditions.
+                        mem_size: unsafe { sys::ggml_tensor_overhead() } * 2,
+                        mem_buffer: ptr::null_mut(),
+                        no_alloc: true,
+                    };
+                    // SAFETY: `params` asks ggml to allocate its own metadata
+                    // pool (null buffer); null on failure, checked next.
+                    let ctx = unsafe { sys::ggml_init(params) };
+                    assert!(!ctx.is_null());
+                    // SAFETY: `ctx` is live with room for this tensor's metadata.
+                    let t =
+                        unsafe { sys::ggml_new_tensor_1d(ctx, sys::ggml_type_GGML_TYPE_F32, 1024) };
+                    assert!(!t.is_null());
+                    // SAFETY: `t` (4096 bytes) is placed at the base of `buf`,
+                    // which has at least 4096 bytes.
+                    let st = unsafe { sys::ggml_backend_tensor_alloc(buf, t, base as *mut c_void) };
+                    assert_eq!(st, sys::ggml_status_GGML_STATUS_SUCCESS);
+                    let src: Vec<f32> = (0..1024).map(|i| i as f32 * 0.5).collect();
+                    let mut dst = vec![0f32; 1024];
+                    // SAFETY: `t` lives in `buf`; `src`/`dst` are 4096-byte
+                    // host buffers matching the tensor's size.
+                    unsafe {
+                        sys::ggml_backend_tensor_set(t, src.as_ptr().cast(), 0, 4096);
+                        sys::ggml_backend_tensor_get(t, dst.as_mut_ptr().cast(), 0, 4096);
+                    }
+                    assert_eq!(src, dst);
+                    // SAFETY: `ctx` is live and freed once; `t` isn't used after.
+                    unsafe { sys::ggml_free(ctx) };
+                }
+                // SAFETY: `buf` is live and freed exactly once.
+                unsafe { sys::ggml_backend_buffer_free(buf) };
+                let reg = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
+                let rec = reg.iter().rev().find(|r| r.base == base).unwrap();
+                assert!(rec.freed, "buffer at {base:#x} not recorded as freed");
+            }
+        }
+        assert_eq!(bases.len(), 300);
+    }
 }

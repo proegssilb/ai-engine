@@ -92,6 +92,10 @@ pub fn measure(
         64
     ];
     let _one = FIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `c_path` is a NUL-terminated string and `params.mp`/`cp` live locals (whose
+    // pointer fields point at vectors owned by `params`) that outlive the call; `rows` has
+    // `rows.len()` writable entries and the shim writes at most that many. FIT_LOCK is held:
+    // llama.cpp's fit swaps the global logger.
     let n = unsafe {
         aie_measure(
             c_path.as_ptr(),
@@ -113,6 +117,8 @@ pub fn measure(
 fn convert(rows: &[MemRow]) -> Vec<Measured> {
     rows.iter()
         .map(|r| Measured {
+            // SAFETY: The shim fills `name` with snprintf into the fixed 128-byte array, so it
+            // is always NUL-terminated within bounds.
             name: unsafe { CStr::from_ptr(r.name.as_ptr()) }
                 .to_string_lossy()
                 .into_owned(),
@@ -146,6 +152,8 @@ pub(crate) fn breakdown(ctx: *const sys::llama_context) -> Vec<Measured> {
         };
         64
     ];
+    // SAFETY: The caller passes a live llama_context (see `breakdown`'s callers); `rows` has
+    // `rows.len()` writable entries and the shim writes at most that many.
     let n = unsafe { aie_ctx_breakdown(ctx, rows.as_mut_ptr(), rows.len() as i32) };
     if n < 0 {
         return Vec::new();
@@ -169,7 +177,9 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
             .ok_or_else(|| Error::Fit("path is not UTF-8".into()))?,
     )
     .map_err(|_| Error::Fit("path contains NUL".into()))?;
+    // SAFETY: Returns a constant; no preconditions.
     let max_dev = unsafe { sys::llama_max_devices() };
+    // SAFETY: Returns a constant; no preconditions.
     let max_tbo = unsafe { sys::llama_max_tensor_buft_overrides() };
     let mut split = vec![0f32; max_dev];
     let mut tbo = vec![
@@ -180,11 +190,17 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
         max_tbo
     ];
     let mut margins = vec![margin as usize; max_dev];
+    // SAFETY: Returns a struct by value; no pointers or preconditions.
     let mut mp = unsafe { sys::llama_model_default_params() };
+    // SAFETY: Returns a struct by value; no pointers or preconditions.
     let mut cp = unsafe { sys::llama_context_default_params() };
     cp.n_ctx = n_ctx;
 
     let _one = FIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: `c_path` is NUL-terminated; `mp`, `cp` are live locals; `split` has max_dev
+    // floats, `tbo` max_tbo override slots and `margins` max_dev entries, the sizes llama.cpp's
+    // fit writes up to. FIT_LOCK is held until the end of this function, because the fit swaps
+    // the global logger and keeps its patterns in static storage that the next fit overwrites.
     let status = unsafe {
         aie_fit(
             c_path.as_ptr(),
@@ -213,8 +229,11 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
 
     let gpus: Vec<sys::ggml_backend_buffer_type_t> = (0..)
         .map_while(gpu_device)
+        // SAFETY: `d` comes from `gpu_device`, a device registered with ggml for the life of
+        // the process.
         .map(|d| unsafe { sys::ggml_backend_dev_buffer_type(d) })
         .collect();
+    // SAFETY: Returns a static buffer type; no preconditions.
     let cpu = unsafe { sys::ggml_backend_cpu_buffer_type() };
     let mut overrides = Vec::new();
     let tbo_ptr = if mp.tensor_buft_overrides.is_null() {
@@ -223,6 +242,9 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
         mp.tensor_buft_overrides
     };
     for i in 0..max_tbo {
+        // SAFETY: `tbo_ptr` is either our `tbo` array (max_tbo entries) or the array the fit
+        // pointed `mp.tensor_buft_overrides` at, which is that same array; `i < max_tbo`, and
+        // the loop stops at the null terminator.
         let o = unsafe { *tbo_ptr.add(i) };
         if o.pattern.is_null() {
             break;
@@ -232,6 +254,8 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
         } else if let Some(g) = gpus.iter().position(|b| *b == o.buft) {
             BufDest::Device(g as u32)
         } else {
+            // SAFETY: `o.buft` is a buffer type the fit chose (non-null, registered for the
+            // process); its name is a NUL-terminated static string.
             let name = unsafe { CStr::from_ptr(sys::ggml_backend_buft_name(o.buft)) }
                 .to_string_lossy()
                 .into_owned();
@@ -240,6 +264,9 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
             )));
         };
         overrides.push(Override {
+            // SAFETY: `o.pattern` is non-null (checked above) and points at a NUL-terminated
+            // string in the fit's static storage, which isn't overwritten while FIT_LOCK is
+            // held.
             pattern: unsafe { CStr::from_ptr(o.pattern) }
                 .to_string_lossy()
                 .into_owned(),
@@ -250,6 +277,8 @@ pub fn fit(path: &Path, n_ctx: u32, n_ctx_min: u32, margin: u64) -> Result<Fitte
     let split_src: &[f32] = if mp.tensor_split.is_null() {
         &split
     } else {
+        // SAFETY: `mp.tensor_split` is non-null here and points at our `split` array (max_dev
+        // floats), which the fit was given and which is still alive.
         unsafe { std::slice::from_raw_parts(mp.tensor_split, max_dev) }
     };
     let n_gpus = gpus.len();

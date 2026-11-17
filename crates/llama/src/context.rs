@@ -40,6 +40,7 @@ impl Default for ContextParams {
 impl ContextParams {
     /// llama.cpp's context parameters (shared by contexts and the dry run).
     pub(crate) fn raw(&self) -> sys::llama_context_params {
+        // SAFETY: Returns a struct by value; no pointers or preconditions.
         let mut cp = unsafe { sys::llama_context_default_params() };
         cp.n_ctx = self.n_ctx;
         cp.n_batch = self.n_batch;
@@ -97,6 +98,9 @@ struct Sampler(NonNull<sys::llama_sampler>);
 
 impl Sampler {
     fn new(s: &Sampling) -> Sampler {
+        // SAFETY: Each sampler is created by its llama.cpp init function and immediately handed
+        // to the chain, which takes ownership; the chain pointer is checked non-null below and
+        // freed once in Sampler's Drop.
         unsafe {
             let chain = sys::llama_sampler_chain_init(sys::llama_sampler_chain_default_params());
             if s.temperature <= 0.0 {
@@ -121,6 +125,8 @@ impl Sampler {
 
 impl Drop for Sampler {
     fn drop(&mut self) {
+        // SAFETY: `self.0` is the chain created in `Sampler::new`, owned by this value and
+        // freed only here.
         unsafe { sys::llama_sampler_free(self.0.as_ptr()) }
     }
 }
@@ -164,6 +170,9 @@ pub struct Context {
 }
 
 // A context may move between threads but isn't shared.
+// SAFETY: A llama_context is used by one thread at a time (Context is Send but not Sync, and
+// every call takes `&self`/`&mut self`); llama.cpp has no thread affinity for contexts. The
+// model it uses is kept alive by the Arc<Model> field.
 unsafe impl Send for Context {}
 
 impl Context {
@@ -176,6 +185,9 @@ impl Context {
         p: ContextParams,
         cb: sys::ggml_backend_sched_eval_callback,
     ) -> Result<Context, Error> {
+        // SAFETY: `model.raw()` is a live model (held by the Arc we store in the Context, so it
+        // outlives the context); `cp` is passed by value; `cb` is either None or an `extern
+        // "C"` function with the signature ggml expects.
         let ptr = unsafe {
             let mut cp = p.raw();
             cp.cb_eval = cb;
@@ -199,11 +211,15 @@ impl Context {
     }
 
     pub fn n_ctx(&self) -> u32 {
+        // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
+        // and freed only in Drop.
         unsafe { sys::llama_n_ctx(self.ptr.as_ptr()) }
     }
 
     /// Forget the conversation (clear the KV cache).
     pub fn clear(&mut self) {
+        // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
+        // and freed only in Drop. The memory handle belongs to the context.
         unsafe { sys::llama_memory_clear(sys::llama_get_memory(self.ptr.as_ptr()), true) }
     }
 
@@ -211,6 +227,10 @@ impl Context {
     pub fn decode(&mut self, tokens: &[Token]) -> Result<(), Error> {
         let mut buf = tokens.to_vec();
         for chunk in buf.chunks_mut(self.params.n_batch.max(1) as usize) {
+            // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in
+            // `new` and freed only in Drop. `chunk` is a live, mutable slice of `chunk.len()`
+            // tokens (at most n_batch, so i32 can't overflow); llama_batch_get_one only borrows
+            // it for the duration of llama_decode.
             let r = unsafe {
                 sys::llama_decode(
                     self.ptr.as_ptr(),
@@ -226,16 +246,6 @@ impl Context {
             }
         }
         Ok(())
-    }
-
-    /// The last position's logits.
-    pub fn logits(&self) -> &[f32] {
-        unsafe {
-            std::slice::from_raw_parts(
-                sys::llama_get_logits_ith(self.ptr.as_ptr(), -1),
-                self.model.n_vocab(),
-            )
-        }
     }
 
     /// Generate from a fresh conversation. `on_token` gets each token and
@@ -261,6 +271,8 @@ impl Context {
         let sampler = Sampler::new(sampling);
         let t0 = Instant::now();
         self.decode(prompt)?;
+        // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
+        // and freed only in Drop.
         unsafe { sys::llama_synchronize(self.ptr.as_ptr()) };
         let prefill = t0.elapsed();
 
@@ -270,6 +282,10 @@ impl Context {
         let mut pos = prompt.len();
         while out.len() < max_tokens {
             let mut t =
+                // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in
+                // `new` and freed only in Drop. The sampler chain is live (owned by `sampler`),
+                // and the prompt was decoded above, so the last position has logits (an empty
+                // prompt is rejected at the top).
                 unsafe { sys::llama_sampler_sample(sampler.0.as_ptr(), self.ptr.as_ptr(), -1) };
             if self.model.is_eog(t) {
                 stop = Stop::EndOfText;
@@ -287,6 +303,9 @@ impl Context {
                 stop = Stop::ContextFull;
                 break;
             }
+            // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in
+            // `new` and freed only in Drop. `t` is a local token that outlives the call; the
+            // batch only borrows it.
             let r = unsafe {
                 sys::llama_decode(self.ptr.as_ptr(), sys::llama_batch_get_one(&mut t, 1))
             };
@@ -307,6 +326,9 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
+        // SAFETY: `self.ptr` is the llama_context this value owns, created non-null in `new`
+        // and freed only in Drop. This is the only place it is freed; the Arc<Model> field is
+        // dropped after, so the model outlives the context.
         unsafe { sys::llama_free(self.ptr.as_ptr()) }
     }
 }

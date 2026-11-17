@@ -27,7 +27,7 @@ use aie_plan::{Plan, Tier};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{CStr, c_void};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Where a weight was found.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -115,6 +115,8 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 static RUNNING: Mutex<()> = Mutex::new(());
 
 unsafe fn name_of(t: *const sys::ggml_tensor) -> String {
+    // SAFETY: Callers pass a non-null tensor from ggml; `name` is a NUL-terminated array inside
+    // it.
     unsafe { CStr::from_ptr((*t).name.as_ptr()) }
         .to_string_lossy()
         .into_owned()
@@ -123,15 +125,21 @@ unsafe fn name_of(t: *const sys::ggml_tensor) -> String {
 unsafe fn observe_src(s: &mut State, mut t: *const sys::ggml_tensor) {
     // Walk views back towards storage, stopping at the first thing we recognise.
     while !t.is_null() {
+        // SAFETY: `t` is non-null (loop condition) and points at a tensor in the graph ggml is
+        // evaluating, alive for the callback.
         let name = unsafe { name_of(t) };
+        // SAFETY: As above.
         let buf = unsafe { (*t).buffer };
         if s.names.contains(&name) {
             if !buf.is_null() {
+                // SAFETY: `buf` is non-null (checked); a buffer's name is a NUL-terminated
+                // string owned by its buffer type, alive for the callback.
                 let buffer = unsafe { CStr::from_ptr(sys::ggml_backend_buffer_name(buf)) }
                     .to_string_lossy()
                     .into_owned();
                 s.seen.entry(name).or_insert(Seen {
                     buffer,
+                    // SAFETY: As above: `t` is a live, non-null tensor.
                     data: unsafe { (*t).data } as usize,
                 });
             }
@@ -148,12 +156,15 @@ unsafe fn observe_src(s: &mut State, mut t: *const sys::ggml_tensor) {
             return;
         }
         if name.starts_with("moe_cache") && !buf.is_null() {
+            // SAFETY: As above: `buf` is non-null and live.
             let buffer = unsafe { CStr::from_ptr(sys::ggml_backend_buffer_name(buf)) }
                 .to_string_lossy()
                 .into_owned();
             s.cache.entry(buffer).or_default().insert(name);
             return;
         }
+        // SAFETY: As above: `t` is non-null; `view_src` is null or another live tensor of the
+        // same graph.
         t = unsafe { (*t).view_src };
     }
 }
@@ -162,9 +173,13 @@ unsafe extern "C" fn eval_cb(t: *mut sys::ggml_tensor, ask: bool, _: *mut c_void
     if !ask {
         return true;
     }
-    let mut g = STATE.lock().unwrap();
+    let mut g = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(s) = g.as_mut() {
+        // SAFETY: ggml passes a live, non-null tensor; `src` is its fixed-size array of source
+        // pointers, each null or a live tensor.
         for src in unsafe { (*t).src.iter() } {
+            // SAFETY: Each source is null (handled in observe_src) or a live tensor of the
+            // graph being evaluated.
             unsafe { observe_src(s, *src) };
         }
     }
@@ -242,6 +257,8 @@ pub fn check(
     let gpu_names: Vec<String> = (0..)
         .map_while(gpu_device)
         .map(|d| {
+            // SAFETY: `d` is a registered GPU device from `gpu_device`; its name is a NUL-
+            // terminated string owned by the device, alive for the process, copied here.
             unsafe { CStr::from_ptr(sys::ggml_backend_dev_name(d)) }
                 .to_string_lossy()
                 .into_owned()
