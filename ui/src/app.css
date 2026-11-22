@@ -1,0 +1,123 @@
+:root {
+  --bg: #15171c;
+  --panel: #1d2027;
+  --panel-2: #252932;
+  --line: #333845;
+  --text: #e7e9ee;
+  --muted: #9aa1b0;
+  --accent: #5b9cff;
+  --gpu: #5b9cff;
+  --ram: #f2a43a;
+  --disk: #b48ead;
+  --ok: #57c785;
+  --bad: #ff6b6b;
+  --radius: 10px;
+  color-scheme: dark;
+  font-family: Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+h3 {
+  font-size: 15px;
+}
+
+button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+button.primary {
+  background: var(--text);
+  color: var(--bg);
+  border-color: var(--text);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+input,
+select {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+}
+
+.mono {
+  font-family: ui-monospace, 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 12.5px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+
+.error {
+  color: var(--bad);
+  white-space: pre-wrap;
+}
+
+.ok {
+  color: var(--ok);
+}
+
+.bar {
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+  display: flex;
+}
+
+.bar > span {
+  display: block;
+  height: 100%;
+}
